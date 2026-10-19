@@ -4,21 +4,13 @@ import { javascript } from "@codemirror/lang-javascript";
 import { bracketMatching, defaultHighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { EditorState } from "@codemirror/state";
 import { EditorView, drawSelection, keymap, lineNumbers } from "@codemirror/view";
+import { diffTexts, readSide } from "./backend";
+import { formatEngineError } from "./engine";
+import { editedContents, fileDecision, rememberDecision, rememberEdit, reportFlowStatus, textsFromDiff, type MergeDecision } from "./localPlan";
 import { Text } from "./plain";
 import { lineHunks, mapDocY, screenCorrection, type Anchor, type Hunk } from "./syncScroll";
 
-const LEFT = sample("left");
-const RIGHT = sample("right");
-
-function sample(side: "left" | "right"): string {
-  const lines: string[] = [];
-  for (let i = 1; i <= 48; i++) lines.push(`export const keep${i} = ${i};`);
-  lines[12] = side === "left" ? "export const port = 43127;" : "export const port = 8080;";
-  if (side === "right") lines.splice(28, 0, "export const tracing = true;");
-  return lines.join("\n");
-}
-
-function extensions() {
+function extensions(onDoc: ((text: string) => void) | null) {
   return [
     lineNumbers(),
     drawSelection(),
@@ -28,6 +20,9 @@ function extensions() {
     javascript(),
     syntaxHighlighting(defaultHighlightStyle),
     EditorView.editable.of(true),
+    EditorView.updateListener.of((update) => {
+      if (update.docChanged && onDoc) onDoc(update.state.doc.toString());
+    }),
     EditorView.theme({
       "&": { height: "480px", fontSize: "12px" },
       ".cm-scroller": { fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace', lineHeight: "1.45" },
@@ -70,24 +65,89 @@ function screenTop(view: EditorView, lineNo: number): number | null {
   return view.coordsAtPos(line.from)?.top ?? null;
 }
 
-export function DiffEditor({ onWriteFailed }: { onWriteFailed: () => void }) {
+async function loadFileTexts(projectRoot: string, packagePath: string, rel: string) {
+  const [leftSide, rightSide] = await Promise.all([readSide(projectRoot, rel), readSide(packagePath, rel)]);
+  if (leftSide.binary || rightSide.binary) {
+    throw { code: "E_UNSUPPORTED", message: "二进制文件不能按文本对照" };
+  }
+  const diff = await diffTexts(leftSide.text, rightSide.text);
+  return textsFromDiff(diff);
+}
+
+function decisionOf(choice: "left" | "right" | "both"): MergeDecision {
+  if (choice === "left") return "keepLeft";
+  if (choice === "both") return "both";
+  return "takeRight";
+}
+
+export function DiffEditor({
+  projectRoot,
+  packagePath,
+  currentFile,
+  onExecute,
+}: {
+  projectRoot: string | null;
+  packagePath: string | null;
+  currentFile: string | null;
+  onExecute: (editedContents: Record<string, string>) => void;
+}) {
+  const ready = Boolean(projectRoot && packagePath);
   const leftHost = useRef<HTMLDivElement>(null);
   const rightHost = useRef<HTMLDivElement>(null);
   const leftView = useRef<EditorView | null>(null);
   const rightView = useRef<EditorView | null>(null);
-  const hunks = useMemo(() => lineHunks(LEFT, RIGHT), []);
+  const [leftText, setLeftText] = useState("");
+  const [rightBase, setRightBase] = useState("");
+  const [edited, setEdited] = useState(false);
+  const hunks = useMemo(() => lineHunks(leftText, rightBase), [leftText, rightBase]);
   const [choice, setChoice] = useState<"left" | "right" | "both">("right");
   const [bothOrder, setBothOrder] = useState<"left-top" | "right-top">("left-top");
   const [active, setActive] = useState(0);
 
   useEffect(() => {
-    if (!leftHost.current || !rightHost.current) return;
+    if (!projectRoot || !packagePath || !currentFile) {
+      setLeftText("");
+      setRightBase("");
+      setEdited(false);
+      return;
+    }
+    const file = currentFile;
+    let cancel = false;
+    void loadFileTexts(projectRoot, packagePath, file).then((texts) => {
+      if (cancel) return;
+      setLeftText(texts.left);
+      setRightBase(texts.right);
+      const saved = editedContents()[file];
+      setEdited(saved != null && saved !== texts.right);
+      setChoice(fileDecision(file) === "keepLeft" ? "left" : fileDecision(file) === "both" ? "both" : "right");
+    }).catch((err) => {
+      if (cancel) return;
+      setLeftText("");
+      setRightBase("");
+      reportFlowStatus(formatEngineError(err));
+    });
+    return () => {
+      cancel = true;
+    };
+  }, [projectRoot, packagePath, currentFile]);
+
+  useEffect(() => {
+    if (!ready || !leftHost.current || !rightHost.current) return;
+    const saved = currentFile ? editedContents()[currentFile] : undefined;
+    const rightDoc = saved ?? rightBase;
     const left = new EditorView({
-      state: EditorState.create({ doc: LEFT, extensions: extensions() }),
+      state: EditorState.create({ doc: leftText, extensions: extensions(null) }),
       parent: leftHost.current,
     });
     const right = new EditorView({
-      state: EditorState.create({ doc: RIGHT, extensions: extensions() }),
+      state: EditorState.create({
+        doc: rightDoc,
+        extensions: extensions((text) => {
+          if (!currentFile) return;
+          rememberEdit(currentFile, text, rightBase);
+          setEdited(text !== rightBase);
+        }),
+      }),
       parent: rightHost.current,
     });
     leftView.current = left;
@@ -137,7 +197,7 @@ export function DiffEditor({ onWriteFailed }: { onWriteFailed: () => void }) {
       leftView.current = null;
       rightView.current = null;
     };
-  }, [hunks]);
+  }, [ready, leftText, rightBase, hunks, currentFile]);
 
   const jump = (index: number) => {
     setActive(index);
@@ -149,26 +209,45 @@ export function DiffEditor({ onWriteFailed }: { onWriteFailed: () => void }) {
     left.dispatch({ effects: EditorView.scrollIntoView(line.from, { y: "start" }) });
   };
 
+  const choose = (next: "left" | "right" | "both") => {
+    setChoice(next);
+    if (currentFile) rememberDecision(currentFile, decisionOf(next));
+  };
   const choiceLabel = choice === "left" ? "保留左边" : choice === "both" ? (bothOrder === "left-top" ? "都保留，左边在上" : "都保留，右边在上") : "用右边";
   const reset = () => {
-    setChoice("right");
+    choose("right");
     setBothOrder("left-top");
   };
+  const fileLabel = currentFile && projectRoot ? `${projectRoot.split(/[/\\]/).filter(Boolean).pop()} · ${currentFile}` : "合天下";
+
+  if (!ready) {
+    return (
+      <div className="editorwrap">
+        <p className="empty-hint">先选项目目录和升级包</p>
+        <div className="difflist">
+          <footer>
+            <span><Text value="合天下" /></span>
+            <button className="primary" disabled={!ready}>执行升级</button>
+          </footer>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="editorwrap" data-merge={choice} data-order={bothOrder}>
       <div className="filebar">
-        <button className={choice === "right" ? "on" : ""} onClick={() => setChoice("right")}>全部用右边</button>
-        <button className={choice === "left" ? "on" : ""} onClick={() => setChoice("left")}>全部保留左边</button>
+        <button className={choice === "right" ? "on" : ""} onClick={() => choose("right")}>全部用右边</button>
+        <button className={choice === "left" ? "on" : ""} onClick={() => choose("left")}>全部保留左边</button>
         <button onClick={reset}>全部恢复</button>
       </div>
       <div className="editor">
         <div className="pane" ref={leftHost} data-pane="left" />
         <div className="gutterbar">
           <b>中间工具条</b>
-          <button className={choice === "right" ? "on" : ""} onClick={() => setChoice("right")}>用右边</button>
-          <button className={choice === "left" ? "on" : ""} onClick={() => setChoice("left")}>保留左边</button>
-          <button className={choice === "both" ? "on" : ""} onClick={() => setChoice("both")}>都保留</button>
+          <button className={choice === "right" ? "on" : ""} onClick={() => choose("right")}>用右边</button>
+          <button className={choice === "left" ? "on" : ""} onClick={() => choose("left")}>保留左边</button>
+          <button className={choice === "both" ? "on" : ""} onClick={() => choose("both")}>都保留</button>
           <button onClick={reset}>恢复</button>
           {choice === "both" && (
             <div className="bothorder" role="group" aria-label="都保留的先后">
@@ -192,8 +271,11 @@ export function DiffEditor({ onWriteFailed }: { onWriteFailed: () => void }) {
           ))}
         </ul>
         <footer>
-          <span><Text value="OrderCenter · src/config/app.config.js" /></span>
-          <button className="primary" onClick={onWriteFailed}>执行升级</button>
+          <span>
+            <Text value={fileLabel} />
+            {edited && <em className="edited">edited</em>}
+          </span>
+          <button className="primary" disabled={!ready} onClick={() => onExecute(editedContents())}>执行升级</button>
         </footer>
       </div>
     </div>

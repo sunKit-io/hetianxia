@@ -83,6 +83,7 @@ fn end_session(session: &Session) {
 pub fn run() {
     hetianxia_core::boot();
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();
@@ -113,6 +114,8 @@ pub fn run() {
             commands::compare,
             commands::diff,
             commands::merge,
+            commands::read_side,
+            commands::prepare_package,
             commands::execute,
             commands::rollback_run,
             commands::resume_run,
@@ -468,5 +471,36 @@ mod tests {
         assert_eq!(again.message, "这次回滚已经结束");
         assert_eq!(std::fs::read(a.join("a.txt")).unwrap(), b"NEW-A");
         assert_eq!(std::fs::read(b.join("a.txt")).unwrap(), b"old-b");
+    }
+
+    #[test]
+    fn read_side_and_prepare_package_do_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+        let side = commands::read_side(dir.path().display().to_string(), "a.txt".into()).unwrap();
+        assert!(side.present);
+        assert!(!side.binary);
+        assert!(side.text.contains("hello"));
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"hello\n");
+        let missing = commands::read_side(dir.path().display().to_string(), "missing.txt".into()).unwrap();
+        assert!(!missing.present);
+        assert!(missing.text.is_empty());
+        let prepared = commands::prepare_package(dir.path().display().to_string()).unwrap();
+        assert_eq!(prepared, dir.path().display().to_string());
+        let note = dir.path().join("note.txt");
+        std::fs::write(&note, "nope").unwrap();
+        let err = commands::prepare_package(note.display().to_string()).unwrap_err();
+        assert_eq!(err.code_str(), "E_NOT_FOUND");
+
+        let zip_path = dir.path().join("pkg.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        writer.start_file("b.txt", zip::write::SimpleFileOptions::default()).unwrap();
+        use std::io::Write;
+        writer.write_all(b"from-zip\n").unwrap();
+        writer.finish().unwrap();
+        let extracted = commands::prepare_package(zip_path.display().to_string()).unwrap();
+        assert!(std::path::Path::new(&extracted).join("b.txt").is_file());
+        let packed = commands::read_side(extracted, "b.txt".into()).unwrap();
+        assert!(packed.text.contains("from-zip"));
     }
 }

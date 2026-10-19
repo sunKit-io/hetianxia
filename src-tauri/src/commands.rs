@@ -1,4 +1,6 @@
 use hetianxia_core::error::{Error, ErrorCode};
+use hetianxia_core::hashutil::sha256_hex;
+use hetianxia_core::pathutil::RelPath;
 use tauri::Manager;
 use hetianxia_core::exec::{self, ExecOpts, ExecReport, HistoryRow, ResumeChoice, ResumeOutcome, RollbackChoice};
 use hetianxia_core::model::ExecPlan;
@@ -67,6 +69,78 @@ pub fn merge(left: String, right: String, decision: String) -> Result<Rendered, 
         Error::new(ErrorCode::UnconfirmedHunks, "还有没确认的差异块")
     })?;
     Ok(merge::render(&file, &state))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SideText {
+    pub present: bool,
+    pub binary: bool,
+    pub text: String,
+    pub bytes: Vec<u8>,
+    pub size: u64,
+    pub mtime_ms: Option<i64>,
+    pub sha256: String,
+}
+
+fn text_of(doc: &merge::TextDoc) -> String {
+    let mut text = doc.lines.join(&doc.newline);
+    if doc.ends_with_newline {
+        text.push_str(&doc.newline);
+    }
+    text
+}
+
+/// 只读。缺文件时 present 为 false，不改磁盘。
+#[tauri::command]
+pub fn read_side(root: String, rel: String) -> Result<SideText, Error> {
+    let fs = LocalFs::new(&root);
+    let parsed = RelPath::parse(&rel)?;
+    match fs.read(&parsed) {
+        Err(err) if err.code == ErrorCode::NotFound => Ok(SideText {
+            present: false,
+            binary: false,
+            text: String::new(),
+            bytes: Vec::new(),
+            size: 0,
+            mtime_ms: None,
+            sha256: sha256_hex(b""),
+        }),
+        Err(err) => Err(err),
+        Ok(bytes) => {
+            let doc = merge::decode(&bytes);
+            let stat = fs.stat(&parsed).ok();
+            Ok(SideText {
+                present: true,
+                binary: doc.binary,
+                text: if doc.binary { String::new() } else { text_of(&doc) },
+                size: stat.as_ref().map(|entry| entry.size).unwrap_or(bytes.len() as u64),
+                mtime_ms: stat.and_then(|entry| entry.mtime_ms),
+                sha256: sha256_hex(&bytes),
+                bytes,
+            })
+        }
+    }
+}
+
+/// scan 的右边必须是目录。zip 先解到临时目录，目录原样返回。
+#[tauri::command]
+pub fn prepare_package(path: String) -> Result<String, Error> {
+    let target = PathBuf::from(&path);
+    if target.is_dir() {
+        return Ok(path);
+    }
+    let zip = target
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
+    if zip && target.is_file() {
+        let temp = std::env::temp_dir().join("hetianxia-packages");
+        std::fs::create_dir_all(&temp)?;
+        let extracted = hetianxia_core::zipfs::extract_to_temp(&target, &temp)?;
+        return Ok(extracted.dir.display().to_string());
+    }
+    Err(Error::new(ErrorCode::NotFound, "升级包需要是目录或 zip 文件"))
 }
 
 pub fn execute_in(db_path: &Path, root: &Path, backup_root: &Path, mut plan: ExecPlan, allow_readonly: bool) -> Result<ExecReport, Error> {

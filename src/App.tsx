@@ -1,13 +1,27 @@
 import { useEffect, useMemo, useState } from "react";
 import { Server, ShieldAlert, KeyRound, AlertTriangle } from "lucide-react";
-import { appBakDir, clearConnectionFingerprint, commitRemoteOverwrite, deleteConnection, deleteSshSecret, journalRuns, listConnections, remoteWritePrompt, rollbackPreview, rollbackRun, resumeRun, saveConnection, saveSshSecret, sshSecretStatus, startupFailure, startupOffers, testConnection, type JournalRun, type ProbeReport, type SavedConnection } from "./backend";
+import { appBakDir, clearConnectionFingerprint, commitRemoteOverwrite, deleteConnection, deleteSshSecret, executeLocal, journalRuns, listConnections, mergeTexts, pickProjectDirectory, pickUpgradePackage, readSide, remoteWritePrompt, rollbackPreview, rollbackRun, resumeRun, saveConnection, saveSshSecret, scanPair, sshSecretStatus, startupFailure, startupOffers, testConnection, type JournalRun, type ProbeReport, type SavedConnection } from "./backend";
 import { externalChoice, keepSource, pendingChoice, rollbackChoice, type ResumeChoice, type RollbackChoice } from "./choices";
 import { DiffEditor } from "./editor";
-import { afterResume, engineCode, formatEngineError, formatOffer, formatReport, type ConflictFile, type RecoveryOffer } from "./engine";
+import { afterResume, engineCode, formatEngineError, formatOffer, formatReport, type ConflictFile, type ExecReport, type RecoveryOffer } from "./engine";
+import {
+  attachFlowStatus,
+  baseName,
+  buildLocalPlan,
+  clearFileNotes,
+  decisionMap,
+  editedContents,
+  execPlanFor,
+  firstTextFile,
+  newExecId,
+  noteShownFile,
+  previewCounts,
+  type LocalPlan,
+} from "./localPlan";
 import { formatFileCounts, formatRunTime, historyContinue, historyRowButtons, historyStatusLabel, REMOTE_ROLLBACK_TITLE, type HistoryContinue } from "./historyRows";
 import { Text } from "./plain";
 import { remoteRootFieldError } from "./remoteRoot";
-import { VERIFY_FAILED_BUTTON, VERIFY_FAILED_TITLE, currentRemotePlan, settleRemoteWrite, type PendingRemoteWrite } from "./remoteWrite";
+import { VERIFY_FAILED_BUTTON, VERIFY_FAILED_TITLE, connectionRemoteRoot, currentRemotePlan, noteRemoteRoot, settleRemoteWrite, type PendingRemoteWrite } from "./remoteWrite";
 import {
   DETAIL_DELETED,
   OVERWRITE_PENDING,
@@ -55,11 +69,28 @@ export function App() {
   const [pendingFiles, setPendingFiles] = useState<ConflictFile[]>(PENDING_FILES);
   const [rollbackFiles, setRollbackFiles] = useState<ConflictFile[]>([]);
   const [rollbackAt, setRollbackAt] = useState(0);
+  const [projectRoot, setProjectRoot] = useState<string | null>(null);
+  const [packagePath, setPackagePath] = useState<string | null>(null);
+  const [plan, setPlan] = useState<LocalPlan | null>(null);
+  const [currentFile, setCurrentFile] = useState<string | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [report, setReport] = useState<ExecReport | null>(null);
   const selected = connections.find((item) => item.id === selectedId) ?? null;
 
   useEffect(() => {
     void listConnections().then(setConnections).catch((err) => setStatus(formatEngineError(err)));
   }, []);
+
+  useEffect(() => {
+    noteShownFile(plan, currentFile);
+  }, [plan, currentFile]);
+
+  useEffect(() => {
+    noteRemoteRoot(connectionRemoteRoot(selected));
+  }, [selected]);
+
+  useEffect(() => attachFlowStatus(setStatus), []);
 
   useEffect(() => {
     void appBakDir().then(setBakDir).catch((err) => {
@@ -85,6 +116,69 @@ export function App() {
       if (message.startsWith("E_")) setStatus(message);
     });
   }, []);
+
+  async function refreshPlan(project: string, pkg: string) {
+    setScanning(true);
+    setReport(null);
+    clearFileNotes();
+    try {
+      const scanned = await scanPair(project, pkg);
+      const next = await buildLocalPlan({
+        projectRoot: project,
+        packagePath: pkg,
+        files: scanned.files,
+        read: readSide,
+        mergeText: mergeTexts,
+      });
+      setPlan(next);
+      setCurrentFile(firstTextFile(next));
+      setStatus(null);
+    } catch (err) {
+      setPlan(null);
+      setCurrentFile(null);
+      setStatus(formatEngineError(err));
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  async function onPickProject() {
+    try {
+      const picked = await pickProjectDirectory();
+      if (!picked) return;
+      setProjectRoot(picked);
+      if (packagePath) await refreshPlan(picked, packagePath);
+    } catch (err) {
+      setStatus(formatEngineError(err));
+    }
+  }
+
+  async function onPickPackage() {
+    try {
+      const picked = await pickUpgradePackage();
+      if (!picked) return;
+      setPackagePath(picked);
+      if (projectRoot) await refreshPlan(projectRoot, picked);
+    } catch (err) {
+      setStatus(formatEngineError(err));
+    }
+  }
+
+  async function backupAndExecute(edits: Record<string, string>) {
+    if (!projectRoot || !plan || running) return;
+    setRunning(true);
+    setStatus("正在备份并执行…");
+    try {
+      const execPlan = await execPlanFor(plan, edits, decisionMap(), mergeTexts, newExecId());
+      const result = await executeLocal(projectRoot, execPlan, allowReadonly);
+      setReport(result);
+      setStatus(formatReport(result));
+    } catch (err) {
+      setStatus(formatEngineError(err));
+    } finally {
+      setRunning(false);
+    }
+  }
 
   async function applyResume(id: string, choice: ResumeChoice) {
     setFlowId(id);
@@ -140,7 +234,7 @@ export function App() {
             <i /><i /><i />
           </span>
           <div className="titleblock">
-            <strong>{page === "ssh" ? "SSH 连接" : page === "history" ? "历史记录" : "合天下"}</strong>
+            <strong>{page === "ssh" ? "SSH 连接" : page === "history" ? "历史记录" : projectRoot ? baseName(projectRoot) : "合天下"}</strong>
             <span>{page === "ssh" ? `${connections.length} 个连接` : ""}</span>
           </div>
           <nav className="pages">
@@ -157,7 +251,14 @@ export function App() {
           )}
         </header>
         {status && !sheet && <p className={status.includes("E_") ? "status err" : "status"} role="status">{status}</p>}
-        {page === "edit" && <DiffEditor onWriteFailed={() => setSheet("failure")} />}
+        {page === "edit" && (
+          <DiffEditor
+            projectRoot={plan ? projectRoot : null}
+            packagePath={plan ? packagePath : null}
+            currentFile={currentFile}
+            onExecute={(edits) => { void backupAndExecute(edits); }}
+          />
+        )}
         {page === "ssh" && (
           <SshPage
             connections={connections}
@@ -172,6 +273,16 @@ export function App() {
             allowReadonly={allowReadonly}
             setAllowReadonly={setAllowReadonly}
             bakDir={bakDir}
+            projectRoot={projectRoot}
+            packagePath={packagePath}
+            plan={plan}
+            scanning={scanning}
+            running={running}
+            report={report}
+            onPickProject={() => { void onPickProject(); }}
+            onPickPackage={() => { void onPickPackage(); }}
+            onExecute={() => { void backupAndExecute(editedContents()); }}
+            onOpenFile={(path) => { setCurrentFile(path); setPage("edit"); }}
             onRemoteWrite={() => {
               const plan = currentRemotePlan();
               if (!selected) {
@@ -476,41 +587,100 @@ function SshPage({
   );
 }
 
-function PreviewPage({ allowReadonly, setAllowReadonly, bakDir, onRemoteWrite }: { allowReadonly: boolean; setAllowReadonly: (v: boolean) => void; bakDir: string | null; onRemoteWrite: () => void }) {
+function PreviewPage({
+  allowReadonly,
+  setAllowReadonly,
+  bakDir,
+  projectRoot,
+  packagePath,
+  plan,
+  scanning,
+  running,
+  report,
+  onPickProject,
+  onPickPackage,
+  onExecute,
+  onOpenFile,
+  onRemoteWrite,
+}: {
+  allowReadonly: boolean;
+  setAllowReadonly: (v: boolean) => void;
+  bakDir: string | null;
+  projectRoot: string | null;
+  packagePath: string | null;
+  plan: LocalPlan | null;
+  scanning: boolean;
+  running: boolean;
+  report: ExecReport | null;
+  onPickProject: () => void;
+  onPickPackage: () => void;
+  onExecute: () => void;
+  onOpenFile: (path: string) => void;
+  onRemoteWrite: () => void;
+}) {
   const [target, setTarget] = useState<"local" | "remote">("local");
-  const counts = useMemo(() => {
-    const overwrite = allowReadonly ? 13 : 11;
-    const skip = allowReadonly ? 0 : 2;
-    return { overwrite, skip };
-  }, [allowReadonly]);
+  const counts = useMemo(() => previewCounts(plan?.files ?? [], allowReadonly), [plan, allowReadonly]);
+  const localReady = Boolean(plan) && !scanning && !running;
+  const localSub = projectRoot && packagePath ? `${baseName(projectRoot)} · ${projectRoot} ← ${baseName(packagePath)}` : "";
+  const readonlyFiles = (plan?.files ?? []).filter((file) => file.readonly && (file.kind === "overwrite" || file.kind === "delete"));
   return (
     <div className="sheetwrap">
       <div className="sheet">
         <h1><ShieldAlert size={18} /> 确认执行升级</h1>
-        <p className="sub">{target === "remote" ? "远程" : "OrderCenter · 本机 ~/work/order-center ← release-3.0.0.zip"}</p>
+        {!plan && <p>先选项目目录和升级包</p>}
+        <p className="sub">{target === "remote" ? "远程" : localSub}</p>
+        <div className="pickrow">
+          <button type="button" onClick={onPickProject}>选择项目目录…</button>
+          <button type="button" onClick={onPickPackage}>选择升级包…</button>
+        </div>
+        {scanning && <p role="status">正在扫描…</p>}
         <div className="auth">写入到 <span className={target === "local" ? "on" : ""} onClick={() => setTarget("local")}>本机</span><span className={target === "remote" ? "on" : ""} onClick={() => setTarget("remote")}>远程</span></div>
-        <div className="stats">
-          <b>6<small>新增</small></b>
-          <b>{counts.overwrite}<small>覆盖{counts.skip ? "" : " · 其中合并 4"}</small></b>
-          <b>1<small>移动</small></b>
-          <b>0<small>删除</small></b>
-          {counts.skip > 0 && <b className="skip">{counts.skip}<small>跳过（只读）</small></b>}
-        </div>
-        <ul className="changes">
-          <li><i className="add" /> <Text value="plugins/tracing/index.ts" /> <em>升级包</em></li>
-          <li><i className="mod" /> <Text value="src/config/app.config.js" /> <em>合并结果</em></li>
-          <li data-keep-source={keepSource("移动（保留旧文件）") ? "1" : "0"}><i className="move" /> <Text value="lib/format.ts → utils/format.ts" /> <em>移动（保留旧文件）</em></li>
-        </ul>
-        <div className="ro">
-          <b>只读文件（2）</b>
-          <div>bin/start.sh <em>E_PERMISSION · {allowReadonly ? "将临时去掉只读" : "不勾选将跳过"}</em></div>
-          <div>conf/license.key <em>E_PERMISSION · {allowReadonly ? "将临时去掉只读" : "不勾选将跳过"}</em></div>
-          <label><input type="checkbox" checked={allowReadonly} onChange={(e) => setAllowReadonly(e.target.checked)} /> 覆盖只读文件</label>
-          <p>临时去掉只读属性，写入后恢复。</p>
-        </div>
+        {plan && (
+          <div className="stats">
+            <b>{counts.create}<small>新增</small></b>
+            <b>{counts.overwrite}<small>覆盖{counts.merged ? ` · 其中合并 ${counts.merged}` : ""}</small></b>
+            <b>{counts.move}<small>移动</small></b>
+            <b>{counts.delete}<small>删除</small></b>
+            {counts.skipReadonly > 0 && <b className="skip">{counts.skipReadonly}<small>跳过（只读）</small></b>}
+          </div>
+        )}
+        {plan && (
+          <ul className="changes">
+            {plan.files.map((file) => (
+              <li key={file.path} data-keep-source={keepSource(file.label) ? "1" : "0"}>
+                <i className={file.kind === "create" ? "add" : file.kind === "move" ? "move" : "mod"} />
+                <button type="button" onClick={() => onOpenFile(file.path)}>
+                  <Text value={file.kind === "move" && file.from ? `${file.from} → ${file.path}` : file.path} />
+                </button>
+                <em>{file.label}</em>
+              </li>
+            ))}
+          </ul>
+        )}
+        {readonlyFiles.length > 0 && (
+          <div className="ro">
+            <b>只读文件（{readonlyFiles.length}）</b>
+            {readonlyFiles.map((file) => (
+              <div key={file.path}><Text value={file.path} /> <em>E_PERMISSION · {allowReadonly ? "将临时去掉只读" : "不勾选将跳过"}</em></div>
+            ))}
+            <label><input type="checkbox" checked={allowReadonly} onChange={(e) => setAllowReadonly(e.target.checked)} /> 覆盖只读文件</label>
+            <p>临时去掉只读属性，写入后恢复。</p>
+          </div>
+        )}
+        {report && (
+          <ul className="changes">
+            {report.files.map((file) => (
+              <li key={`${file.index}-${file.path}`}>
+                <span><Text value={file.path} /></span>
+                <em>{[file.state, file.code, file.error].filter(Boolean).join(" · ")}</em>
+              </li>
+            ))}
+          </ul>
+        )}
+        {running && <p role="status">正在备份并执行…</p>}
         <label className="bak"><input type="checkbox" defaultChecked /> 执行前备份到 {bakDir ? <Text value={bakDir} /> : "…"}</label>
         <footer>
-          <button className="primary" onClick={() => { if (target === "remote") onRemoteWrite(); }}>{target === "remote" ? "写入远程" : "备份并执行"}</button>
+          <button className="primary" disabled={target === "local" ? !localReady : false} onClick={() => { if (target === "remote") onRemoteWrite(); else onExecute(); }}>{target === "remote" ? "写入远程" : "备份并执行"}</button>
         </footer>
       </div>
     </div>

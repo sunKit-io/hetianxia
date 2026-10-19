@@ -4,6 +4,8 @@ fn main() {
         "compare",
         "diff",
         "merge",
+        "read_side",
+        "prepare_package",
         "execute",
         "rollback_run",
         "resume_run",

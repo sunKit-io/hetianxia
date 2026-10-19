@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
-import { remoteWriteBody, settleRemoteWrite, verifyFailureBody } from "./remoteWrite.ts";
+import { clearFileNotes, noteShownFile, rememberEdit, type LocalPlan } from "./localPlan.ts";
+import { connectionRemoteRoot, currentRemotePlan, joinRemote, noteRemoteRoot, remoteWriteBody, settleRemoteWrite, verifyFailureBody } from "./remoteWrite.ts";
 
 test("dialog copy uses the runtime backup path and cancel writes nothing", () => {
   const dir = "/var/lib/hetianxia/bak/tx-100";
@@ -29,6 +30,53 @@ function filesUnder(dir: string): string[] {
   }
   return out;
 }
+
+function samplePlan(text: string): LocalPlan {
+  return {
+    projectRoot: "/work/app",
+    packagePath: "/tmp/pkg",
+    projectKey: "/work/app",
+    files: [{
+      path: "src/app.js",
+      kind: "overwrite",
+      label: "合并结果",
+      readonly: false,
+      merged: true,
+      binary: false,
+      leftText: "old\n",
+      rightText: text,
+      bytes: Array.from(new TextEncoder().encode(text)),
+      from: null,
+      expect: null,
+      sourceMtimeMs: null,
+      keepSource: false,
+    }],
+  };
+}
+
+test("currentRemotePlan returns the selected file, joined to the remote root, including edits", () => {
+  assert.equal(connectionRemoteRoot({
+    id: "1",
+    name: "edge",
+    host: "10.0.0.8",
+    port: 22,
+    user: "ops",
+    auth: "key",
+    keyPath: "/home/ops/.ssh/id_ed25519",
+    fingerprint: "SHA256:aa",
+  }), "");
+  assert.equal(currentRemotePlan(), null);
+  noteShownFile(samplePlan("next\n"), "src/app.js");
+  assert.deepEqual(currentRemotePlan(), { remotePath: "src/app.js", content: "next\n" });
+  rememberEdit("src/app.js", "edited\n", "next\n");
+  assert.equal(currentRemotePlan()?.content, "edited\n");
+  noteRemoteRoot("/srv/site");
+  assert.equal(currentRemotePlan()?.remotePath, "/srv/site/src/app.js");
+  assert.equal(joinRemote("/srv/site/", "src/app.js"), "/srv/site/src/app.js");
+  clearFileNotes();
+  noteShownFile(null, null);
+  noteRemoteRoot("");
+});
 
 test("the frontend has no baked home or product backup path", () => {
   const root = new URL(".", import.meta.url);

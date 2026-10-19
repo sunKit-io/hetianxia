@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import type { ResumeChoice, RollbackChoice } from "./choices";
 import { parseResume, type ExecReport, type RecoveryOffer, type ResumeView } from "./engine";
+import type { ExecPlan, SideText, TextDoc } from "./localPlan";
 
 export function rollbackRun(execId: string, choice: RollbackChoice) {
   return invoke<ExecReport>("rollback_run", { execId, choice });
@@ -133,4 +135,58 @@ export type RollbackPreview = {
 
 export function rollbackPreview(execId: string) {
   return invoke<RollbackPreview>("rollback_preview", { execId });
+}
+
+export type ScanFile = {
+  rel: string;
+  status: string;
+  movedFrom?: string | null;
+  movedTo?: string | null;
+  message?: string | null;
+  readonly?: boolean;
+};
+
+export function scanPair(left: string, right: string) {
+  return invoke<{ files: ScanFile[] }>("scan", { left, right });
+}
+
+export type FileDiff = {
+  left: TextDoc;
+  right: TextDoc;
+};
+
+export function diffTexts(left: string, right: string) {
+  return invoke<FileDiff>("diff", { left, right });
+}
+
+export function mergeTexts(left: string, right: string, decision: string) {
+  return invoke<{ text: string }>("merge", { left, right, decision });
+}
+
+export function readSide(root: string, rel: string) {
+  return invoke<SideText>("read_side", { root, rel });
+}
+
+export function preparePackage(path: string) {
+  return invoke<string>("prepare_package", { path });
+}
+
+export function executeLocal(root: string, plan: ExecPlan, allowReadonly: boolean) {
+  return invoke<ExecReport>("execute", { root, plan, allowReadonly });
+}
+
+export async function pickProjectDirectory(): Promise<string | null> {
+  const picked = await open({ directory: true, multiple: false, title: "选择项目目录" });
+  return typeof picked === "string" ? picked : null;
+}
+
+/** scan 的右边是目录。选中的 zip 先解开；本身是目录则原样交给 scan。 */
+export async function pickUpgradePackage(): Promise<string | null> {
+  const picked = await open({
+    multiple: false,
+    title: "选择升级包",
+    filters: [{ name: "升级包", extensions: ["zip"] }],
+  });
+  if (typeof picked !== "string") return null;
+  return preparePackage(picked);
 }
