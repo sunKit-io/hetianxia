@@ -1,0 +1,445 @@
+//! 远程写入的第一步：先在壳层备份目录留下原文件和清单，再经临时文件改名覆盖。
+//! 事务目录是 `app_data_dir()/bak/<id>/`，和本地引擎的 `backup_root/<id>` 是同一个根。
+//! `app_data_dir()` 由 Tauri 壳按 bundle id 解析，这里不再拼产品名目录。
+//! 取消时不碰远端，也不创建这个目录。
+
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use serde::Serialize;
+
+use crate::brand::{self, TEMP_TAG};
+use crate::error::{Error, ErrorCode, Result};
+use crate::hashutil::{self, sha256_hex};
+use crate::remote::RuntimeLog;
+use crate::sftp::{self, RemoteNames};
+
+pub const DIALOG_TITLE: &str = "远程写入暂不支持回滚";
+pub const CANCEL_LABEL: &str = "取消";
+pub const PROCEED_LABEL: &str = "仍然写入";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteWritePrompt {
+    pub title: String,
+    pub body: String,
+    pub backup_dir: String,
+    pub cancel_label: String,
+    pub proceed_label: String,
+    pub default_button: String,
+    pub exec_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteWriteRequest {
+    pub confirmed: bool,
+    pub exec_id: String,
+    pub host: String,
+    pub remote_path: String,
+    pub bytes: Vec<u8>,
+    /// Tauri `app.path().app_data_dir()` 的绝对路径。
+    pub app_data_dir: PathBuf,
+    pub posix_rename: bool,
+    pub index: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedBackup {
+    pub backup_dir: PathBuf,
+    pub op: String,
+    pub hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitResult {
+    Cancelled,
+    Written(StagedBackup),
+}
+
+pub trait RemoteBytes {
+    fn exists(&mut self, path: &str) -> Result<bool>;
+    fn read(&mut self, path: &str) -> Result<Vec<u8>>;
+    fn write_new(&mut self, path: &str, bytes: &[u8]) -> Result<()>;
+    fn rename(&mut self, from: &str, to: &str) -> Result<()>;
+    fn remove(&mut self, path: &str) -> Result<()>;
+    fn paths(&self) -> Vec<String>;
+}
+
+/// 壳层传下来的备份根：`app_data_dir()/bak`。本地 `ExecOpts.backup_root` 用同一个目录。
+pub fn shell_backup_root(app_data_dir: &Path) -> Result<PathBuf> {
+    if !app_data_dir.is_absolute() {
+        return Err(Error::new(ErrorCode::InvalidLocation, "应用数据目录必须是绝对路径"));
+    }
+    Ok(app_data_dir.join("bak"))
+}
+
+/// `app_data_dir()/bak/<id>/`。macOS 上 `app_data_dir` 是
+/// `$HOME/Library/Application Support/com.hetianxia.app`。
+pub fn tx_backup_dir(app_data_dir: &Path, exec_id: &str) -> Result<PathBuf> {
+    validate_exec_id(exec_id)?;
+    Ok(shell_backup_root(app_data_dir)?.join(exec_id))
+}
+
+pub fn dialog_body(backup_dir: &Path) -> String {
+    format!(
+        "写入前会把远端原文件备份到本机（{}），出问题可以从这里手工恢复。",
+        backup_dir.display()
+    )
+}
+
+pub fn prompt_for(app_data_dir: &Path, exec_id: &str) -> Result<RemoteWritePrompt> {
+    let dir = tx_backup_dir(app_data_dir, exec_id)?;
+    Ok(RemoteWritePrompt {
+        title: DIALOG_TITLE.into(),
+        body: dialog_body(&dir),
+        backup_dir: dir.display().to_string(),
+        cancel_label: CANCEL_LABEL.into(),
+        proceed_label: PROCEED_LABEL.into(),
+        default_button: CANCEL_LABEL.into(),
+        exec_id: exec_id.to_string(),
+    })
+}
+
+/// 把远端原文件落到 `bak/<id>/files/` 并写上清单。必须在远端改名之前调用。
+pub fn stage_before_write(req: &RemoteWriteRequest, original: Option<&[u8]>) -> Result<StagedBackup> {
+    let backup_dir = tx_backup_dir(&req.app_data_dir, &req.exec_id)?;
+    let rel = local_rel(&req.remote_path)?;
+    let op = if original.is_some() { "remote_overwrite" } else { "remote_create" };
+    let hash = if let Some(bytes) = original {
+        let dest = backup_dir.join("files").join(&rel);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&dest)
+            .map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
+        file.write_all(bytes).map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
+        file.sync_all().map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
+        drop(file);
+        let got = hashutil::hash_file_sha256(&dest).map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
+        let expect = sha256_hex(bytes);
+        if got != expect {
+            let _ = fs::remove_file(&dest);
+            return Err(Error::new(
+                ErrorCode::VerifyFailed,
+                format!("{rel} 的备份和原文件哈希不一致，原文件未改"),
+            ));
+        }
+        Some(got)
+    } else {
+        fs::create_dir_all(backup_dir.join("files")).map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
+        None
+    };
+    let backup_rel = hash.as_ref().map(|_| format!("files/{rel}"));
+    let entry = serde_json::json!({
+        "execId": req.exec_id,
+        "projectKey": req.host,
+        "index": req.index,
+        "path": rel,
+        "backup": backup_rel,
+        "hash": hash,
+        "op": op,
+        "host": req.host,
+    });
+    append_manifest(&backup_dir, &entry)?;
+    Ok(StagedBackup { backup_dir, op: op.into(), hash })
+}
+
+pub fn remote_temp_path(remote_path: &str) -> Result<String> {
+    let (dir, name) = split_remote(remote_path)?;
+    let temp = brand::temp_file_name(name, &uuid::Uuid::new_v4().simple().to_string());
+    Ok(join_remote(dir, &temp))
+}
+
+pub fn remote_backup_name(remote_path: &str) -> Result<String> {
+    let (dir, name) = split_remote(remote_path)?;
+    let bak = format!(".{name}{TEMP_TAG}bak-{}", uuid::Uuid::new_v4().simple());
+    Ok(join_remote(dir, &bak))
+}
+
+pub fn commit_remote_write(
+    store: &mut dyn RemoteBytes,
+    log: &mut RuntimeLog,
+    req: &RemoteWriteRequest,
+) -> Result<CommitResult> {
+    if !req.confirmed {
+        return Ok(CommitResult::Cancelled);
+    }
+    let dest = req.remote_path.clone();
+    let original = if store.exists(&dest)? { Some(store.read(&dest)?) } else { None };
+    let staged = stage_before_write(req, original.as_deref())?;
+    let temp = remote_temp_path(&dest)?;
+    let backup = remote_backup_name(&dest)?;
+    if let Err(err) = store.write_new(&temp, &req.bytes) {
+        let _ = remove_if_present(store, &temp);
+        return Err(err);
+    }
+    let renamed = {
+        let mut names = Names { inner: store };
+        sftp::apply_rename(&mut names, log, req.posix_rename, &temp, &dest, &backup)
+    };
+    if let Err(err) = renamed {
+        let _ = remove_if_present(store, &temp);
+        let _ = remove_if_present(store, &backup);
+        return Err(err);
+    }
+    let _ = remove_if_present(store, &temp);
+    let _ = remove_if_present(store, &backup);
+    if store.paths().iter().any(|path| path.contains(TEMP_TAG)) {
+        return Err(Error::new(ErrorCode::Io, "远程临时文件还在"));
+    }
+    let got = store.read(&dest)?;
+    if sha256_hex(&got) != sha256_hex(&req.bytes) {
+        return Err(Error::new(ErrorCode::VerifyFailed, format!("{dest} 写入后的哈希和内容不一致")));
+    }
+    Ok(CommitResult::Written(staged))
+}
+
+fn remove_if_present(store: &mut dyn RemoteBytes, path: &str) -> Result<()> {
+    if store.exists(path)? {
+        store.remove(path)?;
+    }
+    Ok(())
+}
+
+struct Names<'a> {
+    inner: &'a mut dyn RemoteBytes,
+}
+
+impl RemoteNames for Names<'_> {
+    fn exists(&mut self, path: &str) -> Result<bool> {
+        self.inner.exists(path)
+    }
+    fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn remove(&mut self, path: &str) -> Result<()> {
+        self.inner.remove(path)
+    }
+}
+
+fn append_manifest(backup: &Path, entry: &serde_json::Value) -> Result<()> {
+    fs::create_dir_all(backup).map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
+    let path = backup.join("manifest.json");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
+    writeln!(file, "{entry}").map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
+    file.sync_all().map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
+    Ok(())
+}
+
+fn validate_exec_id(exec_id: &str) -> Result<()> {
+    if exec_id.is_empty()
+        || exec_id.contains('/')
+        || exec_id.contains('\\')
+        || exec_id.contains("..")
+        || exec_id.contains('\0')
+    {
+        return Err(Error::new(ErrorCode::InvalidLocation, "备份编号不合法"));
+    }
+    Ok(())
+}
+
+fn local_rel(remote_path: &str) -> Result<String> {
+    let (dir, name) = split_remote(remote_path)?;
+    let joined = join_remote(dir, name);
+    let rel = joined.trim_start_matches('/');
+    if rel.is_empty() {
+        return Err(Error::new(ErrorCode::InvalidLocation, "远程路径不合法"));
+    }
+    Ok(rel.to_string())
+}
+
+fn split_remote(path: &str) -> Result<(&str, &str)> {
+    if path.is_empty() || path.contains('\0') || path.contains('\\') {
+        return Err(Error::new(ErrorCode::InvalidLocation, "远程路径不合法"));
+    }
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(Error::new(ErrorCode::InvalidLocation, "远程路径不合法"));
+    }
+    let mut parts = trimmed.split('/');
+    if trimmed.starts_with('/') {
+        parts.next();
+    }
+    if parts.clone().any(|part| part.is_empty() || part == "." || part == "..") {
+        return Err(Error::new(ErrorCode::InvalidLocation, "远程路径不合法"));
+    }
+    match trimmed.rfind('/') {
+        Some(index) => Ok((&trimmed[..index], &trimmed[index + 1..])),
+        None => Ok(("", trimmed)),
+    }
+}
+
+fn join_remote(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_string()
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    struct Mem {
+        files: BTreeMap<String, Vec<u8>>,
+        calls: u32,
+        fail_write: bool,
+    }
+
+    impl Mem {
+        fn new(files: BTreeMap<String, Vec<u8>>) -> Self {
+            Self { files, calls: 0, fail_write: false }
+        }
+    }
+
+    impl RemoteBytes for Mem {
+        fn exists(&mut self, path: &str) -> Result<bool> {
+            self.calls += 1;
+            Ok(self.files.contains_key(path))
+        }
+        fn read(&mut self, path: &str) -> Result<Vec<u8>> {
+            self.calls += 1;
+            self.files.get(path).cloned().ok_or_else(|| Error::new(ErrorCode::NotFound, "远程文件不存在"))
+        }
+        fn write_new(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
+            self.calls += 1;
+            if self.fail_write {
+                return Err(Error::new(ErrorCode::Io, "写入中途失败"));
+            }
+            if self.files.contains_key(path) {
+                return Err(Error::new(ErrorCode::Io, "临时文件已存在"));
+            }
+            self.files.insert(path.to_string(), bytes.to_vec());
+            Ok(())
+        }
+        fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+            self.calls += 1;
+            let bytes = self.files.remove(from).ok_or_else(|| Error::new(ErrorCode::NotFound, "远程文件不存在"))?;
+            self.files.insert(to.to_string(), bytes);
+            Ok(())
+        }
+        fn remove(&mut self, path: &str) -> Result<()> {
+            self.calls += 1;
+            self.files.remove(path);
+            Ok(())
+        }
+        fn paths(&self) -> Vec<String> {
+            self.files.keys().cloned().collect()
+        }
+    }
+
+    fn request(app_data: &Path, confirmed: bool, posix: bool) -> RemoteWriteRequest {
+        RemoteWriteRequest {
+            confirmed,
+            exec_id: "tx-100".into(),
+            host: "build-01".into(),
+            remote_path: "/opt/gateway/app.conf".into(),
+            bytes: b"new-bytes".to_vec(),
+            app_data_dir: app_data.to_path_buf(),
+            posix_rename: posix,
+            index: 1,
+        }
+    }
+
+    #[test]
+    fn prompt_uses_the_shell_backup_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let app_data = home.path().join("app-data");
+        let prompt = prompt_for(&app_data, "tx-100").unwrap();
+        let dir = tx_backup_dir(&app_data, "tx-100").unwrap();
+        assert_eq!(prompt.backup_dir, dir.display().to_string());
+        assert_eq!(dir, app_data.join("bak").join("tx-100"));
+        assert_eq!(prompt.title, "远程写入暂不支持回滚");
+        assert_eq!(
+            prompt.body,
+            format!("写入前会把远端原文件备份到本机（{}），出问题可以从这里手工恢复。", dir.display())
+        );
+        assert_eq!(prompt.cancel_label, "取消");
+        assert_eq!(prompt.proceed_label, "仍然写入");
+        assert_eq!(prompt.default_button, "取消");
+        assert!(!prompt.body.contains("~/"));
+        assert!(!prompt.body.contains("HeTianXia"));
+    }
+
+    #[test]
+    fn macos_path_is_bundle_id_under_application_support() {
+        let app_data = PathBuf::from("/Users/me/Library/Application Support").join(brand::BUNDLE_ID);
+        let dir = tx_backup_dir(&app_data, "tx-100").unwrap();
+        assert_eq!(
+            dir,
+            PathBuf::from("/Users/me/Library/Application Support/com.hetianxia.app/bak/tx-100")
+        );
+        let body = dialog_body(&dir);
+        assert!(body.contains("/Users/me/Library/Application Support/com.hetianxia.app/bak/tx-100"));
+        assert!(!body.contains("HeTianXia"));
+    }
+
+    #[test]
+    fn cancel_writes_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let mut mem = Mem::new(BTreeMap::from([("/opt/gateway/app.conf".into(), b"old-bytes".to_vec())]));
+        let before = mem.files.clone();
+        let mut log = RuntimeLog::default();
+        let result = commit_remote_write(&mut mem, &mut log, &request(home.path(), false, true)).unwrap();
+        assert_eq!(result, CommitResult::Cancelled);
+        assert_eq!(mem.calls, 0);
+        assert_eq!(mem.files, before);
+        assert!(log.lines.is_empty());
+        let dir = tx_backup_dir(home.path(), "tx-100").unwrap();
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn successful_write_backs_up_and_leaves_no_temp() {
+        for posix in [true, false] {
+            let home = tempfile::tempdir().unwrap();
+            let mut mem = Mem::new(BTreeMap::from([("/opt/gateway/app.conf".into(), b"old-bytes".to_vec())]));
+            let mut log = RuntimeLog::default();
+            let prompt = prompt_for(home.path(), "tx-100").unwrap();
+            let result = commit_remote_write(&mut mem, &mut log, &request(home.path(), true, posix)).unwrap();
+            let CommitResult::Written(staged) = result else { panic!("expected write"); };
+            assert_eq!(staged.backup_dir.display().to_string(), prompt.backup_dir);
+            assert_eq!(staged.op, "remote_overwrite");
+            let expect = sha256_hex(b"old-bytes");
+            assert_eq!(staged.hash.as_deref(), Some(expect.as_str()));
+            let saved = staged.backup_dir.join("files").join("opt/gateway/app.conf");
+            assert_eq!(fs::read(&saved).unwrap(), b"old-bytes");
+            assert_eq!(hashutil::hash_file_sha256(&saved).unwrap(), expect);
+            let manifest = fs::read_to_string(staged.backup_dir.join("manifest.json")).unwrap();
+            assert!(manifest.contains(&expect));
+            assert!(manifest.contains("remote_overwrite"));
+            assert!(manifest.contains("build-01"));
+            assert!(manifest.contains("opt/gateway/app.conf"));
+            assert_eq!(mem.files.get("/opt/gateway/app.conf").map(Vec::as_slice), Some(b"new-bytes".as_slice()));
+            assert!(mem.paths().iter().all(|path| !path.contains(TEMP_TAG)));
+            assert_eq!(mem.paths(), vec!["/opt/gateway/app.conf".to_string()]);
+            assert!(!log.lines.is_empty());
+            assert_eq!(log.lines[0].category, "sftp-rename");
+        }
+    }
+
+    #[test]
+    fn failed_write_leaves_the_remote_file_and_no_temp() {
+        let home = tempfile::tempdir().unwrap();
+        let mut mem = Mem::new(BTreeMap::from([("/opt/gateway/app.conf".into(), b"old-bytes".to_vec())]));
+        mem.fail_write = true;
+        let mut log = RuntimeLog::default();
+        let err = commit_remote_write(&mut mem, &mut log, &request(home.path(), true, true)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io);
+        assert_eq!(mem.files.get("/opt/gateway/app.conf").map(Vec::as_slice), Some(b"old-bytes".as_slice()));
+        assert!(mem.paths().iter().all(|path| !path.contains(TEMP_TAG)));
+        let saved = tx_backup_dir(home.path(), "tx-100").unwrap().join("files").join("opt/gateway/app.conf");
+        assert_eq!(fs::read(saved).unwrap(), b"old-bytes");
+    }
+}

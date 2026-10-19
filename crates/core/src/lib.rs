@@ -13,6 +13,7 @@ pub mod pathutil;
 pub mod plans;
 pub mod prefs;
 pub mod remote;
+pub mod remote_write;
 pub mod runlock;
 pub mod scan;
 pub mod secrets;

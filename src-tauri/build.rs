@@ -21,6 +21,7 @@ fn main() {
         "trust_host_fingerprint",
         "remote_backup_path",
         "remote_rename_plan",
+        "remote_write_prompt",
         "probe_remote",
     ]);
     if let Err(error) = tauri_build::try_build(tauri_build::Attributes::new().app_manifest(manifest)) {

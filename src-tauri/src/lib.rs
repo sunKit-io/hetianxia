@@ -126,6 +126,7 @@ pub fn run() {
             commands::trust_host_fingerprint,
             commands::remote_backup_path,
             commands::remote_rename_plan,
+            commands::remote_write_prompt,
             commands::probe_remote,
         ])
         .build(tauri::generate_context!())

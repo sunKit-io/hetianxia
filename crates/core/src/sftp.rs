@@ -421,6 +421,112 @@ impl RemoteSession {
             .await
             .map_err(map_net)
     }
+
+    /// 确认之后才写。先把远端原文件落到本机 `bak/<id>/`，再写临时文件并改名。
+    /// 成功返回时，远端不应再留下 `.htx-` 临时文件。
+    pub async fn commit_overwrite(
+        &mut self,
+        req: crate::remote_write::RemoteWriteRequest,
+    ) -> Result<crate::remote_write::CommitResult> {
+        if !req.confirmed {
+            return Ok(crate::remote_write::CommitResult::Cancelled);
+        }
+        let dest = req.remote_path.clone();
+        let original = if self.exists(&dest).await? { Some(self.read_file(&dest).await?) } else { None };
+        let staged = crate::remote_write::stage_before_write(&req, original.as_deref())?;
+        let temp = crate::remote_write::remote_temp_path(&dest)?;
+        let backup = crate::remote_write::remote_backup_name(&dest)?;
+        if let Err(err) = self.write_new(&temp, &req.bytes).await {
+            let _ = self.remove_quiet(&temp).await;
+            return Err(err);
+        }
+        if let Err(err) = self.replace_temp(&temp, &dest, &backup, req.posix_rename).await {
+            let _ = self.remove_quiet(&temp).await;
+            let _ = self.remove_quiet(&backup).await;
+            return Err(err);
+        }
+        let _ = self.remove_quiet(&temp).await;
+        let _ = self.remove_quiet(&backup).await;
+        if self.exists(&temp).await? || self.exists(&backup).await? {
+            return Err(Error::new(ErrorCode::Io, "远程临时文件还在"));
+        }
+        let got = self.read_file(&dest).await?;
+        if hashutil::sha256_hex(&got) != hashutil::sha256_hex(&req.bytes) {
+            return Err(Error::new(ErrorCode::VerifyFailed, format!("{dest} 写入后的哈希和内容不一致")));
+        }
+        Ok(crate::remote_write::CommitResult::Written(staged))
+    }
+
+    async fn write_new(&self, path: &str, bytes: &[u8]) -> Result<()> {
+        let flags = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE;
+        let opened = self.sftp.open(path, flags, FileAttributes::empty()).await.map_err(map_sftp)?;
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let end = (offset + 32 * 1024).min(bytes.len());
+            if let Err(err) = self.sftp.write(&opened.handle, offset as u64, bytes[offset..end].to_vec()).await {
+                let _ = self.sftp.close(&opened.handle).await;
+                let _ = self.sftp.remove(path).await;
+                return Err(map_sftp(err));
+            }
+            offset = end;
+        }
+        self.sftp.close(&opened.handle).await.map_err(map_sftp)?;
+        Ok(())
+    }
+
+    async fn replace_temp(&mut self, temp: &str, dest: &str, backup: &str, posix_rename: bool) -> Result<()> {
+        let use_posix = posix_rename && self.posix_rename;
+        log_rename_steps(&mut self.log, use_posix);
+        if use_posix {
+            return self.posix_rename_over(temp, dest).await;
+        }
+        if self.exists(dest).await? {
+            self.rename_path(dest, backup).await?;
+        }
+        if let Err(err) = self.rename_path(temp, dest).await {
+            if self.exists(backup).await? {
+                let _ = self.rename_path(backup, dest).await;
+            }
+            return Err(err);
+        }
+        if self.exists(backup).await? {
+            self.remove_quiet(backup).await?;
+        }
+        Ok(())
+    }
+
+    async fn posix_rename_over(&self, from: &str, to: &str) -> Result<()> {
+        let mut data = ssh_string(from);
+        data.extend(ssh_string(to));
+        let packet = self.sftp.extended(POSIX_RENAME, data).await.map_err(map_sftp)?;
+        match packet {
+            russh_sftp::protocol::Packet::Status(status) if status.status_code == StatusCode::Ok => Ok(()),
+            russh_sftp::protocol::Packet::Status(status) => {
+                Err(map_sftp(russh_sftp::client::error::Error::Status(status)))
+            }
+            _ => Err(Error::new(ErrorCode::Io, "SFTP 操作失败")),
+        }
+    }
+
+    async fn rename_path(&self, from: &str, to: &str) -> Result<()> {
+        self.sftp.rename(from, to).await.map_err(map_sftp)?;
+        Ok(())
+    }
+
+    async fn remove_quiet(&self, path: &str) -> Result<()> {
+        match self.sftp.remove(path).await {
+            Ok(_) => Ok(()),
+            Err(russh_sftp::client::error::Error::Status(status)) if status.status_code == StatusCode::NoSuchFile => Ok(()),
+            Err(err) => Err(map_sftp(err)),
+        }
+    }
+}
+
+fn ssh_string(value: &str) -> Vec<u8> {
+    let bytes = value.as_bytes();
+    let mut out = (bytes.len() as u32).to_be_bytes().to_vec();
+    out.extend_from_slice(bytes);
+    out
 }
 
 async fn authenticate(handle: &mut russh::client::Handle<KeyHandler>, req: &ProbeRequest) -> Result<()> {

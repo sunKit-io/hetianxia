@@ -6,6 +6,7 @@ use hetianxia_core::pathutil::Ignore;
 use hetianxia_core::remote::{self, ImportedHost};
 use hetianxia_core::scan::{self, ScanOptions, ScanOutput};
 use hetianxia_core::secrets::{self, KeyringStore, SecretStatus, SecretStore};
+use hetianxia_core::remote_write::{self, RemoteWritePrompt};
 use hetianxia_core::sftp::{self, ProbeReport, ProbeRequest};
 use hetianxia_core::vfs::LocalFs;
 use std::path::{Path, PathBuf};
@@ -227,6 +228,12 @@ pub fn remote_backup_path(home: String, exec_id: String) -> Result<String, Error
 #[tauri::command]
 pub fn remote_rename_plan(posix_rename: bool) -> Vec<String> {
     sftp::rename_steps(posix_rename).iter().map(|s| (*s).to_string()).collect()
+}
+
+#[tauri::command]
+pub fn remote_write_prompt(app: tauri::AppHandle, exec_id: String) -> Result<RemoteWritePrompt, Error> {
+    let app_data = app.path().app_data_dir().map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
+    remote_write::prompt_for(&app_data, &exec_id)
 }
 
 #[tauri::command]

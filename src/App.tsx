@@ -6,6 +6,7 @@ import { DiffEditor } from "./editor";
 import { afterResume, engineCode, formatEngineError, formatOffer, formatReport, type ConflictFile, type RecoveryOffer } from "./engine";
 import { ALPINE, UNKNOWN, UBUNTU, canContinue, connectionSubtitle, systemTypeLabel, warningBanner, type RemoteOs } from "./os";
 import { Text } from "./plain";
+import { beginRemoteWrite, newExecId, previewAppDataDir, settleRemoteWrite, type PendingRemoteWrite } from "./remoteWrite";
 import {
   DETAIL_DELETED,
   DETAIL_MODIFIED,
@@ -152,6 +153,7 @@ export function App() {
   const [hostId, setHostId] = useState("build-01");
   const [allowReadonly, setAllowReadonly] = useState(false);
   const [sheet, setSheet] = useState<Sheet>("startup");
+  const [remoteTx, setRemoteTx] = useState<PendingRemoteWrite | null>(null);
   const [cleared, setCleared] = useState<Record<string, boolean>>({});
   const [execId, setExecId] = useState("pending-upgrade");
   const [status, setStatus] = useState<string | null>(null);
@@ -245,7 +247,15 @@ export function App() {
           />
         )}
         {page === "preview" && (
-          <PreviewPage allowReadonly={allowReadonly} setAllowReadonly={setAllowReadonly} onLog={() => setSheet("log")} />
+          <PreviewPage
+            allowReadonly={allowReadonly}
+            setAllowReadonly={setAllowReadonly}
+            onLog={() => setSheet("log")}
+            onRemoteWrite={() => {
+              const pending = beginRemoteWrite(previewAppDataDir(), newExecId());
+              setRemoteTx(pending);
+            }}
+          />
         )}
         {page === "history" && (
           <HistoryPage
@@ -300,6 +310,22 @@ export function App() {
               </footer>
             </div>
           </div>
+        )}
+        {remoteTx && (
+          <RemoteWriteSheet
+            pending={remoteTx}
+            onCancel={() => {
+              settleRemoteWrite("取消", () => {
+                throw new Error("取消不能写入");
+              });
+              setRemoteTx(null);
+            }}
+            onProceed={() => {
+              settleRemoteWrite("仍然写入", () => {
+                setRemoteTx(null);
+              });
+            }}
+          />
         )}
       </div>
     </div>
@@ -379,7 +405,8 @@ function SshPage({ host, cleared, onPick, onClear }: { host: Host; cleared: bool
   );
 }
 
-function PreviewPage({ allowReadonly, setAllowReadonly, onLog }: { allowReadonly: boolean; setAllowReadonly: (v: boolean) => void; onLog: () => void }) {
+function PreviewPage({ allowReadonly, setAllowReadonly, onLog, onRemoteWrite }: { allowReadonly: boolean; setAllowReadonly: (v: boolean) => void; onLog: () => void; onRemoteWrite: () => void }) {
+  const [target, setTarget] = useState<"local" | "remote">("local");
   const counts = useMemo(() => {
     const overwrite = allowReadonly ? 13 : 11;
     const skip = allowReadonly ? 0 : 2;
@@ -389,7 +416,8 @@ function PreviewPage({ allowReadonly, setAllowReadonly, onLog }: { allowReadonly
     <div className="sheetwrap">
       <div className="sheet">
         <h1><ShieldAlert size={18} /> 确认执行升级</h1>
-        <p className="sub">OrderCenter · 本机 ~/work/order-center ← release-3.0.0.zip</p>
+        <p className="sub">{target === "remote" ? "OrderCenter · build-01:/opt/gateway ← gateway-1.8" : "OrderCenter · 本机 ~/work/order-center ← release-3.0.0.zip"}</p>
+        <div className="auth">写入到 <span className={target === "local" ? "on" : ""} onClick={() => setTarget("local")}>本机</span><span className={target === "remote" ? "on" : ""} onClick={() => setTarget("remote")}>远程</span></div>
         <div className="stats">
           <b>6<small>新增</small></b>
           <b>{counts.overwrite}<small>覆盖{counts.skip ? "" : " · 其中合并 4"}</small></b>
@@ -412,7 +440,7 @@ function PreviewPage({ allowReadonly, setAllowReadonly, onLog }: { allowReadonly
         <label className="bak"><input type="checkbox" defaultChecked /> 执行前备份到 ~/Library/Application Support/HeTianXia/backups</label>
         <footer>
           <button className="ghost" onClick={onLog}>日志失败示例</button>
-          <button className="primary">备份并执行</button>
+          <button className="primary" onClick={() => { if (target === "remote") onRemoteWrite(); }}>{target === "remote" ? "写入远程" : "备份并执行"}</button>
         </footer>
       </div>
     </div>
@@ -484,6 +512,22 @@ function HistoryPage({ onRollback, onContinue, onResumeRollback }: { onRollback:
           })}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function RemoteWriteSheet({ pending, onCancel, onProceed }: { pending: PendingRemoteWrite; onCancel: () => void; onProceed: () => void }) {
+  return (
+    <div className="mask" onClick={onCancel} onKeyDown={(event) => { if (event.key === "Escape") onCancel(); }}>
+      <div className="sheet small" role="dialog" aria-modal="true" aria-labelledby="remote-write-title" onClick={(event) => event.stopPropagation()}>
+        <h1 id="remote-write-title"><AlertTriangle size={18} /> <Text value={pending.title} /></h1>
+        <p><Text value={pending.body} /></p>
+        <footer>
+          <span />
+          <button type="button" className="ghost" onClick={onProceed}>{pending.proceedLabel}</button>
+          <button type="button" className="primary" autoFocus data-default="true" onClick={onCancel}>{pending.cancelLabel}</button>
+        </footer>
+      </div>
     </div>
   );
 }
