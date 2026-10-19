@@ -76,6 +76,7 @@ export function DiffEditor({ onWriteFailed }: { onWriteFailed: () => void }) {
   const rightView = useRef<EditorView | null>(null);
   const hunks = useMemo(() => lineHunks(LEFT, RIGHT), []);
   const [choice, setChoice] = useState<"left" | "right" | "both">("right");
+  const [bothOrder, setBothOrder] = useState<"left-top" | "right-top">("left-top");
   const [active, setActive] = useState(0);
 
   useEffect(() => {
@@ -147,15 +148,33 @@ export function DiffEditor({ onWriteFailed }: { onWriteFailed: () => void }) {
     left.dispatch({ effects: EditorView.scrollIntoView(line.from, { y: "start" }) });
   };
 
+  const choiceLabel = choice === "left" ? "保留左边" : choice === "both" ? (bothOrder === "left-top" ? "都保留，左边在上" : "都保留，右边在上") : "用右边";
+  const reset = () => {
+    setChoice("right");
+    setBothOrder("left-top");
+  };
+
   return (
-    <div className="editorwrap">
+    <div className="editorwrap" data-merge={choice} data-order={bothOrder}>
+      <div className="filebar">
+        <button className={choice === "right" ? "on" : ""} onClick={() => setChoice("right")}>全部用右边</button>
+        <button className={choice === "left" ? "on" : ""} onClick={() => setChoice("left")}>全部保留左边</button>
+        <button onClick={reset}>全部恢复</button>
+      </div>
       <div className="editor">
         <div className="pane" ref={leftHost} data-pane="left" />
         <div className="gutterbar">
           <b>中间工具条</b>
-          <button className={choice === "left" ? "on" : ""} onClick={() => setChoice("left")}>保留左侧</button>
-          <button className={choice === "right" ? "on" : ""} onClick={() => setChoice("right")}>保留右侧</button>
+          <button className={choice === "right" ? "on" : ""} onClick={() => setChoice("right")}>用右边</button>
+          <button className={choice === "left" ? "on" : ""} onClick={() => setChoice("left")}>保留左边</button>
           <button className={choice === "both" ? "on" : ""} onClick={() => setChoice("both")}>都保留</button>
+          <button onClick={reset}>恢复</button>
+          {choice === "both" && (
+            <div className="bothorder" role="group" aria-label="都保留的先后">
+              <button className={bothOrder === "left-top" ? "on" : ""} onClick={() => setBothOrder("left-top")}>左边在上</button>
+              <button className={bothOrder === "right-top" ? "on" : ""} onClick={() => setBothOrder("right-top")}>右边在上</button>
+            </div>
+          )}
         </div>
         <div className="pane" ref={rightHost} data-pane="right" />
       </div>
@@ -167,7 +186,7 @@ export function DiffEditor({ onWriteFailed }: { onWriteFailed: () => void }) {
               <button className={index === active ? "on" : ""} onClick={() => jump(index)}>
                 左 {hunk.leftStart}–{Math.max(hunk.leftStart, hunk.leftEnd - 1)} 行 · 右 {hunk.rightStart}–{Math.max(hunk.rightStart, hunk.rightEnd - 1)} 行
               </button>
-              <em>{choice === "left" ? "保留左侧" : choice === "both" ? "都保留" : "保留右侧"}</em>
+              <em>{choiceLabel}</em>
             </li>
           ))}
         </ul>
