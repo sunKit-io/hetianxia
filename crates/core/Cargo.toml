@@ -36,9 +36,6 @@ indexmap = "=2.6.0"
 hashbrown = "=0.15.2"
 zeroize_derive = "=1.4.2"
 zopfli = "=0.8.1"
-# filetime 在 redox 目标上依赖 libredox。0.9.x 的清单用了 resolver 3，Rust 1.83 读不了。
-libredox = "=0.1.17"
-redox_syscall = "=0.8.1"
 # russh 的 home 0.5.12、rand 0.9 的 getrandom 0.3.4 都要用 edition 2024。钉在还能用 1.83 的版本。
 home = "=0.5.11"
 getrandom = "=0.3.3"
@@ -52,6 +49,12 @@ keyring = { version = "=3.6.3", features = ["apple-native", "windows-native", "l
 [dev-dependencies]
 proptest = "=1.5.0"
 tempfile = "=3.14.0"
+
+# filetime 只在 redox 上依赖 libredox。0.9.x 的清单用了 resolver 3，Rust 1.83 读不了。
+# 不能放进普通依赖：libredox 0.1.17 在 macOS 上会引用 Linux 才有的 libc 常量。
+[target.'cfg(target_os = "redox")'.dependencies]
+libredox = "=0.1.17"
+redox_syscall = "=0.8.1"
 
 [[bin]]
 name = "hetianxia-linkcheck"
