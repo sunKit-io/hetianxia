@@ -15,6 +15,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.83.0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
       - name: cargo test
         run: cargo test -p hetianxia-core
       - name: cargo test fault-inject
@@ -25,3 +32,91 @@ jobs:
           python3 scripts/scan_release_strings.py --forbid target/release
           cargo build -p hetianxia-core --release --locked --bin hetianxia-linkcheck --features fault-inject
           python3 scripts/scan_release_strings.py --require-sentinel target/release
+      - name: cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features --locked
+      - name: javascript licenses
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run licenses
+
+  macos-build:
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+    strategy:
+      matrix:
+        os: [macos-13, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.83.0
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: test on macOS
+        run: cargo test -p hetianxia-core
+
+  sign-mac:
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+    runs-on: macos-14
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v4
+      - name: signing uses Actions secrets only
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          echo "签名和公证只在 main 或 tag 的 push 上跑，不响应 fork 的 pull_request。"
+          if [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "没有开发者证书，跳过正式签名。本地可用 codesign -s - 做 ad-hoc。"
+            exit 0
+          fi
+          echo "证书已配置。正式 dmg 打包命令见 README。"
+
+  package-mac:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - id: app
+        name: detect the Tauri app
+        run: |
+          if [ -f src-tauri/Cargo.toml ] && [ -f src-tauri/src/main.rs ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "这一支还没有桌面壳，跳过 .app 和 dmg 扫描。"
+          fi
+      - uses: dtolnay/rust-toolchain@1.83.0
+        if: steps.app.outputs.present == 'true'
+      - uses: pnpm/action-setup@v4
+        if: steps.app.outputs.present == 'true'
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        if: steps.app.outputs.present == 'true'
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: install frontend
+        if: steps.app.outputs.present == 'true'
+        run: pnpm install --frozen-lockfile
+      - name: build the release app and dmg
+        if: steps.app.outputs.present == 'true'
+        run: pnpm exec tauri build --bundles dmg
+      - name: scan the built app and the executable inside the dmg
+        if: steps.app.outputs.present == 'true'
+        run: python3 scripts/scan_release_strings.py --forbid src-tauri/target/release/bundle
+      - name: fault-inject build is caught
+        if: steps.app.outputs.present == 'true'
+        run: |
+          cargo build --release --locked --manifest-path src-tauri/Cargo.toml --features fault-inject
+          python3 scripts/scan_release_strings.py --require-sentinel src-tauri/target/release/hetianxia
+          if python3 scripts/scan_release_strings.py --forbid src-tauri/target/release/hetianxia; then
+            echo "fault-inject build was not caught"
+            exit 1
+          fi

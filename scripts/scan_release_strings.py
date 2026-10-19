@@ -25,8 +25,23 @@ import sys
 import tempfile
 
 NEEDLES = (b"UPG_FAULT", b"sftp-disconnect", b"HTX_FAULT_INJECT_ENABLED", b"fsync-dir")
-STAGE = re.compile(rb"(?:backup|write|verify-pre|verify-post|rename|rollback|log|fsync-dir|sftp-disconnect):[0-9a-z]")
-STAGE_NAMES = (b"SftpDisconnect", b"FsyncDir", b"VerifyPre", b"VerifyPost")
+STAGE = re.compile(
+    rb"(?:backup|write|verify-pre|verify-post|rename|rollback|log|log-probe|fsync-dir|sftp-disconnect):[0-9a-z]"
+)
+# Stage 变体名，外加 Item::LogProbe。按标识符边界匹配，避免撞上 core::fmt::Write 这类符号。
+# `Write` 不放进裸名字：正式二进制里有 `std::io::Write`。阶段语法 `write:N` 仍在 STAGE 里。
+STAGE_NAMES = (
+    b"Backup",
+    b"VerifyPre",
+    b"VerifyPost",
+    b"Rename",
+    b"Rollback",
+    b"Log",
+    b"LogProbe",
+    b"SftpDisconnect",
+    b"FsyncDir",
+)
+STAGE_NAME_RE = re.compile(rb"(?<![A-Za-z0-9_])(?:" + b"|".join(STAGE_NAMES) + rb")(?![A-Za-z0-9_])")
 SENTINEL = b"HTX_FAULT_INJECT_ENABLED"
 LINKCHECK = "hetianxia-linkcheck"
 
@@ -105,11 +120,10 @@ def forbid_blobs(blobs):
             print(f"{label} contains {match.group()!r} at {match.start()}")
             failed += 1
             break
-        for name in STAGE_NAMES:
-            idx = blob.find(name)
-            if idx >= 0:
-                print(f"{label} contains {name.decode()} at {idx}")
-                failed += 1
+        for match in STAGE_NAME_RE.finditer(blob):
+            print(f"{label} contains {match.group().decode()} at {match.start()}")
+            failed += 1
+            break
     return failed
 
 

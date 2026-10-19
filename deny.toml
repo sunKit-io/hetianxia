@@ -1,0 +1,47 @@
+# cargo-deny：许可证与安全公告。
+# GPL / AGPL / LGPL 不在 allow 里，遇到就会失败。
+
+[graph]
+targets = []
+all-features = true
+
+[advisories]
+ignore = [
+    # zip 9 才修这些，而 zip 9 需要 Rust 1.88。本仓库钉在 1.83。
+    # 解压不走 ZipArchive::extract / ZipStreamReader::extract：符号链接条目直接跳过，
+    # 路径穿越拒绝整个包，写出字节超过声明大小就中止。
+    { id = "RUSTSEC-2026-0367", reason = "不调用 zip 的 extract。修复需要 zip 9 / Rust 1.88。" },
+    { id = "RUSTSEC-2026-0368", reason = "不创建 zip 里的符号链接。修复需要 zip 9 / Rust 1.88。" },
+    { id = "RUSTSEC-2026-0369", reason = "不调用 ZipStreamReader::extract。修复需要 zip 9 / Rust 1.88。" },
+]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+    # Boost 是宽松许可。xxhash-rust 和 zopfli 的对象池使用它。
+    "BSL-1.0",
+]
+exceptions = []
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
