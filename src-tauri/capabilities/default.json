@@ -1,0 +1,17 @@
+{
+  "identifier": "default",
+  "description": "主窗口只能调用命令层，不能直接访问文件系统或 shell。",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "allow-scan",
+    "allow-compare",
+    "allow-diff",
+    "allow-merge",
+    "allow-execute",
+    "allow-rollback",
+    "allow-history",
+    "allow-connections",
+    "allow-startup-offers"
+  ]
+}

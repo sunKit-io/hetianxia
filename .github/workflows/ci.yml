@@ -112,13 +112,13 @@ jobs:
         run: pnpm exec tauri build --bundles dmg
       - name: scan the built app and the executable inside the dmg
         if: steps.app.outputs.present == 'true'
-        run: python3 scripts/scan_release_strings.py --forbid src-tauri/target/release/bundle
+        run: python3 scripts/scan_release_strings.py --forbid target/release/bundle
       - name: fault-inject build is caught
         if: steps.app.outputs.present == 'true'
         run: |
           cargo build --release --locked --manifest-path src-tauri/Cargo.toml --features fault-inject
-          python3 scripts/scan_release_strings.py --require-sentinel src-tauri/target/release/hetianxia
-          if python3 scripts/scan_release_strings.py --forbid src-tauri/target/release/hetianxia; then
+          python3 scripts/scan_release_strings.py --require-sentinel target/release/hetianxia
+          if python3 scripts/scan_release_strings.py --forbid target/release/hetianxia; then
             echo "fault-inject build was not caught"
             exit 1
           fi

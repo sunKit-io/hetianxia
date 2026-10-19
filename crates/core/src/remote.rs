@@ -9,7 +9,8 @@ pub const PROXY_BADGE: &str = "第二版支持";
 pub const PROXY_REASON: &str = "需要跳板机，第二版支持";
 pub const MAX_HASH_PATHS: usize = 200;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ImportedHost {
     pub alias: String,
     pub host_name: String,
