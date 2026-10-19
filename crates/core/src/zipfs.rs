@@ -4,8 +4,8 @@
 use crate::error::{Error, ErrorCode, Result};
 use crate::pathutil::RelPath;
 use std::fs::{self, File};
-use std::io::{Read, Write};
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use zip::ZipArchive;
 
 pub const MAX_UNCOMPRESSED: u64 = 4 * 1024 * 1024 * 1024;
@@ -80,7 +80,45 @@ pub struct ZipReport {
     pub skipped_symlinks: Vec<String>,
 }
 
+/// 解压需要的空间是声明的解压后总大小的 1.1 倍。正好等于这个数可以通过。
+pub fn required_free_bytes(uncompressed_total: u64) -> u64 {
+    uncompressed_total.saturating_mul(11) / 10
+}
+
+pub fn ensure_free_space(available: u64, uncompressed_total: u64) -> Result<()> {
+    let need = required_free_bytes(uncompressed_total);
+    if available < need {
+        return Err(Error::new(
+            ErrorCode::NoSpace,
+            format!("解压大约需要 {need} 字节，可用 {available} 字节"),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub struct TempExtract {
+    pub dir: PathBuf,
+    pub report: ZipReport,
+}
+
+/// 解压到 `temp_root/zip-<uuid>/`。失败时删掉这个目录，不留下解到一半的文件。
+pub fn extract_to_temp(zip_path: &Path, temp_root: &Path) -> Result<TempExtract> {
+    let dir = temp_root.join(format!("zip-{}", uuid::Uuid::new_v4()));
+    match extract(zip_path, &dir) {
+        Ok(report) => Ok(TempExtract { dir, report }),
+        Err(e) => {
+            let _ = fs::remove_dir_all(&dir);
+            Err(e)
+        }
+    }
+}
+
 pub fn extract(zip_path: &Path, dest: &Path) -> Result<ZipReport> {
+    extract_inner(zip_path, dest, None)
+}
+
+fn extract_inner(zip_path: &Path, dest: &Path, free_override: Option<u64>) -> Result<ZipReport> {
     let file = File::open(zip_path)?;
     let mut archive = ZipArchive::new(file).map_err(|e| Error::new(ErrorCode::Io, e.to_string()))?;
     let mut stats = Vec::new();
@@ -88,11 +126,11 @@ pub fn extract(zip_path: &Path, dest: &Path) -> Result<ZipReport> {
     let mut slips = Vec::new();
     for i in 0..archive.len() {
         let entry = archive.by_index(i).map_err(|e| Error::new(ErrorCode::Io, e.to_string()))?;
-        let name = entry.name().to_string();
+        let name = entry_name(zip_path, &entry)?;
         stats.push(EntryStat {
             uncompressed: entry.size(),
             compressed: entry.compressed_size(),
-            is_dir: entry.is_dir(),
+            is_dir: name.ends_with('/'),
         });
         if is_zip_slip(&name) {
             slips.push(name);
@@ -111,12 +149,19 @@ pub fn extract(zip_path: &Path, dest: &Path) -> Result<ZipReport> {
         };
         return Err(Error::new(ErrorCode::ZipBomb, message));
     }
+    let total = stats.iter().fold(0u64, |acc, e| acc.saturating_add(e.uncompressed));
+    let available = match free_override {
+        Some(n) => n,
+        None => free_bytes(dest)?,
+    };
+    ensure_free_space(available, total)?;
     fs::create_dir_all(dest)?;
     let mut report = ZipReport { files: Vec::new(), skipped_symlinks: Vec::new() };
+    let mut written: Vec<PathBuf> = Vec::new();
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| Error::new(ErrorCode::Io, e.to_string()))?;
-        let name = entry.name().to_string();
-        if entry.is_dir() {
+        let name = entry_name(zip_path, &entry)?;
+        if name.ends_with('/') {
             continue;
         }
         if is_symlink(entry.unix_mode()) {
@@ -131,11 +176,72 @@ pub fn extract(zip_path: &Path, dest: &Path) -> Result<ZipReport> {
             fs::create_dir_all(parent)?;
         }
         let mut out = fs::OpenOptions::new().create(true).write(true).truncate(true).open(&target)?;
-        copy_capped(&mut entry, declared, &mut out)?;
-        out.sync_all()?;
+        if let Err(e) = copy_capped(&mut entry, declared, &mut out) {
+            drop(out);
+            written.push(target);
+            cleanup_written(&written);
+            return Err(e);
+        }
+        if let Err(e) = out.sync_all() {
+            drop(out);
+            written.push(target);
+            cleanup_written(&written);
+            return Err(Error::from(e));
+        }
+        written.push(target);
         report.files.push(rel.as_str().to_string());
     }
     Ok(report)
+}
+
+fn entry_name<R: Read>(zip_path: &Path, entry: &zip::read::ZipFile<'_, R>) -> Result<String> {
+    let utf8 = utf8_flag(zip_path, entry.header_start())?;
+    decode_entry_name(entry.name_raw(), utf8)
+}
+
+fn utf8_flag(zip_path: &Path, header_start: u64) -> Result<bool> {
+    let mut file = File::open(zip_path)?;
+    let at = header_start.checked_add(6).ok_or_else(|| Error::new(ErrorCode::Io, "zip 头偏移溢出"))?;
+    file.seek(SeekFrom::Start(at))?;
+    let mut buf = [0u8; 2];
+    file.read_exact(&mut buf)?;
+    Ok(u16::from_le_bytes(buf) & (1 << 11) != 0)
+}
+
+fn cleanup_written(paths: &[PathBuf]) {
+    for path in paths.iter().rev() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn free_bytes(dest: &Path) -> Result<u64> {
+    let mut probe = dest.to_path_buf();
+    if !probe.exists() {
+        if let Some(parent) = dest.parent() {
+            probe = parent.to_path_buf();
+        }
+    }
+    while !probe.exists() {
+        if !probe.pop() {
+            break;
+        }
+    }
+    #[cfg(unix)]
+    {
+        let text = probe.to_string_lossy();
+        let c = std::ffi::CString::new(text.as_bytes()).map_err(|_| Error::new(ErrorCode::InvalidLocation, "路径含空字节"))?;
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::statvfs(c.as_ptr(), &mut stat) };
+        if rc != 0 {
+            return Err(Error::new(ErrorCode::Io, "读不到剩余空间"));
+        }
+        Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = probe;
+        Ok(u64::MAX)
+    }
 }
 
 pub fn copy_capped(reader: &mut impl Read, declared: u64, out: &mut impl Write) -> Result<u64> {
@@ -262,5 +368,166 @@ mod tests {
         assert!(is_zip_slip("/etc/passwd"));
         assert!(is_zip_slip("C:/windows/a"));
         assert!(!is_zip_slip("src/a.txt"));
+    }
+
+    #[test]
+    fn extract_decodes_gbk_when_the_utf8_flag_is_off() {
+        let (gbk, _, _) = encoding_rs::GBK.encode("说明.txt");
+        let gbk = gbk.into_owned();
+        let placeholder = "n".repeat(gbk.len());
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("gbk.zip");
+        let mut w = ZipWriter::new(File::create(&zip_path).unwrap());
+        w.start_file(&placeholder, SimpleFileOptions::default()).unwrap();
+        w.write_all(b"hi").unwrap();
+        w.finish().unwrap();
+        let mut bytes = fs::read(&zip_path).unwrap();
+        let needle = placeholder.as_bytes();
+        let mut hits = 0;
+        let mut i = 0;
+        while i + needle.len() <= bytes.len() {
+            if &bytes[i..i + needle.len()] == needle {
+                bytes[i..i + needle.len()].copy_from_slice(&gbk);
+                hits += 1;
+                i += needle.len();
+            } else {
+                i += 1;
+            }
+        }
+        assert!(hits >= 2, "local and central names, got {hits}");
+        fs::write(&zip_path, bytes).unwrap();
+        let dest = dir.path().join("out");
+        let report = extract(&zip_path, &dest).unwrap();
+        assert_eq!(report.files, vec!["说明.txt".to_string()]);
+        assert_eq!(fs::read(dest.join("说明.txt")).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn extract_rejects_undecodable_names_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("bad.zip");
+        let mut w = ZipWriter::new(File::create(&zip_path).unwrap());
+        w.start_file("ab", SimpleFileOptions::default()).unwrap();
+        w.write_all(b"x").unwrap();
+        w.finish().unwrap();
+        let mut bytes = fs::read(&zip_path).unwrap();
+        let mut hits = 0;
+        let mut i = 0;
+        while i + 2 <= bytes.len() {
+            if &bytes[i..i + 2] == b"ab" {
+                bytes[i] = 0xFF;
+                bytes[i + 1] = 0xFF;
+                hits += 1;
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        assert!(hits >= 2);
+        fs::write(&zip_path, bytes).unwrap();
+        let dest = dir.path().join("out");
+        let err = extract(&zip_path, &dest).unwrap_err();
+        assert_eq!(err.code, ErrorCode::ZipEncoding);
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn bomb_during_extract_removes_files_already_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("bomb.zip");
+        let mut w = ZipWriter::new(File::create(&zip_path).unwrap());
+        let opt = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        w.start_file("src/ok.txt", opt).unwrap();
+        w.write_all(b"ok").unwrap();
+        w.start_file("src/big.txt", opt).unwrap();
+        w.write_all(b"abcdef").unwrap();
+        w.finish().unwrap();
+        shrink_uncompressed_size(&zip_path, b"src/big.txt", 6, 3);
+        let dest = dir.path().join("out");
+        let err = extract(&zip_path, &dest).unwrap_err();
+        assert_eq!(err.code, ErrorCode::ZipBomb);
+        assert!(!dest.join("src/ok.txt").exists());
+        assert!(!dest.join("src/big.txt").exists());
+    }
+
+    #[test]
+    fn temp_extract_uses_zip_uuid_dir_and_removes_it_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("ok.zip");
+        let mut w = ZipWriter::new(File::create(&zip_path).unwrap());
+        w.start_file("a.txt", SimpleFileOptions::default()).unwrap();
+        w.write_all(b"a").unwrap();
+        w.finish().unwrap();
+        let got = extract_to_temp(&zip_path, dir.path()).unwrap();
+        assert!(got.dir.file_name().unwrap().to_string_lossy().starts_with("zip-"));
+        assert_eq!(fs::read(got.dir.join("a.txt")).unwrap(), b"a");
+        let _ = fs::remove_dir_all(&got.dir);
+
+        let bomb = dir.path().join("bomb.zip");
+        let mut w = ZipWriter::new(File::create(&bomb).unwrap());
+        let opt = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        w.start_file("big.txt", opt).unwrap();
+        w.write_all(b"abcdef").unwrap();
+        w.finish().unwrap();
+        shrink_uncompressed_size(&bomb, b"big.txt", 6, 3);
+        let before = fs::read_dir(dir.path()).unwrap().count();
+        let err = extract_to_temp(&bomb, dir.path()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::ZipBomb);
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().all(|n| !n.starts_with("zip-")), "{names:?}");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), before);
+    }
+
+    #[test]
+    fn free_space_shortfall_stops_before_any_file_is_written() {
+        assert_eq!(required_free_bytes(100), 110);
+        assert!(ensure_free_space(110, 100).is_ok());
+        assert_eq!(ensure_free_space(109, 100).unwrap_err().code, ErrorCode::NoSpace);
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("ok.zip");
+        let mut w = ZipWriter::new(File::create(&zip_path).unwrap());
+        w.start_file("a.txt", SimpleFileOptions::default()).unwrap();
+        w.write_all(b"hello").unwrap();
+        w.finish().unwrap();
+        let dest = dir.path().join("out");
+        let err = extract_inner(&zip_path, &dest, Some(1)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NoSpace);
+        assert!(!dest.exists());
+    }
+
+    fn shrink_uncompressed_size(path: &Path, name: &[u8], from: u32, to: u32) {
+        let mut bytes = fs::read(path).unwrap();
+        let mut patched = 0;
+        let mut i = 0;
+        while i + 30 < bytes.len() {
+            if bytes[i..i + 4] == [0x50, 0x4b, 0x03, 0x04] {
+                let name_len = u16::from_le_bytes(bytes[i + 26..i + 28].try_into().unwrap()) as usize;
+                let start = i + 30;
+                if start + name_len <= bytes.len() && &bytes[start..start + name_len] == name {
+                    let un = u32::from_le_bytes(bytes[i + 22..i + 26].try_into().unwrap());
+                    if un == from {
+                        bytes[i + 22..i + 26].copy_from_slice(&to.to_le_bytes());
+                        patched += 1;
+                    }
+                }
+            }
+            if bytes[i..i + 4] == [0x50, 0x4b, 0x01, 0x02] && i + 46 < bytes.len() {
+                let name_len = u16::from_le_bytes(bytes[i + 28..i + 30].try_into().unwrap()) as usize;
+                let start = i + 46;
+                if start + name_len <= bytes.len() && &bytes[start..start + name_len] == name {
+                    let un = u32::from_le_bytes(bytes[i + 24..i + 28].try_into().unwrap());
+                    if un == from {
+                        bytes[i + 24..i + 28].copy_from_slice(&to.to_le_bytes());
+                        patched += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+        assert!(patched >= 2, "patched {patched}");
+        fs::write(path, bytes).unwrap();
     }
 }
