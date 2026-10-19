@@ -13,6 +13,18 @@ ignore = [
     { id = "RUSTSEC-2026-0367", reason = "不调用 zip 的 extract。修复需要 zip 9 / Rust 1.88。" },
     { id = "RUSTSEC-2026-0368", reason = "不创建 zip 里的符号链接。修复需要 zip 9 / Rust 1.88。" },
     { id = "RUSTSEC-2026-0369", reason = "不调用 ZipStreamReader::extract。修复需要 zip 9 / Rust 1.88。" },
+    # 下面这些都挂在钉死的 Tauri 2.1.1 依赖树上。能升的版本要么要 Rust 1.88，要么没有替代版本。
+    { id = "RUSTSEC-2025-0057", reason = "fxhash 0.2.1 经 selectors/kuchikiki 进入 tauri-utils 2.1.0，没有可升级版本。" },
+    { id = "RUSTSEC-2024-0384", reason = "instant 0.1.13 经 tao 0.30.8 进入 tauri-runtime-wry，没有可升级版本。" },
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error 1.0.4 经 gtk 0.18 的宏进入构建，没有可升级版本。" },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 修复在 0.41，plist 1.8 只接受 0.38；plist 1.9 需要 Rust 1.88。" },
+    { id = "RUSTSEC-2026-0195", reason = "同上。quick-xml 0.38 由 plist 1.8 锁住，无法单独升到 0.41。" },
+    { id = "RUSTSEC-2026-0009", reason = "time 的修复在 0.3.47，该版本需要 Rust 1.88。当前锁的是 0.3.44。" },
+    { id = "RUSTSEC-2025-0075", reason = "unic-char-range 经 urlpattern 0.3 进入 tauri 2.1.1，没有可升级版本。" },
+    { id = "RUSTSEC-2025-0080", reason = "unic-common 经 urlpattern 0.3 进入 tauri 2.1.1，没有可升级版本。" },
+    { id = "RUSTSEC-2025-0081", reason = "unic-char-property 经 urlpattern 0.3 进入 tauri 2.1.1，没有可升级版本。" },
+    { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version 经 urlpattern 0.3 进入 tauri 2.1.1，没有可升级版本。" },
+    { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident 经 urlpattern 0.3 进入 tauri 2.1.1，没有可升级版本。" },
 ]
 
 [licenses]
