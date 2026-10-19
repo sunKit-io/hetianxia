@@ -43,6 +43,9 @@ pub struct PlanOp {
 pub struct ExecPlan {
     pub id: String,
     pub project_key: String,
+    /// 这一笔执行的项目目录。执行开始时写成规范路径，旧计划没有这一项时为空。
+    #[serde(default)]
+    pub project_root: String,
     pub ops: Vec<PlanOp>,
     pub summary: Summary,
 }

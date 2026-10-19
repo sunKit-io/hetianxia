@@ -269,6 +269,7 @@ mod tests {
         let plan = ExecPlan {
             id: "exec-1".into(),
             project_key: "demo".into(),
+            project_root: String::new(),
             ops: vec![PlanOp {
                 index: 1,
                 kind: OpKind::Overwrite,
@@ -363,6 +364,7 @@ mod tests {
         ExecPlan {
             id: id.into(),
             project_key: "demo".into(),
+            project_root: String::new(),
             ops: vec![PlanOp {
                 index: 1,
                 kind: OpKind::Overwrite,
@@ -424,5 +426,54 @@ mod tests {
         assert!(rolled_done_again.is_err(), "已回滚后再 rollback_run 不应再执行: {rolled_done_again:?}");
         assert_eq!(std::fs::read(b.join("a.txt")).unwrap(), b"from-b");
         assert_eq!(std::fs::read(a.join("a.txt")).unwrap(), b"old");
+    }
+
+    /// 历史页：execute 之后先 rollback_preview，确认后再走 rollback_run
+    /// （reject_finished + rollback_recorded）。两个目录里只回滚被点中的那一笔。
+    #[test]
+    fn history_page_previews_then_rolls_back_the_clicked_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("a.txt"), b"old-a").unwrap();
+        std::fs::write(b.join("a.txt"), b"old-b").unwrap();
+        let db = dir.path().join("t.sqlite");
+        let backup = dir.path().join("bak");
+        commands::execute_in(&db, &a, &backup, overwrite_plan("exec-a", b"NEW-A"), false).unwrap();
+        commands::execute_in(&db, &b, &backup, overwrite_plan("exec-b", b"NEW-B"), false).unwrap();
+
+        let canon_a = std::fs::canonicalize(&a).unwrap();
+        let canon_b = std::fs::canonicalize(&b).unwrap();
+        let runs = commands::journal_runs_in(&db).unwrap();
+        let run_a = runs.iter().find(|run| run.exec_id == "exec-a").unwrap();
+        let run_b = runs.iter().find(|run| run.exec_id == "exec-b").unwrap();
+        assert_eq!(run_a.project_root.as_deref(), canon_a.to_str());
+        assert_eq!(run_b.project_root.as_deref(), canon_b.to_str());
+
+        let preview_a = commands::rollback_preview_in(&db, "exec-a").unwrap();
+        assert!(preview_a.files.is_empty());
+        std::fs::write(b.join("a.txt"), b"user-edit").unwrap();
+        let preview_b = commands::rollback_preview_in(&db, "exec-b").unwrap();
+        assert!(preview_b.files.iter().any(|file| file.path == "a.txt"));
+        assert_eq!(std::fs::read(a.join("a.txt")).unwrap(), b"NEW-A");
+        assert_eq!(std::fs::read(b.join("a.txt")).unwrap(), b"user-edit");
+
+        commands::reject_finished(&db, "exec-b", true).unwrap();
+        let rolled = commands::rollback_recorded(
+            &db,
+            "exec-b",
+            hetianxia_core::exec::RollbackChoice::ProceedBackupCurrent,
+        )
+        .unwrap();
+        assert_eq!(rolled.state, "ROLLED_BACK");
+        assert_eq!(std::fs::read(b.join("a.txt")).unwrap(), b"old-b");
+        assert_eq!(std::fs::read(a.join("a.txt")).unwrap(), b"NEW-A");
+
+        let again = commands::reject_finished(&db, "exec-b", true).unwrap_err();
+        assert_eq!(again.message, "这次回滚已经结束");
+        assert_eq!(std::fs::read(a.join("a.txt")).unwrap(), b"NEW-A");
+        assert_eq!(std::fs::read(b.join("a.txt")).unwrap(), b"old-b");
     }
 }

@@ -1018,7 +1018,7 @@ fn missing_root_offer(exec_id: &str, state: &str) -> RecoveryOffer {
 /// 一致就清掉 needs_verify。不一致则改成未恢复，历史记「部分回滚」，错误码用 E_IO。不改文件内容。
 fn reconcile_unverified_restores(db: &Connection, crashed_run: Option<&str>) -> Result<Vec<RecoveryOffer>> {
     let mut stmt = db.prepare(
-        "SELECT o.exec_id, o.op_index, o.op_json, j.backup_root, j.state, j.project_root
+        "SELECT o.exec_id, o.op_index, o.op_json, j.backup_root, j.state
          FROM exec_ops o
          JOIN exec_journal j ON j.exec_id = o.exec_id
          WHERE o.needs_verify = 1 AND o.rollback_state = 'done'
@@ -1031,7 +1031,6 @@ fn reconcile_unverified_restores(db: &Connection, crashed_run: Option<&str>) -> 
             r.get::<_, String>(2)?,
             r.get::<_, String>(3)?,
             r.get::<_, String>(4)?,
-            r.get::<_, Option<String>>(5)?,
         ))
     })?;
     let mut loaded = Vec::new();
@@ -1042,12 +1041,16 @@ fn reconcile_unverified_restores(db: &Connection, crashed_run: Option<&str>) -> 
     let mut mismatched: HashMap<String, (String, Vec<serde_json::Value>)> = HashMap::new();
     let mut prompts = Vec::new();
     let mut prompted = HashSet::new();
-    for (exec_id, index, op_json, backup_root, state, root) in loaded {
-        let Some(root) = nonempty_root(root) else {
-            if prompted.insert(exec_id.clone()) {
-                prompts.push(missing_root_offer(&exec_id, &state));
+    for (exec_id, index, op_json, backup_root, state) in loaded {
+        let root = match stored_project_root(db, &exec_id) {
+            Ok(root) => root,
+            Err(err) if err.code == ErrorCode::InvalidLocation => {
+                if prompted.insert(exec_id.clone()) {
+                    prompts.push(missing_root_offer(&exec_id, &state));
+                }
+                continue;
             }
-            continue;
+            Err(err) => return Err(err),
         };
         let fsys = LocalFs::new(root);
         let Ok(op) = serde_json::from_str::<PlanOp>(&op_json) else {
@@ -1107,7 +1110,7 @@ pub fn recover_on_startup(db: &Connection, _passed_root: &LocalFs) -> Result<Vec
     #[cfg(not(feature = "fault-inject"))]
     let probe_plan = FaultPlan::default();
     let mut stmt = db.prepare(
-        "SELECT exec_id, state, plan_json, backup_root, project_root FROM exec_journal ORDER BY started_at, exec_id",
+        "SELECT exec_id, state, plan_json, backup_root FROM exec_journal ORDER BY started_at, exec_id",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok((
@@ -1115,7 +1118,6 @@ pub fn recover_on_startup(db: &Connection, _passed_root: &LocalFs) -> Result<Vec
             r.get::<_, String>(1)?,
             r.get::<_, String>(2)?,
             r.get::<_, String>(3)?,
-            r.get::<_, Option<String>>(4)?,
         ))
     })?;
     let mut loaded = Vec::new();
@@ -1124,14 +1126,17 @@ pub fn recover_on_startup(db: &Connection, _passed_root: &LocalFs) -> Result<Vec
     }
     drop(stmt);
     let mut offers = Vec::new();
-    for (exec_id, state, plan_json, backup_root, root) in loaded {
+    for (exec_id, state, plan_json, backup_root) in loaded {
         if matches!(resume_admission(&state), ResumeAdmission::Reject) {
             continue;
         }
-        let Some(root) = nonempty_root(root) else {
-            db.execute("UPDATE exec_ops SET needs_verify=1 WHERE exec_id=?1", params![exec_id])?;
-            offers.push(missing_root_offer(&exec_id, &state));
-            continue;
+        let root = match stored_project_root(db, &exec_id) {
+            Ok(root) => root,
+            Err(err) if err.code == ErrorCode::InvalidLocation => {
+                offers.push(missing_root_offer(&exec_id, &state));
+                continue;
+            }
+            Err(err) => return Err(err),
         };
         let fsys = LocalFs::new(root);
         if state == "LOG_FAILED" {
@@ -1239,11 +1244,13 @@ pub fn execute(db: &Connection, fsys: &LocalFs, plan: &ExecPlan, opts: &ExecOpts
     let mut fault = FaultRuntime::new(fault);
     let mut recorded_temps: Vec<RelPath> = Vec::new();
     let project_root = canonical_project_root(fsys.root())?;
+    let mut recorded = plan.clone();
+    recorded.project_root = project_root.clone();
     let backup = opts.backup_root.join(&plan.id);
     let mut files = Vec::new();
     let started = now_ms();
-    // 项目目录和这一笔执行写在同一事务里，并且在任何文件操作之前提交。
-    log_write(db, &mut fault, &plan.id, "prepared", || insert_prepared_run(db, plan, &backup, started, &project_root))?;
+    // 项目目录写进计划，并和这一笔执行在同一事务里、在任何文件操作之前提交。
+    log_write(db, &mut fault, &plan.id, "prepared", || insert_prepared_run(db, &recorded, &backup, started, &project_root))?;
     if stop(opts, "prepared") {
         return Ok(partial(plan, &backup, "PREPARED", files, true));
     }
@@ -2169,14 +2176,11 @@ pub fn rollback(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: 
     if available == Some(0) {
         return Err(Error::new(ErrorCode::BackupPurged, "备份已清理"));
     }
-    let (plan_json, backup, root): (String, String, Option<String>) = {
-        let mut stmt = db.prepare("SELECT plan_json, backup_root, project_root FROM exec_journal WHERE exec_id=?1")?;
-        stmt.query_row(params![exec_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?)))?
+    let (plan_json, backup): (String, String) = {
+        let mut stmt = db.prepare("SELECT plan_json, backup_root FROM exec_journal WHERE exec_id=?1")?;
+        stmt.query_row(params![exec_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
     };
-    let Some(root) = nonempty_root(root) else {
-        let _ = db.execute("UPDATE exec_ops SET needs_verify=1 WHERE exec_id=?1", params![exec_id]);
-        return Err(Error::new(ErrorCode::InvalidLocation, "没有记下这次的项目目录，不能借用当前项目回滚"));
-    };
+    let root = stored_project_root(db, exec_id)?;
     let project = LocalFs::new(root);
     let fsys = &project;
     let plan: ExecPlan = serde_json::from_str(&plan_json).map_err(|e| Error::new(ErrorCode::Internal, e.to_string()))?;
@@ -2744,12 +2748,7 @@ pub fn resume(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: Re
         probe_log_write(db, &fault)?;
     }
     note_pre_recovery(db, exec_id, &observed)?;
-    let stored_root: Option<String> = db.query_row("SELECT project_root FROM exec_journal WHERE exec_id=?1", params![exec_id], |r| r.get(0))?;
-    let Some(stored_root) = nonempty_root(stored_root) else {
-        let _ = db.execute("UPDATE exec_ops SET needs_verify=1 WHERE exec_id=?1", params![exec_id]);
-        return Err(Error::new(ErrorCode::InvalidLocation, "没有记下这次的项目目录，不能借用当前项目继续"));
-    };
-    let project = LocalFs::new(stored_root);
+    let project = LocalFs::new(stored_project_root(db, exec_id)?);
     let fsys = &project;
     let backup_root_early: String = db.query_row(
         "SELECT backup_root FROM exec_journal WHERE exec_id=?1",
@@ -3029,6 +3028,7 @@ mod tests {
         ExecPlan {
             id: format!("ex-{}", uuid::Uuid::new_v4().simple()),
             project_key: "proj".into(),
+            project_root: String::new(),
             summary: Summary { create: 1, overwrite: 1, ..Summary::default() },
             ops,
         }
@@ -5862,6 +5862,7 @@ mod tests {
         let plan = ExecPlan {
             id: "ex-1".into(),
             project_key: "not-a-path".into(),
+            project_root: String::new(),
             summary: Summary::default(),
             ops: vec![ov(1, "a.txt", b"old\n", b"original\n", None)],
         };
@@ -6006,10 +6007,15 @@ mod tests {
         let mut opts = opts_at(&a);
         opts.stop_after_log = Some("prepared".into());
         execute(&db, &LocalFs::new(&a), &p, &opts, FaultPlan::default()).unwrap();
-        let stored: String = db
-            .query_row("SELECT project_root FROM exec_journal WHERE exec_id=?1", params![p.id], |r| r.get(0))
+        let (stored, plan_json): (String, String) = db
+            .query_row("SELECT project_root, plan_json FROM exec_journal WHERE exec_id=?1", params![p.id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap();
-        assert_eq!(Path::new(&stored), std::fs::canonicalize(&a).unwrap().as_path());
+        let canon = std::fs::canonicalize(&a).unwrap();
+        assert_eq!(Path::new(&stored), canon.as_path());
+        let recorded: ExecPlan = serde_json::from_str(&plan_json).unwrap();
+        assert_eq!(Path::new(&recorded.project_root), canon.as_path());
         assert_eq!(fs::read(a.join("a.txt")).unwrap(), b"old");
         assert!(!a.join("bak").exists());
     }

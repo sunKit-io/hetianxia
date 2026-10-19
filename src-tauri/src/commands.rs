@@ -69,8 +69,9 @@ pub fn merge(left: String, right: String, decision: String) -> Result<Rendered, 
     Ok(merge::render(&file, &state))
 }
 
-pub fn execute_in(db_path: &Path, root: &Path, backup_root: &Path, plan: ExecPlan, allow_readonly: bool) -> Result<ExecReport, Error> {
+pub fn execute_in(db_path: &Path, root: &Path, backup_root: &Path, mut plan: ExecPlan, allow_readonly: bool) -> Result<ExecReport, Error> {
     remember_project_root(db_path, root);
+    plan.project_root = root.display().to_string();
     let db = exec::open_db(db_path)?;
     let fsys = LocalFs::new(root);
     let kinds: Vec<_> = plan.ops.iter().map(|op| op.kind).collect();
