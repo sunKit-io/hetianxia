@@ -99,6 +99,9 @@ impl Error {
     }
 }
 
+/// 内容已经回到备份，但权限或修改时间没有恢复。不算未恢复，也不单独变成「部分回滚」。
+pub const ATTR_RESTORE_FAILED: &str = "内容已恢复，权限 / 修改时间未恢复";
+
 /// 设计文档 12.11 的错误码。界面按这些码出文案。
 pub const SPEC_CODES: &[&str] = &[
     "E_NOT_FOUND",

@@ -10,6 +10,17 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_SET_META: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 下一次 `set_meta` 失败一次。用来测属性恢复失败，内容仍然算已恢复。
+#[cfg(test)]
+pub fn fail_set_meta_once() {
+    FAIL_SET_META.with(|flag| flag.set(true));
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum EntryKind {
@@ -439,11 +450,8 @@ impl LocalFs {
         forget(&tmp);
         after_rename()?;
         if mtime_ms.is_some() || mode.is_some() {
-            if let Err(e) = self.set_meta(dest, mode, mtime_ms) {
-                return Err(Error::new(
-                    ErrorCode::Io,
-                    format!("模式或修改时间可能没有恢复：{}", e.message),
-                ));
+            if let Err(_e) = self.set_meta(dest, mode, mtime_ms) {
+                return Err(Error::new(ErrorCode::Io, crate::error::ATTR_RESTORE_FAILED));
             }
         }
         Ok(())
@@ -472,6 +480,10 @@ impl LocalFs {
     }
 
     pub fn set_meta(&self, rel: &RelPath, mode: Option<u32>, mtime_ms: Option<i64>) -> Result<()> {
+        #[cfg(test)]
+        if FAIL_SET_META.with(|flag| flag.replace(false)) {
+            return Err(Error::new(ErrorCode::Io, "set_meta injected"));
+        }
         let p = self.abs(rel)?;
         if let Some(mode) = mode {
             set_mode(&p, mode)?;

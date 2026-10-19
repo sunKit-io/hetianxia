@@ -19,6 +19,7 @@ mod fault_marker;
 #[cfg(feature = "fault-inject")]
 pub const MARKER: &str = "UPG_FAULT_MARKER_HETIANXIA";
 
+#[cfg(feature = "fault-inject")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     Backup,
@@ -32,6 +33,7 @@ pub enum Stage {
     FsyncDir,
 }
 
+#[cfg(feature = "fault-inject")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Error,
@@ -41,6 +43,7 @@ pub enum Mode {
     Corrupt,
 }
 
+#[cfg(feature = "fault-inject")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
     At { stage: Stage, n: u32, mode: Mode },
@@ -50,14 +53,28 @@ pub enum Item {
     LogProbe { n: Option<u32> },
 }
 
+#[cfg(feature = "fault-inject")]
 #[derive(Debug, Clone, Default)]
 pub struct FaultPlan {
     pub items: Vec<Item>,
 }
 
+#[cfg(feature = "fault-inject")]
 impl FaultPlan {
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
+    }
+}
+
+/// 正式包没有故障项。阶段名不进入这个类型。
+#[cfg(not(feature = "fault-inject"))]
+#[derive(Debug, Clone, Default)]
+pub struct FaultPlan;
+
+#[cfg(not(feature = "fault-inject"))]
+impl FaultPlan {
+    pub fn is_empty(&self) -> bool {
+        true
     }
 }
 
@@ -305,7 +322,7 @@ impl FaultRuntime {
     }
 
     #[cfg(not(feature = "fault-inject"))]
-    pub fn hit_file(&mut self, _stage: Stage, _index: u32) -> Result<()> {
+    pub fn hit_file(&mut self, _index: u32) -> Result<()> {
         Ok(())
     }
 
