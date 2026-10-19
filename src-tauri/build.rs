@@ -8,6 +8,7 @@ fn main() {
         "rollback",
         "history",
         "connections",
+        "startup_offers",
     ]);
     if let Err(error) = tauri_build::try_build(tauri_build::Attributes::new().app_manifest(manifest)) {
         println!("{error:#}");

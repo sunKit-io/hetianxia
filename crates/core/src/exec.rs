@@ -1075,7 +1075,8 @@ pub enum RunStart {
     },
 }
 
-/// 占住 run.lock。状态是 `running` 时先核对 needs_verify，再做崩溃恢复。锁一直拿到调用方放开为止。
+/// 占住 run.lock。状态是 `running` 时先核对 needs_verify，核对完才写入新的 `run_id`。
+/// 然后做崩溃恢复。锁一直拿到调用方放开为止。
 pub fn begin_run(db: &Connection, fsys: &LocalFs, data_dir: &Path) -> Result<RunStart> {
     match crate::runlock::acquire_run_lock(data_dir)? {
         crate::runlock::RunAcquire::AnotherInstance => Ok(RunStart::AnotherInstance),
@@ -1084,6 +1085,7 @@ pub fn begin_run(db: &Connection, fsys: &LocalFs, data_dir: &Path) -> Result<Run
             if abnormal_exit {
                 reconcile_unverified_restores(db, fsys, lock.crashed_run())?;
             }
+            lock.publish_running()?;
             set_active_run(Some(lock.run_id().to_string()));
             let offers = recover_on_startup(db, fsys)?;
             Ok(RunStart::Started { lock, abnormal_exit, offers })
@@ -5124,10 +5126,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (db, fsys, id) = needs_verify_after_user_edit(dir.path());
         let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let prior = b"status=running\nrun=held\npid=1\nstart=1\n";
+        fs::write(data.join("run.lock"), prior).unwrap();
         let first = crate::runlock::acquire_run_lock(&data).unwrap();
         let crate::runlock::RunAcquire::Held(lock) = first else { panic!("first lock"); };
         let body = fs::read(data.join("run.lock")).unwrap();
-        assert!(body.starts_with(b"status=running\n"));
+        assert_eq!(body, prior);
         let second = crate::runlock::acquire_run_lock(&data).unwrap();
         assert!(matches!(second, crate::runlock::RunAcquire::AnotherInstance));
         assert_eq!(fs::read(data.join("run.lock")).unwrap(), body);
@@ -5234,6 +5239,35 @@ mod tests {
         op.keep_source = false;
         op.label = "移动".into();
         op
+    }
+
+    /// N7：核对完成前不覆盖 run.lock 里的上一次 run_id。
+    #[test]
+    fn n7_new_run_id_is_written_only_after_reverify() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, fsys, id) = needs_verify_after_user_edit(dir.path());
+        db.execute(
+            "UPDATE exec_ops SET needs_verify=1, needs_verify_run='stale-run' WHERE exec_id=?1",
+            params![id],
+        )
+        .unwrap();
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let prior = b"status=running\nrun=stale-run\npid=8\nstart=8\n";
+        fs::write(data.join("run.lock"), prior).unwrap();
+        let held = crate::runlock::acquire_run_lock(&data).unwrap();
+        let crate::runlock::RunAcquire::Held(lock) = held else { panic!("lock"); };
+        assert_eq!(fs::read(data.join("run.lock")).unwrap(), prior);
+        assert!(!String::from_utf8_lossy(&fs::read(data.join("run.lock")).unwrap()).contains(lock.run_id()));
+        drop(lock);
+        let started = begin_run(&db, &fsys, &data).unwrap();
+        let RunStart::Started { lock, .. } = started else { panic!("expected the lock"); };
+        let text = fs::read_to_string(data.join("run.lock")).unwrap();
+        assert!(text.starts_with("status=running\n"), "{text}");
+        assert!(text.contains(&format!("run={}\n", lock.run_id())), "{text}");
+        assert!(!text.contains("stale-run"), "{text}");
+        assert_eq!(journal_state(&db, &id), "ROLLBACK_PARTIAL");
+        lock.release_clean(&db).unwrap();
     }
 
     /// R1 / REC-32 的干净退出一半：没带 run_id 的标记在写成 clean 之前被清掉，之后的崩溃不再核对。

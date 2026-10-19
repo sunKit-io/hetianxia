@@ -15,6 +15,11 @@ hetianxia-core = { path = "../crates/core" }
 serde = { version = "=1.0.214", features = ["derive"] }
 serde_json = "=1.0.132"
 tauri = "=2.1.1"
+tauri-plugin-single-instance = "=2.0.1"
+# 插件在 Linux 上用 zbus 4。不钉的话会拉到需要 Rust 1.85 的传递依赖。
+zbus = "=4.3.1"
+proc-macro-crate = "=3.1.0"
+async-lock = "=3.4.0"
 tauri-utils = "=2.1.0"
 tauri-macros = "=2.0.3"
 tauri-runtime = "=2.2.0"

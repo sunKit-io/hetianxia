@@ -20,6 +20,11 @@ fn local_opts(backup_root: String, allow_readonly: bool) -> ExecOpts {
     }
 }
 
+fn remember_project_root(db_path: &str, root: &str) {
+    let path = Path::new(db_path).with_file_name("project-root");
+    let _ = std::fs::write(path, root);
+}
+
 #[tauri::command]
 pub fn scan(left: String, right: String) -> Result<ScanOutput, Error> {
     let left = LocalFs::new(left);
@@ -60,6 +65,7 @@ pub fn execute(
     plan: ExecPlan,
     allow_readonly: bool,
 ) -> Result<ExecReport, Error> {
+    remember_project_root(&db_path, &root);
     let db = exec::open_db(Path::new(&db_path))?;
     let fsys = LocalFs::new(root);
     let kinds: Vec<_> = plan.ops.iter().map(|op| op.kind).collect();
@@ -78,6 +84,11 @@ pub fn rollback(db_path: String, root: String, exec_id: String, choice: Rollback
 pub fn history(db_path: String) -> Result<Vec<HistoryRow>, Error> {
     let db = exec::open_db(Path::new(&db_path))?;
     exec::list_history(&db)
+}
+
+#[tauri::command]
+pub fn startup_offers(session: tauri::State<crate::Session>) -> Vec<hetianxia_core::exec::RecoveryOffer> {
+    session.offers.clone()
 }
 
 #[tauri::command]

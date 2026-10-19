@@ -11,6 +11,7 @@
     "allow-execute",
     "allow-rollback",
     "allow-history",
-    "allow-connections"
+    "allow-connections",
+    "allow-startup-offers"
   ]
 }

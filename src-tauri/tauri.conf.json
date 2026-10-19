@@ -3,7 +3,11 @@
   "version": "1.0.0",
   "identifier": "com.hetianxia.app",
   "build": {
-    "frontendDist": "ui",
+    "beforeBuildCommand": {
+      "script": "pnpm build",
+      "cwd": ".."
+    },
+    "frontendDist": "../dist",
     "devUrl": "http://127.0.0.1:43127"
   },
   "app": {

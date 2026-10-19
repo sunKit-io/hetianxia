@@ -8,8 +8,10 @@
 //! - 拿到锁，文件不存在、是空的，或状态是 `clean`：正常启动，不核对 `needs_verify`。
 //! - 拿到锁，状态是 `running`：上次进程不是干净退出。文件里的 `run` 是那次运行的
 //!   `run_id`，只核对打着这个 id 的 `needs_verify`。
-//! - 两种都先写上本次新的 `run_id` 和 `running` 并 fsync。干净退出时先清掉这次运行打上的
-//!   标记，再写成 `clean`、fsync，然后放开锁。
+//! - 拿到锁之后先不改文件。异常退出要先按文件里原来的 `run_id` 核对 `needs_verify`。
+//!   核对结束才写上本次新的 `run_id` 和 `running` 并 fsync。核对过程中如果进程再次退出，
+//!   文件仍是上一次的 `run_id`，那些标记不会丢。
+//! - 干净退出时先清掉这次运行打上的标记，再写成 `clean`、fsync，然后放开锁。
 //!
 //! pid 和进程启动时间只给诊断看。`run` 用来把 `needs_verify` 对上一次具体的运行。
 
@@ -51,6 +53,11 @@ impl RunLock {
         self.crashed_run.as_deref()
     }
 
+    /// 核对结束后才把本次 `run_id` 写成 `running`。在这之前文件保持上次的内容。
+    pub fn publish_running(&self) -> Result<()> {
+        write_status(&self.file, STATUS_RUNNING, &self.run_id)
+    }
+
     /// 干净退出：先清掉这次运行的 `needs_verify`，再写成 `clean` 并 fsync，然后放开锁。不删除文件。
     pub fn release_clean(mut self, db: &rusqlite::Connection) -> Result<()> {
         crate::exec::clear_needs_verify_for_run(db, &self.run_id)?;
@@ -88,7 +95,6 @@ pub fn acquire_run_lock(data_dir: &Path) -> Result<RunAcquire> {
             let abnormal = prior.status == Some(STATUS_RUNNING);
             let crashed_run = if abnormal { prior.run_id } else { None };
             let run_id = uuid::Uuid::new_v4().simple().to_string();
-            write_status(&file, STATUS_RUNNING, &run_id)?;
             Ok(RunAcquire::Held(RunLock { file, abnormal, released: false, run_id, crashed_run }))
         }
         Err(err) if lock_held_by_other(&err) => Ok(RunAcquire::AnotherInstance),
