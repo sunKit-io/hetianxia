@@ -15,6 +15,7 @@ pub mod remote;
 pub mod runlock;
 pub mod scan;
 pub mod vfs;
+pub mod zipfs;
 
 /// 进程启动时调用。故障注入构建会在这里检查环境变量语法。
 pub fn boot() {
