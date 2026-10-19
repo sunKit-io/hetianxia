@@ -2,11 +2,17 @@
 
 pub mod brand;
 pub mod error;
+pub mod exec;
+pub mod fault;
 pub mod hashutil;
 pub mod limits;
 pub mod model;
 pub mod pathutil;
 pub mod prefs;
+pub mod runlock;
+pub mod vfs;
 
-/// 进程启动时调用。故障注入构建会在执行引擎里检查 `UPG_FAULT` 的语法。
-pub fn boot() {}
+/// 进程启动时调用。故障注入构建会在这里检查环境变量语法。
+pub fn boot() {
+    fault::check_env_syntax_or_exit();
+}

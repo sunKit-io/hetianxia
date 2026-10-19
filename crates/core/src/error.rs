@@ -32,6 +32,7 @@ pub enum ErrorCode {
     Conflict,
     Unsupported,
     Io,
+    InvalidState,
     Internal,
 }
 
@@ -92,10 +93,14 @@ impl Error {
             ErrorCode::Conflict => "E_CONFLICT",
             ErrorCode::Unsupported => "E_UNSUPPORTED",
             ErrorCode::Io => "E_IO",
+            ErrorCode::InvalidState => "E_INVALID_STATE",
             ErrorCode::Internal => "E_INTERNAL",
         }
     }
 }
+
+/// 内容已经回到备份，但权限或修改时间没有恢复。不算未恢复，也不单独变成「部分回滚」。
+pub const ATTR_RESTORE_FAILED: &str = "内容已恢复，权限 / 修改时间未恢复";
 
 /// 设计文档 12.11 的错误码。界面按这些码出文案。
 pub const SPEC_CODES: &[&str] = &[
@@ -103,6 +108,7 @@ pub const SPEC_CODES: &[&str] = &[
     "E_PERMISSION",
     "E_BUSY",
     "E_NO_SPACE",
+    "E_IO",
     "E_CHANGED_SINCE_SCAN",
     "E_CASE_CONFLICT",
     "E_SYMLINK_IN_PATH",
@@ -121,6 +127,7 @@ pub const SPEC_CODES: &[&str] = &[
     "E_ROLLBACK_CONFLICT",
     "E_ROLLBACK_PARTIAL",
     "E_CANCELLED",
+    "E_INVALID_STATE",
     "E_INTERNAL",
 ];
 
@@ -135,6 +142,7 @@ mod tests {
             ErrorCode::Permission,
             ErrorCode::Busy,
             ErrorCode::NoSpace,
+            ErrorCode::Io,
             ErrorCode::ChangedSinceScan,
             ErrorCode::CaseConflict,
             ErrorCode::SymlinkInPath,
@@ -153,6 +161,7 @@ mod tests {
             ErrorCode::RollbackConflict,
             ErrorCode::RollbackPartial,
             ErrorCode::Cancelled,
+            ErrorCode::InvalidState,
             ErrorCode::Internal,
         ]
         .into_iter()
