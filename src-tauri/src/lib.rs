@@ -15,8 +15,57 @@ pub const MACOS_TARGET: &str = "universal-apple-darwin";
 
 pub struct Session {
     db_path: PathBuf,
+    /// 固定为 app_data/bak。界面不能改。
+    backup_root: PathBuf,
+    project_root: Mutex<PathBuf>,
     lock: Mutex<Option<hetianxia_core::runlock::RunLock>>,
     offers: Vec<hetianxia_core::exec::RecoveryOffer>,
+    startup_error: Option<String>,
+}
+
+pub fn app_db_path(data: &std::path::Path) -> PathBuf {
+    data.join("hetianxia.sqlite")
+}
+
+pub fn app_backup_root(data: &std::path::Path) -> PathBuf {
+    data.join("bak")
+}
+
+fn boot_error(err: &hetianxia_core::error::Error) -> String {
+    format!("{} · {}", err.code_str(), err.message)
+}
+
+fn failed_session(message: String) -> Session {
+    Session {
+        db_path: PathBuf::new(),
+        backup_root: PathBuf::new(),
+        project_root: Mutex::new(PathBuf::new()),
+        lock: Mutex::new(None),
+        offers: Vec::new(),
+        startup_error: Some(message),
+    }
+}
+
+fn open_session(data: PathBuf) -> Result<Session, String> {
+    std::fs::create_dir_all(&data).map_err(|e| format!("E_IO · {e}"))?;
+    let db_path = app_db_path(&data);
+    let backup_root = app_backup_root(&data);
+    std::fs::create_dir_all(&backup_root).map_err(|e| format!("E_IO · {e}"))?;
+    let saved = std::fs::read_to_string(data.join("project-root")).unwrap_or_default();
+    let root = if saved.trim().is_empty() { data.clone() } else { PathBuf::from(saved.trim()) };
+    let db = hetianxia_core::exec::open_db(&db_path).map_err(|e| boot_error(&e))?;
+    let fsys = hetianxia_core::vfs::LocalFs::new(&root);
+    match hetianxia_core::exec::begin_run(&db, &fsys, &data).map_err(|e| boot_error(&e))? {
+        hetianxia_core::exec::RunStart::AnotherInstance => std::process::exit(0),
+        hetianxia_core::exec::RunStart::Started { lock, offers, .. } => Ok(Session {
+            db_path,
+            backup_root,
+            project_root: Mutex::new(root),
+            lock: Mutex::new(Some(lock)),
+            offers,
+            startup_error: None,
+        }),
+    }
 }
 
 fn end_session(session: &Session) {
@@ -37,20 +86,13 @@ pub fn run() {
             }
         }))
         .setup(|app| {
-            let data = app.path().app_data_dir()?;
-            std::fs::create_dir_all(&data)?;
-            let db_path = data.join("hetianxia.sqlite");
-            let saved = std::fs::read_to_string(data.join("project-root")).unwrap_or_default();
-            let root = if saved.trim().is_empty() { data.clone() } else { PathBuf::from(saved.trim()) };
-            let db = hetianxia_core::exec::open_db(&db_path)?;
-            let fsys = hetianxia_core::vfs::LocalFs::new(&root);
-            let session = match hetianxia_core::exec::begin_run(&db, &fsys, &data)? {
-                hetianxia_core::exec::RunStart::AnotherInstance => std::process::exit(0),
-                hetianxia_core::exec::RunStart::Started { lock, offers, .. } => Session {
-                    db_path,
-                    lock: Mutex::new(Some(lock)),
-                    offers,
+            // begin_run 失败也要把窗口留住，错误交给界面上的对话框。
+            let session = match app.path().app_data_dir() {
+                Ok(data) => match open_session(data) {
+                    Ok(session) => session,
+                    Err(message) => failed_session(message),
                 },
+                Err(err) => failed_session(format!("E_IO · {err}")),
             };
             app.manage(session);
             Ok(())
@@ -69,9 +111,12 @@ pub fn run() {
             commands::merge,
             commands::execute,
             commands::rollback,
+            commands::rollback_run,
+            commands::resume_run,
             commands::history,
             commands::connections,
             commands::startup_offers,
+            commands::startup_failure,
             commands::ssh_secret_service,
             commands::save_ssh_secret,
             commands::ssh_secret_status,
@@ -99,6 +144,14 @@ mod tests {
     use super::*;
     use hetianxia_core::model::{ExecPlan, OpKind, PlanOp, Summary};
 
+    fn command_header(source: &str, name: &str) -> String {
+        let marker = format!("pub fn {name}(");
+        let start = source.find(&marker).unwrap_or_else(|| panic!("missing {name}"));
+        let rest = &source[start..];
+        let end = rest.find("->").unwrap_or_else(|| panic!("missing arrow on {name}"));
+        rest[..end].to_string()
+    }
+
     #[test]
     fn shell_does_not_enable_devtools_and_keeps_the_bundle_id() {
         let manifest = include_str!("../Cargo.toml");
@@ -111,13 +164,32 @@ mod tests {
         assert!(conf.contains("\"frontendDist\": \"../dist\""));
         assert!(conf.contains("pnpm build"));
         assert!(!conf.contains("\"frontendDist\": \"ui\""));
+        let value: serde_json::Value = serde_json::from_str(conf).unwrap();
+        assert_eq!(value["build"]["frontendDist"], "../dist");
+        let hook = &value["build"]["beforeBuildCommand"];
+        let script = hook.as_str().unwrap_or_else(|| hook["script"].as_str().expect("beforeBuildCommand"));
+        assert!(script.contains("pnpm build"), "{script}");
+        let placeholder = include_str!("../ui/index.html");
+        assert!(placeholder.contains("<p>合天下</p>"));
+        assert!(!placeholder.contains("id=\"root\""));
         assert_eq!(MACOS_TARGET, "universal-apple-darwin");
         let source = include_str!("lib.rs");
         assert!(source.contains("tauri_plugin_single_instance"));
         assert!(source.contains("begin_run"));
         assert!(source.contains("release_clean"));
         assert!(source.contains("startup_offers"));
+        assert!(source.contains("startup_failure"));
+        assert!(source.contains("failed_session"));
+        assert_eq!(app_db_path(std::path::Path::new("/data")), std::path::PathBuf::from("/data/hetianxia.sqlite"));
+        assert_eq!(app_backup_root(std::path::Path::new("/data")), std::path::PathBuf::from("/data/bak"));
         let commands = include_str!("commands.rs");
+        for name in ["execute", "rollback", "rollback_run", "resume_run", "history"] {
+            let header = command_header(commands, name);
+            assert!(!header.contains("db_path"), "{name}: {header}");
+            assert!(!header.contains("backup_root"), "{name}: {header}");
+        }
+        assert!(commands.contains("session.backup_root"));
+        assert!(!commands.contains("join(\"backups\")"));
         assert!(!commands.contains("load_ssh_secret"));
         assert!(commands.contains("ssh_secret_status"));
         assert!(commands.contains("req.secret.clear()"));
@@ -174,22 +246,16 @@ mod tests {
             }],
             summary: Summary { overwrite: 1, ..Summary::default() },
         };
-        let report = commands::execute(
-            db.display().to_string(),
-            dir.path().display().to_string(),
-            dir.path().join("bak").display().to_string(),
-            plan,
-            false,
-        )
-        .unwrap();
+        let backup = dir.path().join("bak");
+        let report = commands::execute_in(&db, dir.path(), &backup, plan, false).unwrap();
         assert_eq!(report.history_result, "成功");
-        let rows = commands::history(db.display().to_string()).unwrap();
+        let rows = commands::history_in(&db).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].result, "成功");
-        let rolled = commands::rollback(
-            db.display().to_string(),
-            dir.path().display().to_string(),
-            "exec-1".into(),
+        let rolled = commands::rollback_in(
+            &db,
+            dir.path(),
+            "exec-1",
             hetianxia_core::exec::RollbackChoice::ProceedBackupCurrent,
         )
         .unwrap();

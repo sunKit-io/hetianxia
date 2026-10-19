@@ -2353,7 +2353,7 @@ fn written_file_conflict(fsys: &LocalFs, backup: &Path, op: &PlanOp, row: &OpRow
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ResumeChoice {
     /// 什么都不改，下次启动再提示。

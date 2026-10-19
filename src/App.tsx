@@ -1,8 +1,36 @@
-import { useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import { Server, ShieldAlert, KeyRound, AlertTriangle } from "lucide-react";
+import { rollbackRun, resumeRun, startupFailure, startupOffers } from "./backend";
+import { externalChoice, keepSource, pendingChoice, rollbackChoice, type ResumeChoice, type RollbackChoice } from "./choices";
+import { DiffEditor } from "./editor";
+import { afterResume, engineCode, formatEngineError, formatOffer, formatReport, type ConflictFile, type RecoveryOffer } from "./engine";
 import { ALPINE, UNKNOWN, UBUNTU, canContinue, connectionSubtitle, systemTypeLabel, warningBanner, type RemoteOs } from "./os";
+import { Text } from "./plain";
+import {
+  DETAIL_DELETED,
+  DETAIL_MODIFIED,
+  OVERWRITE_PENDING,
+  OVERWRITE_PENDING_NOTE,
+  RESUME_AGAIN,
+  RESUME_NOTE,
+  SKIP_PENDING,
+  STOP_BODY,
+  STOP_FOOTER,
+  pendingChangedTitle,
+  resumeConflictScreen,
+  resumeConflictTitle,
+  rollbackProceedLabel,
+  rollbackProceedNote,
+  rollbackSkipNote,
+  PARTIAL_ROLLBACK_CHANGE,
+  PARTIAL_ROLLBACK_RESULT,
+  PARTIAL_ROLLBACK_UNRESTORED,
+  type ResumeFile,
+  type UnrestoredFile,
+} from "./resumeCopy";
 
-type Page = "ssh" | "preview" | "history";
+type Page = "edit" | "ssh" | "preview" | "history";
+type Sheet = null | "rollback" | "log" | "failure" | "startup" | "external" | "pending" | "rollbackResume";
 
 type Host = {
   id: string;
@@ -70,20 +98,122 @@ const HOSTS: Host[] = [
   },
 ];
 
-const HISTORY = [
+type HistoryEntry = {
+  time: string;
+  where: string;
+  change: string;
+  result: string;
+  rollback?: boolean;
+  partial?: boolean;
+  resumeRollback?: boolean;
+  cleaned?: boolean;
+  unrestored?: UnrestoredFile[];
+};
+
+const HISTORY: HistoryEntry[] = [
+  {
+    time: "10月18日 17:08",
+    where: "~/work/order-center ← release-3.1.0.zip",
+    change: PARTIAL_ROLLBACK_CHANGE,
+    result: PARTIAL_ROLLBACK_RESULT,
+    unrestored: PARTIAL_ROLLBACK_UNRESTORED,
+  },
+  { time: "10月18日 16:02", where: "~/work/order-center ← release-3.1.0.zip", change: "覆盖 4 · 已写 2", result: "部分失败", rollback: true, partial: true },
+  { time: "10月18日 15:11", where: "~/work/order-center ← release-3.1.0.zip", change: "回滚中断 · 已恢复 1 / 3", result: "回滚未完成", resumeRollback: true },
   { time: "10月12日 14:20", where: "~/work/order-center ← release-3.0.0.zip", change: "新增 6 · 覆盖 13 · 移动 1", result: "成功", rollback: true },
   { time: "9月28日 09:41", where: "~/work/order-center ← release-2.3.1.zip", change: "新增 2 · 覆盖 8", result: "成功", rollback: true },
   { time: "9月03日 18:05", where: "prod-gw-01:/opt/gateway ← gateway-1.8", change: "覆盖 21 · 删除 3", result: "已回滚", rollback: false, cleaned: false },
   { time: "8月11日 10:12", where: "~/work/order-center ← release-2.2.0.zip", change: "新增 4 · 覆盖 17", result: "成功", rollback: false, cleaned: true },
 ];
 
+const EXTERNAL_FILES: ResumeFile[] = [
+  { path: "src/routes.js", detail: DETAIL_MODIFIED },
+  { path: "public/old-banner.png", detail: DETAIL_DELETED },
+];
+
+const PENDING_FILES = ["src/legacy/cache.js", "config/local.env"];
+
+const ROLLBACK_FILES: ResumeFile[] = [
+  { path: "src/routes.js", detail: "升级后修改于 10月14日 09:12" },
+  { path: "public/old-banner.png", detail: DETAIL_DELETED },
+];
+
+const STOPPED = {
+  done: 9,
+  total: 20,
+  failed: 1,
+  file: "src/config/app.config.js",
+  code: "E_IO",
+  message: "写入失败",
+};
+
 export function App() {
-  const [page, setPage] = useState<Page>("ssh");
+  const [page, setPage] = useState<Page>("edit");
   const [hostId, setHostId] = useState("build-01");
   const [allowReadonly, setAllowReadonly] = useState(false);
-  const [sheet, setSheet] = useState<null | "rollback" | "log">(null);
+  const [sheet, setSheet] = useState<Sheet>("startup");
   const [cleared, setCleared] = useState<Record<string, boolean>>({});
+  const [execId, setExecId] = useState("pending-upgrade");
+  const [status, setStatus] = useState<string | null>(null);
+  const [offer, setOffer] = useState<RecoveryOffer | null>(null);
+  const [bootError, setBootError] = useState<string | null>(null);
+  const [externalFiles, setExternalFiles] = useState<ConflictFile[]>(EXTERNAL_FILES);
+  const [externalTitle, setExternalTitle] = useState(resumeConflictTitle(EXTERNAL_FILES));
+  const [pendingFiles, setPendingFiles] = useState<ConflictFile[]>(PENDING_FILES.map((path) => ({ path, detail: DETAIL_MODIFIED })));
+  const [rollbackFiles, setRollbackFiles] = useState<ConflictFile[]>(ROLLBACK_FILES);
   const host = HOSTS.find((h) => h.id === hostId) ?? HOSTS[0];
+
+  useEffect(() => {
+    void startupFailure().then((message) => {
+      if (message) setBootError(message);
+    }).catch((err) => {
+      const message = formatEngineError(err);
+      if (message.startsWith("E_")) setBootError(message);
+    });
+    void startupOffers().then((offers) => {
+      const first = offers[0];
+      if (!first) return;
+      setOffer(first);
+      setExecId(first.execId);
+      setStatus(formatOffer(first));
+      if (first.state === "ROLLING_BACK" || first.state === "ROLLBACK_PARTIAL") setSheet("rollbackResume");
+    }).catch((err) => {
+      const message = formatEngineError(err);
+      if (message.startsWith("E_")) setStatus(message);
+    });
+  }, []);
+
+  async function applyResume(choice: ResumeChoice) {
+    try {
+      const next = afterResume(choice, await resumeRun(execId, choice));
+      if (next.sheet === "external") {
+        setExternalTitle(next.title);
+        setExternalFiles(next.files);
+      } else if (next.sheet === "pending") {
+        setPendingFiles(next.files);
+      } else if (next.sheet === "rollback") {
+        setRollbackFiles(next.files);
+      }
+      setStatus(next.status);
+      setSheet(next.sheet);
+    } catch (err) {
+      const message = formatEngineError(err);
+      setStatus(message);
+      if (choice === "rollback" && message.startsWith("E_INVALID_STATE")) setSheet("rollback");
+    }
+  }
+
+  async function applyRollback(choice: RollbackChoice) {
+    try {
+      const report = await rollbackRun(execId, choice);
+      setStatus(formatReport(report));
+      setSheet(null);
+    } catch (err) {
+      const message = formatEngineError(err);
+      setStatus(message);
+      if (choice === "cancel") setSheet(null);
+    }
+  }
 
   return (
     <div className="desktop">
@@ -93,16 +223,19 @@ export function App() {
             <i /><i /><i />
           </span>
           <div className="titleblock">
-            <strong>{page === "ssh" ? "SSH 连接" : page === "history" ? "历史记录" : "OrderCenter"}</strong>
-            <span>{page === "ssh" ? `${HOSTS.length} 个连接` : page === "history" ? "OrderCenter · 保留最近 10 次 · 超过 30 天自动清理" : "本机 ~/work/order-center ← release-3.0.0.zip"}</span>
+            <strong>{page === "ssh" ? "SSH 连接" : page === "history" ? "历史记录" : page === "edit" ? "OrderCenter" : "OrderCenter"}</strong>
+            <span>{page === "ssh" ? `${HOSTS.length} 个连接` : page === "history" ? "OrderCenter · 保留最近 10 次 · 超过 30 天自动清理" : page === "edit" ? "src/config/app.config.js · 左右对照" : "本机 ~/work/order-center ← release-3.0.0.zip"}</span>
           </div>
           <nav className="pages">
+            <button className={page === "edit" ? "on" : ""} onClick={() => setPage("edit")}>编辑</button>
             <button className={page === "ssh" ? "on" : ""} onClick={() => setPage("ssh")}>连接</button>
             <button className={page === "preview" ? "on" : ""} onClick={() => setPage("preview")}>预演</button>
             <button className={page === "history" ? "on" : ""} onClick={() => setPage("history")}>历史</button>
           </nav>
           {page === "ssh" && <button className="ghost import">从 ~/.ssh/config 导入</button>}
         </header>
+        {status && !sheet && <p className={status.includes("E_") ? "status err" : "status"} role="status">{status}</p>}
+        {page === "edit" && <DiffEditor onWriteFailed={() => setSheet("failure")} />}
         {page === "ssh" && (
           <SshPage
             host={host}
@@ -114,9 +247,60 @@ export function App() {
         {page === "preview" && (
           <PreviewPage allowReadonly={allowReadonly} setAllowReadonly={setAllowReadonly} onLog={() => setSheet("log")} />
         )}
-        {page === "history" && <HistoryPage onRollback={() => setSheet("rollback")} />}
-        {sheet === "rollback" && <RollbackSheet onClose={() => setSheet(null)} />}
-        {sheet === "log" && <LogSheet onClose={() => setSheet(null)} />}
+        {page === "history" && (
+          <HistoryPage
+            onRollback={() => void applyResume("rollback")}
+            onContinue={() => void applyResume("continue")}
+            onResumeRollback={() => void applyRollback("proceedBackupCurrent")}
+          />
+        )}
+        {sheet === "rollback" && (
+          <RollbackSheet
+            files={rollbackFiles}
+            alert={status}
+            onCancel={() => void applyRollback("cancel")}
+            onApply={(choice) => void applyRollback(rollbackChoice(choice))}
+          />
+        )}
+        {sheet === "log" && <LogSheet alert={status} onClose={() => void applyResume("cancel")} onRollback={() => void applyResume("rollback")} />}
+        {sheet === "failure" && <WriteFailureSheet alert={status} offer={offer} onLater={() => void applyResume("cancel")} onRollback={() => void applyResume("rollback")} />}
+        {sheet === "startup" && (
+          <StartupSheet
+            alert={status}
+            offer={offer}
+            onLater={() => void applyResume("cancel")}
+            onRollback={() => void applyResume("rollback")}
+            onContinue={() => void applyResume("continue")}
+          />
+        )}
+        {sheet === "external" && (
+          <ExternalSheet
+            title={externalTitle}
+            files={externalFiles}
+            alert={status}
+            onClose={() => void applyResume("cancel")}
+            onKeep={() => void applyResume(externalChoice("keep"))}
+            onRollback={() => void applyResume(externalChoice("rollback"))}
+          />
+        )}
+        {sheet === "pending" && (
+          <PendingSheet files={pendingFiles} alert={status} onCancel={() => void applyResume("cancel")} onApply={(choice) => void applyResume(pendingChoice(choice))} />
+        )}
+        {sheet === "rollbackResume" && (
+          <RollbackResumeSheet alert={status} offer={offer} onLater={() => void applyResume("cancel")} onContinue={() => void applyRollback("proceedBackupCurrent")} />
+        )}
+        {bootError && (
+          <div className="mask" role="alertdialog" aria-modal="true" aria-labelledby="boot-error-title">
+            <div className="sheet small">
+              <h1 id="boot-error-title"><AlertTriangle size={18} /> 启动失败</h1>
+              <p>运行锁或事务日志没有准备好，升级和回滚都不会开始。</p>
+              <p className="err" role="alert"><Text value={bootError} /></p>
+              <footer>
+                <button className="primary" onClick={() => setBootError(null)}>知道了</button>
+              </footer>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -214,9 +398,9 @@ function PreviewPage({ allowReadonly, setAllowReadonly, onLog }: { allowReadonly
           {counts.skip > 0 && <b className="skip">{counts.skip}<small>跳过（只读）</small></b>}
         </div>
         <ul className="changes">
-          <li><i className="add" /> plugins/tracing/index.ts <em>升级包</em></li>
-          <li><i className="mod" /> src/config/app.config.js <em>合并结果</em></li>
-          <li><i className="move" /> lib/format.ts → utils/format.ts <em>移动（保留旧文件）</em></li>
+          <li><i className="add" /> <Text value="plugins/tracing/index.ts" /> <em>升级包</em></li>
+          <li><i className="mod" /> <Text value="src/config/app.config.js" /> <em>合并结果</em></li>
+          <li data-keep-source={keepSource("移动（保留旧文件）") ? "1" : "0"}><i className="move" /> <Text value="lib/format.ts → utils/format.ts" /> <em>移动（保留旧文件）</em></li>
         </ul>
         <div className="ro">
           <b>只读文件（2）</b>
@@ -235,71 +419,243 @@ function PreviewPage({ allowReadonly, setAllowReadonly, onLog }: { allowReadonly
   );
 }
 
-function HistoryPage({ onRollback }: { onRollback: () => void }) {
+function resultClass(result: string): string {
+  if (result === "已回滚" || result === "回滚未完成") return "rolled";
+  if (result === "部分失败") return "partial";
+  if (result === PARTIAL_ROLLBACK_RESULT) return "";
+  return "ok";
+}
+
+function HistoryPage({ onRollback, onContinue, onResumeRollback }: { onRollback: () => void; onContinue: () => void; onResumeRollback: () => void }) {
+  const [partialOpen, setPartialOpen] = useState(true);
   return (
-    <div className="history">
+    <div className="history" data-screen="26">
       <table>
         <thead><tr><th>时间</th><th>位置</th><th>变更</th><th>结果</th><th /></tr></thead>
         <tbody>
-          {HISTORY.map((row) => (
-            <tr key={row.time}>
-              <td>{row.time}</td>
-              <td>{row.where}</td>
-              <td>{row.change}</td>
-              <td className={row.result === "已回滚" ? "rolled" : "ok"}>{row.result}</td>
-              <td>
-                {row.where.includes(":/") ? (
-                  <button disabled title="远程写入还没支持">回滚…</button>
-                ) : row.cleaned ? (
-                  <button disabled>备份已清理</button>
-                ) : row.rollback ? (
-                  <button onClick={onRollback}>回滚…</button>
-                ) : (
-                  <button disabled>回滚…</button>
+          {HISTORY.map((row) => {
+            const expanded = !!row.unrestored && partialOpen;
+            const remote = row.where.includes(":/");
+            return (
+              <Fragment key={row.time}>
+                <tr>
+                  <td><Text value={row.time} /></td>
+                  <td><Text value={row.where} /></td>
+                  <td><Text value={row.change} /></td>
+                  <td className={resultClass(row.result)}>
+                    {row.unrestored ? <span className="partialback"><Text value={row.result} /></span> : <Text value={row.result} />}
+                  </td>
+                  <td>
+                    {row.unrestored ? (
+                      <button className="expander" aria-expanded={expanded} onClick={() => setPartialOpen((open) => !open)}>
+                        {expanded ? "收起" : "未恢复文件"}
+                      </button>
+                    ) : remote ? (
+                      <button disabled title="远程写入还没支持">回滚…</button>
+                    ) : row.partial ? (
+                      <>
+                        <button onClick={onRollback}>回滚…</button>
+                        <button onClick={onContinue}>继续</button>
+                      </>
+                    ) : row.resumeRollback ? (
+                      <button onClick={onResumeRollback}>继续回滚</button>
+                    ) : row.cleaned ? (
+                      <button disabled>备份已清理</button>
+                    ) : row.rollback ? (
+                      <button onClick={onRollback}>回滚…</button>
+                    ) : (
+                      <button disabled>回滚…</button>
+                    )}
+                  </td>
+                </tr>
+                {expanded && row.unrestored && (
+                  <tr className="detail">
+                    <td colSpan={5}>
+                      <ul className="unrestored">
+                        {row.unrestored.map((file) => (
+                          <li key={file.path}><span><Text value={file.path} /></span><em><Text value={file.reason} /></em></li>
+                        ))}
+                      </ul>
+                    </td>
+                  </tr>
                 )}
-              </td>
-            </tr>
-          ))}
+              </Fragment>
+            );
+          })}
         </tbody>
       </table>
     </div>
   );
 }
 
-function RollbackSheet({ onClose }: { onClose: () => void }) {
+function RollbackSheet({ files, alert, onCancel, onApply }: { files: ConflictFile[]; alert: string | null; onCancel: () => void; onApply: (choice: "proceed" | "skip") => void }) {
   const [choice, setChoice] = useState("proceed");
+  const hasDeletion = files.some((file) => file.detail === DETAIL_DELETED);
   return (
-    <div className="mask" onClick={onClose}>
+    <div className="mask" data-screen={hasDeletion ? "22" : "11"}>
       <div className="sheet small" onClick={(e) => e.stopPropagation()}>
-        <h1><AlertTriangle size={18} /> 回滚发现 2 个冲突文件</h1>
+        <h1><AlertTriangle size={18} /> 回滚发现 {files.length} 个冲突文件</h1>
         <p>这些文件在 10月12日 升级后又被改动过。</p>
+        {alert && <p className="err" role="alert"><Text value={alert} /></p>}
         <ul className="changes">
-          <li>src/routes.js <em>升级后修改于 10月14日 09:12</em></li>
-          <li>public/index.html <em>升级后修改于 10月13日 17:40</em></li>
+          {files.map((file) => (
+            <li key={file.path} className={file.detail === DETAIL_DELETED ? "deleted" : ""}>
+              <span><Text value={file.path} /></span>
+              <em><Text value={file.detail} /></em>
+            </li>
+          ))}
         </ul>
-        <label className={choice === "proceed" ? "choice on" : "choice"}><input type="radio" checked={choice === "proceed"} onChange={() => setChoice("proceed")} /> 继续回滚（先备份当前版本）<small>先把这 2 个文件的当前版本备份，再覆盖回升级前的样子</small></label>
-        <label className={choice === "skip" ? "choice on" : "choice"}><input type="radio" checked={choice === "skip"} onChange={() => setChoice("skip")} /> 跳过冲突的文件<small>其余文件照常回滚，这 2 个保持现状</small></label>
+        <label className={choice === "proceed" ? "choice on" : "choice"}><input type="radio" name="rollback" checked={choice === "proceed"} onChange={() => setChoice("proceed")} /> {rollbackProceedLabel(hasDeletion)}<small>{rollbackProceedNote(hasDeletion)}</small></label>
+        <label className={choice === "skip" ? "choice on" : "choice"}><input type="radio" name="rollback" checked={choice === "skip"} onChange={() => setChoice("skip")} /> 跳过冲突的文件<small>{rollbackSkipNote(hasDeletion)}</small></label>
         <footer>
-          <button className="ghost" onClick={onClose}>取消</button>
-          <button className="primary" onClick={onClose}>继续</button>
+          <button className="ghost" onClick={onCancel}>取消</button>
+          <button className="primary" onClick={() => onApply(choice === "skip" ? "skip" : "proceed")}>继续</button>
         </footer>
       </div>
     </div>
   );
 }
 
-function LogSheet({ onClose }: { onClose: () => void }) {
+function WriteFailureSheet({ alert, offer, onLater, onRollback }: { alert: string | null; offer: RecoveryOffer | null; onLater: () => void; onRollback: () => void }) {
+  const file = offer?.conflicts[0]?.path ?? STOPPED.file;
+  const code = offer?.code ? engineCode(offer.code) : STOPPED.code;
+  const message = offer?.error ?? STOPPED.message;
   return (
-    <div className="mask" onClick={onClose}>
+    <div className="mask" data-screen="18">
+      <div className="sheet small" onClick={(e) => e.stopPropagation()}>
+        <h1><AlertTriangle size={18} /> 升级已停止：有文件写入失败</h1>
+        <p>{STOP_BODY}</p>
+        <p>{offer ? offer.state : `已完成 ${STOPPED.done} / ${STOPPED.total}，失败 ${STOPPED.failed} 个`}</p>
+        {alert && <p className="err" role="alert"><Text value={alert} /></p>}
+        <ul className="changes">
+          <li><span><Text value={file} /></span><em className="err"><Text value={`${code} · ${message}`} /></em></li>
+        </ul>
+        <p className="keyhint">{STOP_FOOTER}</p>
+        <footer>
+          <button className="ghost" onClick={onLater}>稍后处理</button>
+          <button className="primary" onClick={onRollback}>回滚</button>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function StartupSheet({ alert, offer, onLater, onRollback, onContinue }: { alert: string | null; offer: RecoveryOffer | null; onLater: () => void; onRollback: () => void; onContinue: () => void }) {
+  const file = offer?.conflicts[0]?.path ?? STOPPED.file;
+  const code = offer?.code ? engineCode(offer.code) : STOPPED.code;
+  const message = offer?.error ?? STOPPED.message;
+  return (
+    <div className="mask" data-screen="20">
+      <div className="sheet small" onClick={(e) => e.stopPropagation()}>
+        <h1><AlertTriangle size={18} /> 有一次升级没有完成</h1>
+        <p>上次升级停在写入中途。可以继续、回滚，或先放着。</p>
+        <p>{offer ? offer.state : `已完成 ${STOPPED.done} / ${STOPPED.total}，失败 ${STOPPED.failed} 个`}</p>
+        {alert && <p className="err" role="alert"><Text value={alert} /></p>}
+        <ul className="changes">
+          <li><span><Text value={file} /></span><em className="err"><Text value={`${code} · ${message}`} /></em></li>
+        </ul>
+        <p className="keyhint">{RESUME_NOTE}</p>
+        <footer>
+          <button className="ghost" onClick={onLater}>稍后处理</button>
+          <button className="ghost" onClick={onRollback}>回滚</button>
+          <button className="primary" onClick={onContinue}>继续</button>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function ExternalSheet({ title, files, alert, onClose, onKeep, onRollback }: { title: string; files: ConflictFile[]; alert: string | null; onClose: () => void; onKeep: () => void; onRollback: () => void }) {
+  const [choice, setChoice] = useState("keep");
+  return (
+    <div className="mask" data-screen={resumeConflictScreen(files)}>
+      <div className="sheet small" onClick={(e) => e.stopPropagation()}>
+        <h1><AlertTriangle size={18} /> <Text value={title} /></h1>
+        <p className="sub">继续之前先确认怎么处理这些文件</p>
+        {alert && <p className="err" role="alert"><Text value={alert} /></p>}
+        <ul className="changes">
+          {files.map((file) => (
+            <li key={file.path} className={file.detail === DETAIL_DELETED ? "deleted" : ""}>
+              <span><Text value={file.path} /></span>
+              <em><Text value={file.detail} /></em>
+            </li>
+          ))}
+        </ul>
+        <label className={choice === "keep" ? "choice on" : "choice"}>
+          <input type="radio" name="external" checked={choice === "keep"} onChange={() => setChoice("keep")} /> 保留外部修改并继续
+          {files.some((file) => file.detail === DETAIL_DELETED) && <small>已经删除的文件保持删除</small>}
+        </label>
+        <label className={choice === "rollback" ? "choice on" : "choice"}>
+          <input type="radio" name="external" checked={choice === "rollback"} onChange={() => setChoice("rollback")} /> 回滚
+        </label>
+        <p className="keyhint">{RESUME_AGAIN}</p>
+        <footer>
+          <button className="ghost" onClick={onClose}>取消</button>
+          <button className="primary" onClick={() => (choice === "keep" ? onKeep() : onRollback())}>继续</button>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function PendingSheet({ files, alert, onCancel, onApply }: { files: ConflictFile[]; alert: string | null; onCancel: () => void; onApply: (choice: "skip" | "overwrite") => void }) {
+  const [choice, setChoice] = useState("skip");
+  return (
+    <div className="mask" data-screen="25">
+      <div className="sheet small" onClick={(e) => e.stopPropagation()}>
+        <h1><AlertTriangle size={18} /> {pendingChangedTitle(files.length)}</h1>
+        <p className="sub">这些文件这次还没写入</p>
+        {alert && <p className="err" role="alert"><Text value={alert} /></p>}
+        <ul className="changes">
+          {files.map((file) => (
+            <li key={file.path}><span><Text value={file.path} /></span><em><Text value={file.detail} /></em></li>
+          ))}
+        </ul>
+        <label className={choice === "skip" ? "choice on" : "choice"}>
+          <input type="radio" name="pending" checked={choice === "skip"} onChange={() => setChoice("skip")} /> {SKIP_PENDING}
+        </label>
+        <label className={choice === "overwrite" ? "choice on" : "choice"}>
+          <input type="radio" name="pending" checked={choice === "overwrite"} onChange={() => setChoice("overwrite")} /> {OVERWRITE_PENDING}
+          <small>{OVERWRITE_PENDING_NOTE}</small>
+        </label>
+        <footer>
+          <button className="ghost" onClick={onCancel}>取消</button>
+          <button className="primary" onClick={() => onApply(choice === "overwrite" ? "overwrite" : "skip")}>继续</button>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function RollbackResumeSheet({ alert, offer, onLater, onContinue }: { alert: string | null; offer: RecoveryOffer | null; onLater: () => void; onContinue: () => void }) {
+  return (
+    <div className="mask" data-screen="24">
+      <div className="sheet small" onClick={(e) => e.stopPropagation()}>
+        <h1><AlertTriangle size={18} /> 有一次回滚没有完成</h1>
+        <p>上次回滚停在中途。可以接着回滚，或先放着。</p>
+        <p>{offer ? offer.state : "已恢复 1 / 3 个文件"}</p>
+        {alert && <p className="err" role="alert"><Text value={alert} /></p>}
+        <footer>
+          <button className="ghost" onClick={onLater}>稍后处理</button>
+          <button className="primary" onClick={onContinue}>继续回滚</button>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function LogSheet({ alert, onClose, onRollback }: { alert: string | null; onClose: () => void; onRollback: () => void }) {
+  return (
+    <div className="mask">
       <div className="sheet small" onClick={(e) => e.stopPropagation()}>
         <h1><KeyRound size={18} /> 升级已停止：事务日志写入失败</h1>
         <p>可能是磁盘空间不足或没有写权限。已停止写入，不会自动回滚。</p>
         <p>已完成 9 / 20 个文件</p>
-        <p className="err">E_LOG_WRITE · No space left on device</p>
+        <p className="err"><Text value={alert && alert.startsWith("E_") ? alert : "E_LOG_WRITE · No space left on device"} /></p>
         <p>备份清单 manifest.json 仍保留已备份的文件。选「稍后处理」后，下次启动会继续提示这次未完成的升级。</p>
         <footer>
           <button className="ghost" onClick={onClose}>稍后处理</button>
-          <button className="primary" onClick={onClose}>回滚</button>
+          <button className="primary" onClick={onRollback}>回滚</button>
         </footer>
       </div>
     </div>

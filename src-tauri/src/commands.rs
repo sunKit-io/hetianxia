@@ -1,5 +1,5 @@
 use hetianxia_core::error::{Error, ErrorCode};
-use hetianxia_core::exec::{self, ExecOpts, ExecReport, HistoryRow, RollbackChoice};
+use hetianxia_core::exec::{self, ExecOpts, ExecReport, HistoryRow, ResumeChoice, ResumeOutcome, RollbackChoice};
 use hetianxia_core::model::ExecPlan;
 use hetianxia_core::merge::{self, Decision, Rendered};
 use hetianxia_core::pathutil::Ignore;
@@ -22,9 +22,25 @@ fn local_opts(backup_root: String, allow_readonly: bool) -> ExecOpts {
     }
 }
 
-fn remember_project_root(db_path: &str, root: &str) {
-    let path = Path::new(db_path).with_file_name("project-root");
-    let _ = std::fs::write(path, root);
+fn remember_project_root(db_path: &Path, root: &Path) {
+    let path = db_path.with_file_name("project-root");
+    let _ = std::fs::write(path, root.display().to_string());
+}
+
+fn ready(session: &crate::Session) -> Result<(), Error> {
+    if let Some(message) = &session.startup_error {
+        return Err(Error::new(ErrorCode::InvalidState, message.clone()));
+    }
+    Ok(())
+}
+
+fn project_root(session: &crate::Session) -> Result<PathBuf, Error> {
+    ready(session)?;
+    session
+        .project_root
+        .lock()
+        .map(|guard| guard.clone())
+        .map_err(|_| Error::new(ErrorCode::Internal, "项目目录锁被占用"))
 }
 
 #[tauri::command]
@@ -59,33 +75,82 @@ pub fn merge(left: String, right: String, decision: String) -> Result<Rendered, 
     Ok(merge::render(&file, &state))
 }
 
-#[tauri::command]
-pub fn execute(
-    db_path: String,
-    root: String,
-    backup_root: String,
-    plan: ExecPlan,
-    allow_readonly: bool,
-) -> Result<ExecReport, Error> {
-    remember_project_root(&db_path, &root);
-    let db = exec::open_db(Path::new(&db_path))?;
+pub fn execute_in(db_path: &Path, root: &Path, backup_root: &Path, plan: ExecPlan, allow_readonly: bool) -> Result<ExecReport, Error> {
+    remember_project_root(db_path, root);
+    let db = exec::open_db(db_path)?;
     let fsys = LocalFs::new(root);
     let kinds: Vec<_> = plan.ops.iter().map(|op| op.kind).collect();
     let fault = hetianxia_core::fault::load_from_env_or_exit(&kinds);
-    exec::execute(&db, &fsys, &plan, &local_opts(backup_root, allow_readonly), fault)
+    exec::execute(&db, &fsys, &plan, &local_opts(backup_root.display().to_string(), allow_readonly), fault)
 }
 
 #[tauri::command]
-pub fn rollback(db_path: String, root: String, exec_id: String, choice: RollbackChoice) -> Result<ExecReport, Error> {
-    let db = exec::open_db(Path::new(&db_path))?;
+pub fn execute(
+    session: tauri::State<crate::Session>,
+    root: String,
+    plan: ExecPlan,
+    allow_readonly: bool,
+) -> Result<ExecReport, Error> {
+    ready(&session)?;
+    let project = PathBuf::from(&root);
+    {
+        let mut saved = session.project_root.lock().map_err(|_| Error::new(ErrorCode::Internal, "项目目录锁被占用"))?;
+        *saved = project.clone();
+    }
+    execute_in(&session.db_path, &project, &session.backup_root, plan, allow_readonly)
+}
+
+pub fn rollback_in(db_path: &Path, root: &Path, exec_id: &str, choice: RollbackChoice) -> Result<ExecReport, Error> {
+    let db = exec::open_db(db_path)?;
     let fsys = LocalFs::new(root);
-    exec::rollback(&db, &fsys, &exec_id, choice, hetianxia_core::fault::FaultPlan::default())
+    exec::rollback(&db, &fsys, exec_id, choice, hetianxia_core::fault::FaultPlan::default())
 }
 
 #[tauri::command]
-pub fn history(db_path: String) -> Result<Vec<HistoryRow>, Error> {
-    let db = exec::open_db(Path::new(&db_path))?;
+pub fn rollback(session: tauri::State<crate::Session>, root: String, exec_id: String, choice: RollbackChoice) -> Result<ExecReport, Error> {
+    ready(&session)?;
+    rollback_in(&session.db_path, Path::new(&root), &exec_id, choice)
+}
+
+#[tauri::command]
+pub fn rollback_run(session: tauri::State<crate::Session>, exec_id: String, choice: RollbackChoice) -> Result<ExecReport, Error> {
+    let root = project_root(&session)?;
+    rollback_in(&session.db_path, &root, &exec_id, choice)
+}
+
+#[tauri::command]
+pub fn resume_run(
+    session: tauri::State<crate::Session>,
+    exec_id: String,
+    choice: ResumeChoice,
+) -> Result<ResumeOutcome, Error> {
+    let root = project_root(&session)?;
+    let db = exec::open_db(&session.db_path)?;
+    let fsys = LocalFs::new(root);
+    exec::resume(
+        &db,
+        &fsys,
+        &exec_id,
+        choice,
+        &local_opts(session.backup_root.display().to_string(), false),
+        hetianxia_core::fault::FaultPlan::default(),
+    )
+}
+
+pub fn history_in(db_path: &Path) -> Result<Vec<HistoryRow>, Error> {
+    let db = exec::open_db(db_path)?;
     exec::list_history(&db)
+}
+
+#[tauri::command]
+pub fn history(session: tauri::State<crate::Session>) -> Result<Vec<HistoryRow>, Error> {
+    ready(&session)?;
+    history_in(&session.db_path)
+}
+
+#[tauri::command]
+pub fn startup_failure(session: tauri::State<crate::Session>) -> Option<String> {
+    session.startup_error.clone()
 }
 
 #[tauri::command]
