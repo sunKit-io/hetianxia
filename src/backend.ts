@@ -32,3 +32,12 @@ export type JournalRun = {
 export function journalRuns() {
   return invoke<JournalRun[]>("journal_runs");
 }
+
+export type RollbackPreview = {
+  startedAt: number;
+  files: { path: string; detail: string }[];
+};
+
+export function rollbackPreview(execId: string) {
+  return invoke<RollbackPreview>("rollback_preview", { execId });
+}

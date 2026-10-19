@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Server, ShieldAlert, KeyRound, AlertTriangle } from "lucide-react";
-import { journalRuns, rollbackRun, resumeRun, startupFailure, startupOffers, type JournalRun } from "./backend";
+import { journalRuns, rollbackPreview, rollbackRun, resumeRun, startupFailure, startupOffers, type JournalRun } from "./backend";
 import { externalChoice, keepSource, pendingChoice, rollbackChoice, type ResumeChoice, type RollbackChoice } from "./choices";
 import { DiffEditor } from "./editor";
 import { afterResume, engineCode, formatEngineError, formatOffer, formatReport, type ConflictFile, type RecoveryOffer } from "./engine";
@@ -102,25 +102,11 @@ const EXTERNAL_FILES: ResumeFile[] = [
 
 const PENDING_FILES = ["src/legacy/cache.js", "config/local.env"];
 
-const ROLLBACK_FILES: ResumeFile[] = [
-  { path: "src/routes.js", detail: "升级后修改于 10月14日 09:12" },
-  { path: "public/old-banner.png", detail: DETAIL_DELETED },
-];
-
-const STOPPED = {
-  done: 9,
-  total: 20,
-  failed: 1,
-  file: "src/config/app.config.js",
-  code: "E_IO",
-  message: "写入失败",
-};
-
 export function App() {
   const [page, setPage] = useState<Page>("edit");
   const [hostId, setHostId] = useState("build-01");
   const [allowReadonly, setAllowReadonly] = useState(false);
-  const [sheet, setSheet] = useState<Sheet>("startup");
+  const [sheet, setSheet] = useState<Sheet>(null);
   const [cleared, setCleared] = useState<Record<string, boolean>>({});
   const [flowId, setFlowId] = useState("");
   const [status, setStatus] = useState<string | null>(null);
@@ -129,7 +115,8 @@ export function App() {
   const [externalFiles, setExternalFiles] = useState<ConflictFile[]>(EXTERNAL_FILES);
   const [externalTitle, setExternalTitle] = useState(resumeConflictTitle(EXTERNAL_FILES));
   const [pendingFiles, setPendingFiles] = useState<ConflictFile[]>(PENDING_FILES.map((path) => ({ path, detail: DETAIL_MODIFIED })));
-  const [rollbackFiles, setRollbackFiles] = useState<ConflictFile[]>(ROLLBACK_FILES);
+  const [rollbackFiles, setRollbackFiles] = useState<ConflictFile[]>([]);
+  const [rollbackAt, setRollbackAt] = useState(0);
   const host = HOSTS.find((h) => h.id === hostId) ?? HOSTS[0];
 
   useEffect(() => {
@@ -146,6 +133,7 @@ export function App() {
       setFlowId(first.execId);
       setStatus(formatOffer(first));
       if (first.state === "ROLLING_BACK" || first.state === "ROLLBACK_PARTIAL") setSheet("rollbackResume");
+      else setSheet("startup");
     }).catch((err) => {
       const message = formatEngineError(err);
       if (message.startsWith("E_")) setStatus(message);
@@ -173,6 +161,18 @@ export function App() {
     }
   }
 
+  async function openRollback(execId: string) {
+    setFlowId(execId);
+    try {
+      const preview = await rollbackPreview(execId);
+      setRollbackFiles(preview.files);
+      setRollbackAt(preview.startedAt);
+      setSheet("rollback");
+    } catch (err) {
+      setStatus(formatEngineError(err));
+    }
+  }
+
   async function applyRollback(id: string, choice: RollbackChoice) {
     setFlowId(id);
     try {
@@ -194,8 +194,8 @@ export function App() {
             <i /><i /><i />
           </span>
           <div className="titleblock">
-            <strong>{page === "ssh" ? "SSH 连接" : page === "history" ? "历史记录" : page === "edit" ? "OrderCenter" : "OrderCenter"}</strong>
-            <span>{page === "ssh" ? `${HOSTS.length} 个连接` : page === "history" ? "OrderCenter · 保留最近 10 次 · 超过 30 天自动清理" : page === "edit" ? "src/config/app.config.js · 左右对照" : "本机 ~/work/order-center ← release-3.0.0.zip"}</span>
+            <strong>{page === "ssh" ? "SSH 连接" : page === "history" ? "历史记录" : ""}</strong>
+            <span>{page === "ssh" ? `${HOSTS.length} 个连接` : page === "history" ? "保留最近 10 次 · 超过 30 天自动清理" : ""}</span>
           </div>
           <nav className="pages">
             <button className={page === "edit" ? "on" : ""} onClick={() => setPage("edit")}>编辑</button>
@@ -216,20 +216,18 @@ export function App() {
           />
         )}
         {page === "preview" && (
-          <PreviewPage allowReadonly={allowReadonly} setAllowReadonly={setAllowReadonly} onLog={() => setSheet("log")} />
+          <PreviewPage allowReadonly={allowReadonly} setAllowReadonly={setAllowReadonly} />
         )}
         {page === "history" && (
           <HistoryPage
-            onRollback={(execId) => {
-              setFlowId(execId);
-              setSheet("rollback");
-            }}
+            onRollback={(execId) => void openRollback(execId)}
             onContinue={(action) => void applyResume(action.execId, action.choice)}
           />
         )}
         {sheet === "rollback" && (
           <RollbackSheet
             files={rollbackFiles}
+            startedAt={rollbackAt}
             alert={status}
             onCancel={() => void applyRollback(flowId, "cancel")}
             onApply={(choice) => void applyRollback(flowId, rollbackChoice(choice))}
@@ -242,7 +240,7 @@ export function App() {
             alert={status}
             offer={offer}
             onLater={() => offer && void applyResume(offer.execId, "cancel")}
-            onRollback={() => offer && void applyResume(offer.execId, "rollback")}
+            onRollback={() => offer && void openRollback(offer.execId)}
             onContinue={() => offer && void applyResume(offer.execId, "continue")}
           />
         )}
@@ -352,7 +350,7 @@ function SshPage({ host, cleared, onPick, onClear }: { host: Host; cleared: bool
   );
 }
 
-function PreviewPage({ allowReadonly, setAllowReadonly, onLog }: { allowReadonly: boolean; setAllowReadonly: (v: boolean) => void; onLog: () => void }) {
+function PreviewPage({ allowReadonly, setAllowReadonly }: { allowReadonly: boolean; setAllowReadonly: (v: boolean) => void }) {
   const counts = useMemo(() => {
     const overwrite = allowReadonly ? 13 : 11;
     const skip = allowReadonly ? 0 : 2;
@@ -384,7 +382,6 @@ function PreviewPage({ allowReadonly, setAllowReadonly, onLog }: { allowReadonly
         </div>
         <label className="bak"><input type="checkbox" defaultChecked /> 执行前备份</label>
         <footer>
-          <button className="ghost" onClick={onLog}>日志失败示例</button>
           <button className="primary">备份并执行</button>
         </footer>
       </div>
@@ -437,14 +434,15 @@ function HistoryPage({ onRollback, onContinue }: { onRollback: (execId: string) 
   );
 }
 
-function RollbackSheet({ files, alert, onCancel, onApply }: { files: ConflictFile[]; alert: string | null; onCancel: () => void; onApply: (choice: "proceed" | "skip") => void }) {
+function RollbackSheet({ files, startedAt, alert, onCancel, onApply }: { files: ConflictFile[]; startedAt: number; alert: string | null; onCancel: () => void; onApply: (choice: "proceed" | "skip") => void }) {
   const [choice, setChoice] = useState("proceed");
   const hasDeletion = files.some((file) => file.detail === DETAIL_DELETED);
+  const when = formatRunTime(startedAt);
   return (
     <div className="mask" data-screen={hasDeletion ? "22" : "11"}>
       <div className="sheet small" onClick={(e) => e.stopPropagation()}>
         <h1><AlertTriangle size={18} /> 回滚发现 {files.length} 个冲突文件</h1>
-        <p>这些文件在 10月12日 升级后又被改动过。</p>
+        <p>{when ? `这些文件在 ${when} 升级后又被改动过。` : "这些文件在升级后又被改动过。"}</p>
         {alert && <p className="err" role="alert"><Text value={alert} /></p>}
         <ul className="changes">
           {files.map((file) => (
@@ -466,19 +464,22 @@ function RollbackSheet({ files, alert, onCancel, onApply }: { files: ConflictFil
 }
 
 function WriteFailureSheet({ alert, offer, onLater, onRollback }: { alert: string | null; offer: RecoveryOffer | null; onLater: () => void; onRollback: () => void }) {
-  const file = offer?.conflicts[0]?.path ?? STOPPED.file;
-  const code = offer?.code ? engineCode(offer.code) : STOPPED.code;
-  const message = offer?.error ?? STOPPED.message;
+  const file = offer?.conflicts[0]?.path ?? "";
+  const code = offer?.code ? engineCode(offer.code) : "";
+  const message = offer?.error ?? "";
+  const detail = [code, message].filter(Boolean).join(" · ");
   return (
     <div className="mask" data-screen="18">
       <div className="sheet small" onClick={(e) => e.stopPropagation()}>
         <h1><AlertTriangle size={18} /> 升级已停止：有文件写入失败</h1>
         <p>{STOP_BODY}</p>
-        <p>{offer ? offer.state : `已完成 ${STOPPED.done} / ${STOPPED.total}，失败 ${STOPPED.failed} 个`}</p>
+        {offer?.state ? <p><Text value={offer.state} /></p> : null}
         {alert && <p className="err" role="alert"><Text value={alert} /></p>}
-        <ul className="changes">
-          <li><span><Text value={file} /></span><em className="err"><Text value={`${code} · ${message}`} /></em></li>
-        </ul>
+        {(file || detail) && (
+          <ul className="changes">
+            <li><span><Text value={file} /></span>{detail ? <em className="err"><Text value={detail} /></em> : null}</li>
+          </ul>
+        )}
         <p className="keyhint">{STOP_FOOTER}</p>
         <footer>
           <button className="ghost" onClick={onLater}>稍后处理</button>
@@ -490,19 +491,22 @@ function WriteFailureSheet({ alert, offer, onLater, onRollback }: { alert: strin
 }
 
 function StartupSheet({ alert, offer, onLater, onRollback, onContinue }: { alert: string | null; offer: RecoveryOffer | null; onLater: () => void; onRollback: () => void; onContinue: () => void }) {
-  const file = offer?.conflicts[0]?.path ?? STOPPED.file;
-  const code = offer?.code ? engineCode(offer.code) : STOPPED.code;
-  const message = offer?.error ?? STOPPED.message;
+  const file = offer?.conflicts[0]?.path ?? "";
+  const code = offer?.code ? engineCode(offer.code) : "";
+  const message = offer?.error ?? "";
+  const detail = [code, message].filter(Boolean).join(" · ");
   return (
     <div className="mask" data-screen="20">
       <div className="sheet small" onClick={(e) => e.stopPropagation()}>
         <h1><AlertTriangle size={18} /> 有一次升级没有完成</h1>
         <p>上次升级停在写入中途。可以继续、回滚，或先放着。</p>
-        <p>{offer ? offer.state : `已完成 ${STOPPED.done} / ${STOPPED.total}，失败 ${STOPPED.failed} 个`}</p>
+        {offer?.state ? <p><Text value={offer.state} /></p> : null}
         {alert && <p className="err" role="alert"><Text value={alert} /></p>}
-        <ul className="changes">
-          <li><span><Text value={file} /></span><em className="err"><Text value={`${code} · ${message}`} /></em></li>
-        </ul>
+        {(file || detail) && (
+          <ul className="changes">
+            <li><span><Text value={file} /></span>{detail ? <em className="err"><Text value={detail} /></em> : null}</li>
+          </ul>
+        )}
         <p className="keyhint">{RESUME_NOTE}</p>
         <footer>
           <button className="ghost" onClick={onLater}>稍后处理</button>
@@ -582,7 +586,7 @@ function RollbackResumeSheet({ alert, offer, onLater, onContinue }: { alert: str
       <div className="sheet small" onClick={(e) => e.stopPropagation()}>
         <h1><AlertTriangle size={18} /> 有一次回滚没有完成</h1>
         <p>上次回滚停在中途。可以接着回滚，或先放着。</p>
-        <p>{offer ? offer.state : "已恢复 1 / 3 个文件"}</p>
+        {offer?.state ? <p><Text value={offer.state} /></p> : null}
         {alert && <p className="err" role="alert"><Text value={alert} /></p>}
         <footer>
           <button className="ghost" onClick={onLater}>稍后处理</button>
@@ -599,8 +603,7 @@ function LogSheet({ alert, onClose, onRollback }: { alert: string | null; onClos
       <div className="sheet small" onClick={(e) => e.stopPropagation()}>
         <h1><KeyRound size={18} /> 升级已停止：事务日志写入失败</h1>
         <p>可能是磁盘空间不足或没有写权限。已停止写入，不会自动回滚。</p>
-        <p>已完成 9 / 20 个文件</p>
-        <p className="err"><Text value={alert && alert.startsWith("E_") ? alert : "E_LOG_WRITE · No space left on device"} /></p>
+        {alert ? <p className="err"><Text value={alert} /></p> : null}
         <p>备份清单 manifest.json 仍保留已备份的文件。选「稍后处理」后，下次启动会继续提示这次未完成的升级。</p>
         <footer>
           <button className="ghost" onClick={onClose}>稍后处理</button>

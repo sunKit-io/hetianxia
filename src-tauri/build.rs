@@ -10,6 +10,7 @@ fn main() {
         "resume_run",
         "history",
         "journal_runs",
+        "rollback_preview",
         "connections",
         "startup_offers",
         "startup_failure",

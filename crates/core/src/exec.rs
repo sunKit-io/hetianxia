@@ -1967,6 +1967,41 @@ fn as_u32(value: i64) -> u32 {
     u32::try_from(value).unwrap_or(0)
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackPreview {
+    pub started_at: i64,
+    pub files: Vec<ConflictFile>,
+}
+
+/// 只读。项目目录只取这次 `exec_id` 的日志，没有就报错，不用别的目录顶上。
+pub fn rollback_preview(db: &Connection, exec_id: &str) -> Result<RollbackPreview> {
+    let (plan_json, started_at): (String, i64) = match db.query_row(
+        "SELECT COALESCE(plan_json, ''), COALESCE(started_at, 0) FROM exec_journal WHERE exec_id=?1",
+        params![exec_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ) {
+        Ok(row) => row,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Err(Error::new(ErrorCode::NotFound, "找不到这次升级")),
+        Err(err) => return Err(err.into()),
+    };
+    let (project_col, _) = journal_flag_columns(db)?;
+    let column_root = if project_col {
+        db.query_row("SELECT project_root FROM exec_journal WHERE exec_id=?1", params![exec_id], |row| {
+            row.get::<_, Option<String>>(0)
+        })?
+    } else {
+        None
+    };
+    let plan_value: serde_json::Value = serde_json::from_str(&plan_json).unwrap_or(serde_json::Value::Null);
+    let Some(root) = nonempty(column_root).or_else(|| plan_project_root(&plan_value)) else {
+        return Err(Error::new(ErrorCode::NotFound, "这次升级没有项目目录"));
+    };
+    let plan: ExecPlan = serde_json::from_str(&plan_json).map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))?;
+    let files = rollback_conflicts(&LocalFs::new(root), db, exec_id, &plan)?;
+    Ok(RollbackPreview { started_at, files })
+}
+
 fn plan_file_count(plan: &serde_json::Value) -> u32 {
     let Some(summary) = plan.get("summary") else {
         return 0;
@@ -5677,6 +5712,54 @@ mod tests {
         let column = runs.iter().find(|run| run.exec_id == "col-1").unwrap();
         assert_eq!(column.project_root.as_deref(), Some("/from-column"));
         assert!(!column.remote);
+    }
+
+    #[test]
+    fn rollback_preview_reads_conflicts_from_that_exec_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir.path().join("preview.sqlite")).unwrap();
+        let missing = rollback_preview(&db, "missing").unwrap_err();
+        assert_eq!(missing.code, ErrorCode::NotFound);
+        assert_eq!(missing.message, "找不到这次升级");
+
+        let proj = dir.path().join("proj");
+        let decoy = dir.path().join("decoy");
+        fs::create_dir(&proj).unwrap();
+        fs::create_dir(&decoy).unwrap();
+        fs::write(proj.join("a.txt"), b"original\n").unwrap();
+        fs::write(decoy.join("a.txt"), b"changed\n").unwrap();
+        let plan = ExecPlan {
+            id: "ex-1".into(),
+            project_key: "not-a-path".into(),
+            summary: Summary::default(),
+            ops: vec![ov(1, "a.txt", b"old\n", b"original\n", None)],
+        };
+        let stored = serde_json::to_string(&plan).unwrap();
+        db.execute(
+            "INSERT INTO exec_journal (exec_id, state, project_key, plan_json, backup_root, started_at) VALUES (?1,?2,?3,?4,?5,?6)",
+            params!["ex-1", "COMMITTED", "not-a-path", stored, decoy.display().to_string(), 1_700_000_000_000_i64],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO exec_ops (exec_id, op_index, op_json, state, written) VALUES (?1,1,'{}','done',1)",
+            params!["ex-1"],
+        )
+        .unwrap();
+        let no_root = rollback_preview(&db, "ex-1").unwrap_err();
+        assert_eq!(no_root.message, "这次升级没有项目目录");
+
+        let mut with_root = serde_json::to_value(&plan).unwrap();
+        with_root["projectRoot"] = serde_json::Value::String(proj.display().to_string());
+        db.execute("UPDATE exec_journal SET plan_json=?2 WHERE exec_id=?1", params!["ex-1", with_root.to_string()])
+            .unwrap();
+        let same = rollback_preview(&db, "ex-1").unwrap();
+        assert_eq!(same.started_at, 1_700_000_000_000);
+        assert!(same.files.is_empty());
+        fs::write(proj.join("a.txt"), b"changed\n").unwrap();
+        let preview = rollback_preview(&db, "ex-1").unwrap();
+        assert_eq!(preview.files.len(), 1);
+        assert_eq!(preview.files[0].path, "a.txt");
+        assert_eq!(preview.files[0].detail, DETAIL_MODIFIED);
     }
 
     #[cfg(feature = "fault-inject")]

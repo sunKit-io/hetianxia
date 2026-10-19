@@ -115,6 +115,7 @@ pub fn run() {
             commands::resume_run,
             commands::history,
             commands::journal_runs,
+            commands::rollback_preview,
             commands::connections,
             commands::startup_offers,
             commands::startup_failure,
@@ -184,7 +185,7 @@ mod tests {
         assert_eq!(app_db_path(std::path::Path::new("/data")), std::path::PathBuf::from("/data/hetianxia.sqlite"));
         assert_eq!(app_backup_root(std::path::Path::new("/data")), std::path::PathBuf::from("/data/bak"));
         let commands = include_str!("commands.rs");
-        for name in ["execute", "rollback", "rollback_run", "resume_run", "history", "journal_runs"] {
+        for name in ["execute", "rollback", "rollback_run", "resume_run", "history", "journal_runs", "rollback_preview"] {
             let header = command_header(commands, name);
             assert!(!header.contains("db_path"), "{name}: {header}");
             assert!(!header.contains("backup_root"), "{name}: {header}");
@@ -208,6 +209,7 @@ mod tests {
         assert!(!caps.contains("shell:"));
         assert!(caps.contains("allow-execute"));
         assert!(caps.contains("allow-journal-runs"));
+        assert!(caps.contains("allow-rollback-preview"));
         assert!(caps.contains("core:default"));
     }
 
