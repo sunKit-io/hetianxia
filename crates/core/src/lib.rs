@@ -10,6 +10,7 @@ pub mod model;
 pub mod pathutil;
 pub mod prefs;
 pub mod runlock;
+pub mod scan;
 pub mod vfs;
 
 /// 进程启动时调用。故障注入构建会在这里检查环境变量语法。
