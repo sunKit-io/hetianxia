@@ -224,23 +224,51 @@ impl LocalFs {
         Ok(())
     }
 
-    pub fn write_temp(&self, rel: &RelPath, data: &[u8]) -> Result<RelPath> {
+    /// 只分配临时文件名，不创建文件。调用方先把这个名字写进事务日志，再 `create_temp_file`。
+    pub fn allocate_temp(&self, rel: &RelPath) -> Result<RelPath> {
         self.ensure_writable_tree(rel)?;
         if let Some(parent) = rel.parent() {
             self.mkdir_p(&parent)?;
         }
         let name = rel.name();
         let tmp_name = crate::brand::temp_file_name(name, &uuid::Uuid::new_v4().simple().to_string());
-        let tmp_rel = match rel.parent() {
-            Some(p) => RelPath::parse(&format!("{p}/{tmp_name}"))?,
-            None => RelPath::parse(&tmp_name)?,
-        };
-        let path = self.abs(&tmp_rel)?;
-        {
-            let mut f = OpenOptions::new().write(true).create_new(true).open(&path)?;
+        match rel.parent() {
+            Some(p) => RelPath::parse(&format!("{p}/{tmp_name}")),
+            None => RelPath::parse(&tmp_name),
+        }
+    }
+
+    /// 在已经登记的路径上创建临时文件。写到一半失败时删掉这个文件。
+    pub fn create_temp_file(&self, tmp_rel: &RelPath, data: &[u8]) -> Result<()> {
+        self.ensure_writable_tree(tmp_rel)?;
+        if let Some(parent) = tmp_rel.parent() {
+            self.mkdir_p(&parent)?;
+        }
+        let path = self.abs(tmp_rel)?;
+        let mut f = OpenOptions::new().write(true).create_new(true).open(&path)?;
+        let write_result = (|| -> std::io::Result<()> {
+            #[cfg(test)]
+            if fail_mid_write() {
+                if !data.is_empty() {
+                    f.write_all(&data[..1])?;
+                }
+                return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "写入中途失败"));
+            }
             f.write_all(data)?;
             f.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = write_result {
+            drop(f);
+            let _ = fs::remove_file(&path);
+            return Err(e.into());
         }
+        Ok(())
+    }
+
+    pub fn write_temp(&self, rel: &RelPath, data: &[u8]) -> Result<RelPath> {
+        let tmp_rel = self.allocate_temp(rel)?;
+        self.create_temp_file(&tmp_rel, data)?;
         Ok(tmp_rel)
     }
 
@@ -321,16 +349,40 @@ impl LocalFs {
         Ok(())
     }
 
-    pub fn copy_in_atomic(&self, src: &Path, dest: &RelPath, mode: Option<u32>, mtime_ms: Option<i64>) -> Result<()> {
+    /// `register` 在创建临时文件之前调用，把名字写进事务日志。失败时删掉临时文件并调用 `forget`。
+    pub fn copy_in_atomic<R, G>(
+        &self,
+        src: &Path,
+        dest: &RelPath,
+        mode: Option<u32>,
+        mtime_ms: Option<i64>,
+        register: R,
+        forget: G,
+    ) -> Result<()>
+    where
+        R: FnOnce(&RelPath) -> Result<()>,
+        G: FnOnce(&RelPath),
+    {
         let data = fs::read(src)?;
-        let tmp = self.write_temp(dest, &data)?;
-        if let Some(mode) = mode {
-            set_mode(&self.abs(&tmp)?, mode)?;
+        let tmp = self.allocate_temp(dest)?;
+        register(&tmp)?;
+        let step = (|| -> Result<()> {
+            self.create_temp_file(&tmp, &data)?;
+            if let Some(mode) = mode {
+                set_mode(&self.abs(&tmp)?, mode)?;
+            }
+            self.rename_over(&tmp, dest)?;
+            if mtime_ms.is_some() || mode.is_some() {
+                self.set_meta(dest, mode, mtime_ms)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = step {
+            let _ = self.remove_path(&tmp);
+            forget(&tmp);
+            return Err(e);
         }
-        self.rename_over(&tmp, dest)?;
-        if mtime_ms.is_some() || mode.is_some() {
-            self.set_meta(dest, mode, mtime_ms)?;
-        }
+        forget(&tmp);
         Ok(())
     }
 
@@ -548,6 +600,21 @@ pub fn now_ms() -> i64 {
 }
 
 #[cfg(test)]
+thread_local! {
+    static FAIL_MID_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_mid_write() -> bool {
+    FAIL_MID_WRITE.with(|c| c.get())
+}
+
+#[cfg(test)]
+fn set_fail_mid_write(on: bool) {
+    FAIL_MID_WRITE.with(|c| c.set(on));
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
@@ -596,5 +663,18 @@ mod tests {
         fs.rename_over(&tmp, &rel).unwrap();
         assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"new");
         assert!(fs.list_temps().unwrap().is_empty());
+    }
+
+    #[test]
+    fn partial_write_deletes_the_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = LocalFs::new(dir.path());
+        let rel = RelPath::parse("a.txt").unwrap();
+        let tmp = fs.allocate_temp(&rel).unwrap();
+        set_fail_mid_write(true);
+        let err = fs.create_temp_file(&tmp, b"partial-bytes").unwrap_err();
+        set_fail_mid_write(false);
+        assert_eq!(err.code, ErrorCode::Io);
+        assert!(!dir.path().join(tmp.as_str()).exists());
     }
 }

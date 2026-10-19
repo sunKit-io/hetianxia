@@ -337,7 +337,8 @@ fn real_fault_code(stage: Stage) -> ErrorCode {
         // backup:N:error 模拟读写失败。backup:N:corrupt 不走这里，校验失败时报 E_VERIFY_FAILED。
         Stage::Backup | Stage::Write | Stage::Rename => ErrorCode::Io,
         Stage::Log => ErrorCode::LogWrite,
-        Stage::Rollback => ErrorCode::RollbackPartial,
+        // 单个文件的回滚失败报真实读写码。事务结果才是 ROLLBACK_PARTIAL。
+        Stage::Rollback => ErrorCode::Io,
         Stage::SftpDisconnect => ErrorCode::Net,
     }
 }
@@ -349,8 +350,8 @@ fn fire(stage: Stage, n: u32, mode: Mode) -> Result<()> {
         Mode::Drop => Err(Error::new(ErrorCode::Net, format!("injected disconnect at {label}"))),
         Mode::Corrupt => Ok(()),
         Mode::Error => Err(Error::new(real_fault_code(stage), format!("injected {label}"))),
-        // 进程缺陷。日志记 E_INTERNAL，不再上报 E_FAULT，也不把 IO 失败记成它。
-        Mode::Panic => Err(Error::new(ErrorCode::Internal, format!("panic {label}"))),
+        // 立刻中止进程。不返回错误码，不写日志，不做清理。下次启动走崩溃恢复。
+        Mode::Panic => std::process::abort(),
     }
 }
 

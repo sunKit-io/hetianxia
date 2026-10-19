@@ -32,6 +32,7 @@ pub enum ErrorCode {
     Conflict,
     Unsupported,
     Io,
+    InvalidState,
     Internal,
 }
 
@@ -92,6 +93,7 @@ impl Error {
             ErrorCode::Conflict => "E_CONFLICT",
             ErrorCode::Unsupported => "E_UNSUPPORTED",
             ErrorCode::Io => "E_IO",
+            ErrorCode::InvalidState => "E_INVALID_STATE",
             ErrorCode::Internal => "E_INTERNAL",
         }
     }
@@ -122,6 +124,7 @@ pub const SPEC_CODES: &[&str] = &[
     "E_ROLLBACK_CONFLICT",
     "E_ROLLBACK_PARTIAL",
     "E_CANCELLED",
+    "E_INVALID_STATE",
     "E_INTERNAL",
 ];
 
@@ -155,6 +158,7 @@ mod tests {
             ErrorCode::RollbackConflict,
             ErrorCode::RollbackPartial,
             ErrorCode::Cancelled,
+            ErrorCode::InvalidState,
             ErrorCode::Internal,
         ]
         .into_iter()
