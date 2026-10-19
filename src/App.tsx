@@ -191,7 +191,7 @@ export function App() {
           </span>
           <div className="titleblock">
             <strong>{page === "ssh" ? "SSH 连接" : page === "history" ? "历史记录" : "合天下"}</strong>
-            <span>{page === "ssh" ? `${HOSTS.length} 个连接` : page === "history" ? "保留最近 10 次 · 超过 30 天自动清理" : ""}</span>
+            <span>{page === "ssh" ? `${HOSTS.length} 个连接` : ""}</span>
           </div>
           <nav className="pages">
             <button className={page === "edit" ? "on" : ""} onClick={() => setPage("edit")}>编辑</button>
