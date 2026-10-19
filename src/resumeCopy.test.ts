@@ -16,6 +16,9 @@ import {
   rollbackProceedLabel,
   rollbackProceedNote,
   rollbackSkipNote,
+  PARTIAL_ROLLBACK_CHANGE,
+  PARTIAL_ROLLBACK_RESULT,
+  PARTIAL_ROLLBACK_UNRESTORED,
 } from "./resumeCopy.ts";
 
 test("title switches when any written file was deleted", () => {
@@ -42,4 +45,14 @@ test("pending overwrite and rollback copy stay pinned", () => {
   assert.equal(STOP_BODY, "已停止写入后面的文件，不会自动回滚");
   assert.equal(STOP_FOOTER, "下次启动还会再提示。历史记录会标成「部分失败」。");
   assert.equal(RESUME_NOTE, "继续会先核对已写完的文件，沿用原来的事务和备份");
+});
+
+test("partial rollback history lists only the files that stayed unrestored", () => {
+  assert.equal(PARTIAL_ROLLBACK_RESULT, "部分回滚");
+  assert.equal(PARTIAL_ROLLBACK_CHANGE, "已恢复 7 / 9 · 跳过 2");
+  assert.deepEqual(
+    PARTIAL_ROLLBACK_UNRESTORED.map((file) => file.path),
+    ["src/routes.js", "public/index.html"],
+  );
+  assert.ok(PARTIAL_ROLLBACK_UNRESTORED.every((file) => file.reason === "升级后被修改，已跳过"));
 });

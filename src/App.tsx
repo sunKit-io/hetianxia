@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 import { Server, ShieldAlert, KeyRound, AlertTriangle } from "lucide-react";
 import { DiffEditor } from "./editor";
 import { ALPINE, UNKNOWN, UBUNTU, canContinue, connectionSubtitle, systemTypeLabel, warningBanner, type RemoteOs } from "./os";
@@ -18,7 +18,11 @@ import {
   rollbackProceedLabel,
   rollbackProceedNote,
   rollbackSkipNote,
+  PARTIAL_ROLLBACK_CHANGE,
+  PARTIAL_ROLLBACK_RESULT,
+  PARTIAL_ROLLBACK_UNRESTORED,
   type ResumeFile,
+  type UnrestoredFile,
 } from "./resumeCopy";
 
 type Page = "edit" | "ssh" | "preview" | "history";
@@ -90,7 +94,26 @@ const HOSTS: Host[] = [
   },
 ];
 
-const HISTORY = [
+type HistoryEntry = {
+  time: string;
+  where: string;
+  change: string;
+  result: string;
+  rollback?: boolean;
+  partial?: boolean;
+  resumeRollback?: boolean;
+  cleaned?: boolean;
+  unrestored?: UnrestoredFile[];
+};
+
+const HISTORY: HistoryEntry[] = [
+  {
+    time: "10月18日 17:08",
+    where: "~/work/order-center ← release-3.1.0.zip",
+    change: PARTIAL_ROLLBACK_CHANGE,
+    result: PARTIAL_ROLLBACK_RESULT,
+    unrestored: PARTIAL_ROLLBACK_UNRESTORED,
+  },
   { time: "10月18日 16:02", where: "~/work/order-center ← release-3.1.0.zip", change: "覆盖 4 · 已写 2", result: "部分失败", rollback: true, partial: true },
   { time: "10月18日 15:11", where: "~/work/order-center ← release-3.1.0.zip", change: "回滚中断 · 已恢复 1 / 3", result: "回滚未完成", resumeRollback: true },
   { time: "10月12日 14:20", where: "~/work/order-center ← release-3.0.0.zip", change: "新增 6 · 覆盖 13 · 移动 1", result: "成功", rollback: true },
@@ -306,38 +329,69 @@ function PreviewPage({ allowReadonly, setAllowReadonly, onLog }: { allowReadonly
   );
 }
 
+function resultClass(result: string): string {
+  if (result === "已回滚" || result === "回滚未完成") return "rolled";
+  if (result === "部分失败") return "partial";
+  if (result === PARTIAL_ROLLBACK_RESULT) return "";
+  return "ok";
+}
+
 function HistoryPage({ onRollback, onContinue, onResumeRollback }: { onRollback: () => void; onContinue: () => void; onResumeRollback: () => void }) {
+  const [partialOpen, setPartialOpen] = useState(true);
   return (
-    <div className="history">
+    <div className="history" data-screen="26">
       <table>
         <thead><tr><th>时间</th><th>位置</th><th>变更</th><th>结果</th><th /></tr></thead>
         <tbody>
-          {HISTORY.map((row) => (
-            <tr key={row.time}>
-              <td>{row.time}</td>
-              <td>{row.where}</td>
-              <td>{row.change}</td>
-              <td className={row.result === "已回滚" || row.result === "回滚未完成" ? "rolled" : row.result === "部分失败" ? "partial" : "ok"}>{row.result}</td>
-              <td>
-                {row.where.includes(":/") ? (
-                  <button disabled title="远程写入还没支持">回滚…</button>
-                ) : row.partial ? (
-                  <>
-                    <button onClick={onRollback}>回滚…</button>
-                    <button onClick={onContinue}>继续</button>
-                  </>
-                ) : row.resumeRollback ? (
-                  <button onClick={onResumeRollback}>继续回滚</button>
-                ) : row.cleaned ? (
-                  <button disabled>备份已清理</button>
-                ) : row.rollback ? (
-                  <button onClick={onRollback}>回滚…</button>
-                ) : (
-                  <button disabled>回滚…</button>
+          {HISTORY.map((row) => {
+            const expanded = !!row.unrestored && partialOpen;
+            const remote = row.where.includes(":/");
+            return (
+              <Fragment key={row.time}>
+                <tr>
+                  <td>{row.time}</td>
+                  <td>{row.where}</td>
+                  <td>{row.change}</td>
+                  <td className={resultClass(row.result)}>
+                    {row.unrestored ? <span className="partialback">{row.result}</span> : row.result}
+                  </td>
+                  <td>
+                    {row.unrestored ? (
+                      <button className="expander" aria-expanded={expanded} onClick={() => setPartialOpen((open) => !open)}>
+                        {expanded ? "收起" : "未恢复文件"}
+                      </button>
+                    ) : remote ? (
+                      <button disabled title="远程写入还没支持">回滚…</button>
+                    ) : row.partial ? (
+                      <>
+                        <button onClick={onRollback}>回滚…</button>
+                        <button onClick={onContinue}>继续</button>
+                      </>
+                    ) : row.resumeRollback ? (
+                      <button onClick={onResumeRollback}>继续回滚</button>
+                    ) : row.cleaned ? (
+                      <button disabled>备份已清理</button>
+                    ) : row.rollback ? (
+                      <button onClick={onRollback}>回滚…</button>
+                    ) : (
+                      <button disabled>回滚…</button>
+                    )}
+                  </td>
+                </tr>
+                {expanded && row.unrestored && (
+                  <tr className="detail">
+                    <td colSpan={5}>
+                      <ul className="unrestored">
+                        {row.unrestored.map((file) => (
+                          <li key={file.path}><span>{file.path}</span><em>{file.reason}</em></li>
+                        ))}
+                      </ul>
+                    </td>
+                  </tr>
                 )}
-              </td>
-            </tr>
-          ))}
+              </Fragment>
+            );
+          })}
         </tbody>
       </table>
     </div>
