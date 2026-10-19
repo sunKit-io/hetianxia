@@ -306,6 +306,26 @@ impl LocalFs {
         Ok(())
     }
 
+    pub fn rename_over_counted(
+        &self,
+        tmp: &RelPath,
+        dest: &RelPath,
+        before_dir_fsync: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        self.ensure_writable_tree(dest)?;
+        let from = self.abs(tmp)?;
+        let to = self.abs(dest)?;
+        if to.exists() || fs::symlink_metadata(&to).is_ok() {
+            let meta = fs::symlink_metadata(&to)?;
+            if meta.file_type().is_symlink() {
+                let _ = fs::remove_file(&from);
+                return Err(Error::new(ErrorCode::SymlinkRefused, format!("拒绝用普通文件覆盖符号链接 {dest}")));
+            }
+        }
+        atomic_rename_counted(&from, &to, before_dir_fsync)?;
+        Ok(())
+    }
+
     pub fn mkdir_p(&self, rel: &RelPath) -> Result<Vec<String>> {
         if self.readonly {
             return Err(Error::new(ErrorCode::Permission, "升级包是只读的"));
@@ -356,6 +376,7 @@ impl LocalFs {
         dest: &RelPath,
         mode: Option<u32>,
         mtime_ms: Option<i64>,
+        before_dir_fsync: impl FnOnce() -> Result<()>,
         register: R,
         forget: G,
     ) -> Result<()>
@@ -371,7 +392,7 @@ impl LocalFs {
             if let Some(mode) = mode {
                 set_mode(&self.abs(&tmp)?, mode)?;
             }
-            self.rename_over(&tmp, dest)?;
+            self.rename_over_counted(&tmp, dest, before_dir_fsync)?;
             if mtime_ms.is_some() || mode.is_some() {
                 self.set_meta(dest, mode, mtime_ms)?;
             }
@@ -553,6 +574,10 @@ fn fsync_parent(path: &Path) -> Result<()> {
 }
 
 pub fn atomic_rename(from: &Path, to: &Path) -> Result<()> {
+    atomic_rename_counted(from, to, || Ok(()))
+}
+
+pub fn atomic_rename_counted(from: &Path, to: &Path, before_dir_fsync: impl FnOnce() -> Result<()>) -> Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -569,12 +594,14 @@ pub fn atomic_rename(from: &Path, to: &Path) -> Result<()> {
         if ok == 0 {
             return Err(Error::new(ErrorCode::Io, "MoveFileExW 失败"));
         }
+        before_dir_fsync()?;
         fsync_parent(to)?;
         return Ok(());
     }
     #[cfg(not(windows))]
     {
         fs::rename(from, to)?;
+        before_dir_fsync()?;
         fsync_parent(to)?;
         Ok(())
     }

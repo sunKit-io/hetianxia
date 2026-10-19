@@ -29,6 +29,7 @@ pub enum Stage {
     Rollback,
     Log,
     SftpDisconnect,
+    FsyncDir,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +66,8 @@ pub struct FaultRuntime {
     #[cfg_attr(not(feature = "fault-inject"), allow(dead_code))]
     plan: FaultPlan,
     log_writes: u32,
+    #[cfg_attr(not(feature = "fault-inject"), allow(dead_code))]
+    dir_fsyncs: u32,
 }
 
 #[cfg(not(feature = "fault-inject"))]
@@ -139,6 +142,7 @@ fn parse_item(raw: &str) -> std::result::Result<Item, String> {
         && parts[0] != "verify-pre" && parts[0] != "verify-post"
         && parts[0] != "rename" && parts[0] != "rollback"
         && parts[0] != "sftp-disconnect"
+        && parts[0] != "fsync-dir"
     {
         return Err(format!("未知阶段「{}」（来自「{raw}」）。没有单独的 verify，请用 verify-pre 或 verify-post", parts[0]));
     }
@@ -154,6 +158,24 @@ fn parse_item(raw: &str) -> std::result::Result<Item, String> {
             return Ok(Item::LogProbe { n: Some(n) });
         }
         return Err(format!("「{raw}」：log:probe 不接受模式"));
+    }
+    if parts[0] == "fsync-dir" {
+        if parts.len() != 2 && parts.len() != 3 {
+            return Err(format!("无法解析「{raw}」，应为 fsync-dir:N 或 fsync-dir:N:mode"));
+        }
+        let n: u32 = parts[1].parse().map_err(|_| format!("「{raw}」的序号不是正整数"))?;
+        if n == 0 {
+            return Err(format!("「{raw}」的序号不能为 0（从 1 开始）"));
+        }
+        let mode = if parts.len() == 2 {
+            Mode::Error
+        } else {
+            parse_mode(parts[2], raw, Stage::FsyncDir)?
+        };
+        if mode != Mode::Error && mode != Mode::Panic {
+            return Err(format!("「{raw}」：fsync-dir 只有 error 和 panic"));
+        }
+        return Ok(Item::At { stage: Stage::FsyncDir, n, mode });
     }
     if parts[0] == "log" && parts.len() >= 2 && (parts[1] == "begin" || parts[1] == "commit") {
         let which = parts[1];
@@ -232,6 +254,7 @@ fn validate(plan: &FaultPlan, ops: &[OpKind]) -> Result<()> {
     for item in &plan.items {
         match item {
             Item::LogBegin { .. } | Item::LogCommit { .. } | Item::LogProbe { .. } => {}
+            Item::At { stage: Stage::FsyncDir, .. } => {}
             Item::At { stage: Stage::Log, n, .. } => {
                 // 日志写入次数 = prepared + backed_up + 每个文件 doing/done + verifying + committed。
                 // 大于这个上限的 log:N 无法命中，按非法处理，避免静默忽略。
@@ -272,13 +295,13 @@ fn stage_applies(stage: Stage, kind: OpKind) -> bool {
         }
         Stage::VerifyPost | Stage::Rollback => true,
         Stage::SftpDisconnect => matches!(kind, OpKind::Create | OpKind::Overwrite | OpKind::Move),
-        Stage::Log => true,
+        Stage::Log | Stage::FsyncDir => true,
     }
 }
 
 impl FaultRuntime {
     pub fn new(plan: FaultPlan) -> Self {
-        Self { plan, log_writes: 0 }
+        Self { plan, log_writes: 0, dir_fsyncs: 0 }
     }
 
     #[cfg(not(feature = "fault-inject"))]
@@ -294,6 +317,12 @@ impl FaultRuntime {
 
     #[cfg(not(feature = "fault-inject"))]
     pub fn hit_commit(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// 正式包里什么都不做。故障注入构建在真正 fsync 父目录之前调用。
+    #[cfg(not(feature = "fault-inject"))]
+    pub fn hit_fsync_dir(&mut self) -> Result<()> {
         Ok(())
     }
 
@@ -340,6 +369,21 @@ impl FaultRuntime {
         Ok(())
     }
 
+    /// 本次运行或本次继续里的下一次父目录 fsync。`panic` 在 fsync 之前中止。
+    #[cfg(feature = "fault-inject")]
+    pub fn hit_fsync_dir(&mut self) -> Result<()> {
+        self.dir_fsyncs += 1;
+        let n = self.dir_fsyncs;
+        for item in &self.plan.items {
+            if let Item::At { stage: Stage::FsyncDir, n: want, mode } = item {
+                if *want == n {
+                    return fire(Stage::FsyncDir, n, *mode);
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "fault-inject")]
     pub fn hit_commit(&self) -> Result<()> {
         for item in &self.plan.items {
@@ -356,7 +400,7 @@ fn real_fault_code(stage: Stage) -> ErrorCode {
     match stage {
         Stage::VerifyPre | Stage::VerifyPost => ErrorCode::VerifyFailed,
         // backup:N:error 模拟读写失败。backup:N:corrupt 不走这里，校验失败时报 E_VERIFY_FAILED。
-        Stage::Backup | Stage::Write | Stage::Rename => ErrorCode::Io,
+        Stage::Backup | Stage::Write | Stage::Rename | Stage::FsyncDir => ErrorCode::Io,
         Stage::Log => ErrorCode::LogWrite,
         // 单个文件的回滚失败报真实读写码。事务结果才是 ROLLBACK_PARTIAL。
         Stage::Rollback => ErrorCode::Io,
@@ -522,6 +566,23 @@ mod tests {
         assert!(parse_spec("log:probe:1:panic").unwrap_err().contains("不接受模式"));
         assert!(parse_spec("log:probe:0").unwrap_err().contains("0"));
         assert!(load_for_plan("log:probe:1", &ops).is_ok());
+        assert!(matches!(
+            parse_spec("fsync-dir:2").unwrap().items[0],
+            Item::At { stage: Stage::FsyncDir, n: 2, mode: Mode::Error }
+        ));
+        assert!(matches!(
+            parse_spec("fsync-dir:4:error").unwrap().items[0],
+            Item::At { stage: Stage::FsyncDir, n: 4, mode: Mode::Error }
+        ));
+        assert!(matches!(
+            parse_spec("fsync-dir:4:panic").unwrap().items[0],
+            Item::At { stage: Stage::FsyncDir, n: 4, mode: Mode::Panic }
+        ));
+        assert!(parse_spec("fsync-dir:2:corrupt").unwrap_err().contains("fsync-dir"));
+        assert!(parse_spec("fsync-dir:2:drop").unwrap_err().contains("fsync-dir") || parse_spec("fsync-dir:2:drop").unwrap_err().contains("drop"));
+        assert!(parse_spec("fsync-dir:panic").is_err());
+        assert!(parse_spec("fsync-dir:0").unwrap_err().contains("0"));
+        assert!(load_for_plan("fsync-dir:8", &ops).is_ok());
         let err = load_for_plan("write:1", &[OpKind::Delete]).unwrap_err();
         assert!(err.message.contains("不适用"));
         assert_ne!(err.code_str(), "E_FAULT");
