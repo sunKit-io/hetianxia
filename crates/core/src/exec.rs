@@ -832,6 +832,10 @@ fn observed_state(db: &Connection, exec_id: &str) -> Result<String> {
     Ok(state)
 }
 
+pub fn read_journal_state(db: &Connection, exec_id: &str) -> Result<String> {
+    observed_state(db, exec_id)
+}
+
 fn note_pre_recovery(db: &Connection, exec_id: &str, observed: &str) -> Result<String> {
     db.execute(
         "UPDATE exec_journal SET pre_recovery_state=COALESCE(pre_recovery_state, ?2) WHERE exec_id=?1",

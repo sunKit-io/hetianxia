@@ -254,6 +254,10 @@ mod tests {
         let rows = commands::history_in(&db).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].result, "成功");
+        let resume_done = commands::reject_finished(&db, "exec-1", false).unwrap_err();
+        assert_eq!(resume_done.code, hetianxia_core::error::ErrorCode::InvalidState);
+        assert_eq!(resume_done.message, "这次升级已经结束，不能继续");
+        assert!(commands::reject_finished(&db, "exec-1", true).is_ok());
         let rolled = commands::rollback_in(
             &db,
             dir.path(),
@@ -269,6 +273,9 @@ mod tests {
         assert!(!runs[0].remote);
         assert_eq!(runs[0].file_count, 1);
         assert_eq!(runs[0].status, "ROLLED_BACK");
+        let again = commands::reject_finished(&db, "exec-1", true).unwrap_err();
+        assert_eq!(again.message, "这次回滚已经结束");
+        assert!(commands::reject_finished(&db, "exec-1", false).is_err());
 
         let hosts = commands::connections("Host build-01\n  HostName 10.0.8.15\n  User deploy\n".into()).unwrap();
         assert_eq!(hosts[0].alias, "build-01");
