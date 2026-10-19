@@ -197,7 +197,7 @@ mod tests {
         assert_eq!(app_db_path(std::path::Path::new("/data")), std::path::PathBuf::from("/data/hetianxia.sqlite"));
         assert_eq!(app_backup_root(std::path::Path::new("/data")), std::path::PathBuf::from("/data/bak"));
         let commands = include_str!("commands.rs");
-        for name in ["execute", "rollback_run", "resume_run", "history", "journal_runs", "clear_host_fingerprint", "rollback_preview"] {
+        for name in ["execute", "rollback_run", "resume_run", "history", "journal_runs", "clear_host_fingerprint", "host_key_status", "trust_host_fingerprint", "rollback_preview"] {
             let header = command_header(commands, name);
             assert!(!header.contains("db_path"), "{name}: {header}");
             assert!(!header.contains("backup_root"), "{name}: {header}");
@@ -338,24 +338,17 @@ mod tests {
         )
         .unwrap();
         let before = std::fs::read(&known).unwrap();
-        let status = commands::host_key_status(
-            db.display().to_string(),
-            known.display().to_string(),
-            "build-01".into(),
+        let status = commands::host_key_status_at(
+            &db,
+            &known,
+            "build-01",
             22,
-            "SHA256:ldyiXa1JQakitNU5tErauu8DvWQ1dZ7aXu+rm7KQuog".into(),
+            "SHA256:ldyiXa1JQakitNU5tErauu8DvWQ1dZ7aXu+rm7KQuog",
         )
         .unwrap();
         assert_eq!(status, "match");
         commands::clear_host_fingerprint_at(&db, "build-01", 22).unwrap();
-        let again = commands::host_key_status(
-            db.display().to_string(),
-            known.display().to_string(),
-            "build-01".into(),
-            22,
-            "SHA256:other".into(),
-        )
-        .unwrap();
+        let again = commands::host_key_status_at(&db, &known, "build-01", 22, "SHA256:other").unwrap();
         assert_eq!(again, "new");
         assert_eq!(std::fs::read(&known).unwrap(), before);
     }

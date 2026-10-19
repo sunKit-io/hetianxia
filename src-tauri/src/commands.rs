@@ -142,22 +142,6 @@ pub fn reject_finished(db_path: &Path, exec_id: &str, rollback: bool) -> Result<
     Ok(())
 }
 
-/// 已回滚的不能再回滚。已完成的升级可以回滚，所以已提交不在这里拒绝。
-pub fn reject_finished(db_path: &Path, exec_id: &str, rollback: bool) -> Result<(), Error> {
-    let db = exec::open_db(db_path)?;
-    let state = exec::read_journal_state(&db, exec_id)?;
-    if state == "ROLLED_BACK" {
-        return Err(Error::new(
-            ErrorCode::InvalidState,
-            if rollback { "这次回滚已经结束" } else { "这次升级已经结束，不能继续" },
-        ));
-    }
-    if state == "COMMITTED" && !rollback {
-        return Err(Error::new(ErrorCode::InvalidState, "这次升级已经结束，不能继续"));
-    }
-    Ok(())
-}
-
 #[tauri::command]
 pub fn rollback_run(session: tauri::State<crate::Session>, exec_id: String, choice: RollbackChoice) -> Result<ExecReport, Error> {
     ready(&session)?;
@@ -246,23 +230,34 @@ pub fn delete_ssh_secret(account: String) -> Result<(), Error> {
     KeyringStore.delete(&account)
 }
 
-#[tauri::command]
-pub fn host_key_status(
-    db_path: String,
-    known_hosts_path: String,
-    host: String,
+pub fn host_key_status_at(
+    db_path: &Path,
+    known_hosts_path: &Path,
+    host: &str,
     port: u16,
-    fingerprint: String,
+    fingerprint: &str,
 ) -> Result<String, Error> {
-    let db = exec::open_db(Path::new(&db_path))?;
-    let status = remote::host_key_with_file(&db, Path::new(&known_hosts_path), &host, port, &fingerprint)?;
-    remote::reject_if_host_key_changed(status, &fingerprint)?;
+    let db = exec::open_db(db_path)?;
+    let status = remote::host_key_with_file(&db, known_hosts_path, host, port, fingerprint)?;
+    remote::reject_if_host_key_changed(status, fingerprint)?;
     Ok(match status {
         remote::HostKeyStatus::New => "new",
         remote::HostKeyStatus::Match => "match",
         remote::HostKeyStatus::Changed => "changed",
     }
     .to_string())
+}
+
+#[tauri::command]
+pub fn host_key_status(
+    session: tauri::State<crate::Session>,
+    known_hosts_path: String,
+    host: String,
+    port: u16,
+    fingerprint: String,
+) -> Result<String, Error> {
+    ready(&session)?;
+    host_key_status_at(&session.db_path, Path::new(&known_hosts_path), &host, port, &fingerprint)
 }
 
 pub fn clear_host_fingerprint_at(db_path: &Path, host: &str, port: u16) -> Result<(), Error> {
@@ -276,15 +271,25 @@ pub fn clear_host_fingerprint(session: tauri::State<crate::Session>, host: Strin
     clear_host_fingerprint_at(&session.db_path, &host, port)
 }
 
-#[tauri::command]
-#[allow(dead_code)]
-pub fn trust_host_fingerprint(db_path: String, host: String, port: u16, fingerprint: String) -> Result<(), Error> {
-    let db = exec::open_db(Path::new(&db_path))?;
+pub fn trust_host_fingerprint_at(db_path: &Path, host: &str, port: u16, fingerprint: &str) -> Result<(), Error> {
+    let db = exec::open_db(db_path)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    remote::trust_host_key(&db, &host, port, &fingerprint, now)
+    remote::trust_host_key(&db, host, port, fingerprint, now)
+}
+
+#[tauri::command]
+#[allow(dead_code)]
+pub fn trust_host_fingerprint(
+    session: tauri::State<crate::Session>,
+    host: String,
+    port: u16,
+    fingerprint: String,
+) -> Result<(), Error> {
+    ready(&session)?;
+    trust_host_fingerprint_at(&session.db_path, &host, port, &fingerprint)
 }
 
 #[tauri::command]
