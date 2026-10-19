@@ -29,14 +29,14 @@ STAGE = re.compile(
     rb"(?:backup|write|verify-pre|verify-post|rename|rollback|log|log-probe|fsync-dir|sftp-disconnect):[0-9a-z]"
 )
 # Stage 变体名，外加 Item::LogProbe。按标识符边界匹配，避免撞上 core::fmt::Write 这类符号。
-# `Write` 不放进裸名字：正式二进制里有 `std::io::Write`。阶段语法 `write:N` 仍在 STAGE 里。
+# `Write` 不放进裸名字：正式二进制里有 `std::io::Write`。
+# `Log` 也不放：Tauri 带进来的 log::Log 会命中。阶段语法 `write:N` / `log:N` 仍在 STAGE 里。
 STAGE_NAMES = (
     b"Backup",
     b"VerifyPre",
     b"VerifyPost",
     b"Rename",
     b"Rollback",
-    b"Log",
     b"LogProbe",
     b"SftpDisconnect",
     b"FsyncDir",
