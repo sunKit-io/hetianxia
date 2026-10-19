@@ -38,10 +38,13 @@ jobs:
           command: check
           arguments: --all-features --locked
       - name: banner copy
-        run: node --experimental-strip-types --test src/os.test.ts src/resumeCopy.test.ts src/syncScroll.test.ts
+        run: node --experimental-strip-types --test src/os.test.ts src/resumeCopy.test.ts src/syncScroll.test.ts src/choices.test.ts src/engine.test.ts src/labels.test.ts src/paths.test.ts
       - name: javascript licenses
         run: |
           pnpm install --frozen-lockfile
+          node --experimental-strip-types --test src/text.test.ts
+          pnpm run build
+          node --experimental-strip-types --test src/bundle.test.ts
           pnpm run licenses
 
   macos-build:

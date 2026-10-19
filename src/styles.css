@@ -74,7 +74,8 @@ footer { margin-top: auto; }
 .choice small { display: block; color: #6e6e73; }
 .mask { position: fixed; inset: 0; background: rgba(0,0,0,.25); display: grid; place-items: center; }
 .sheet.small { width: min(520px, 92vw); }
-.err { color: #d70015; }
+.err { color: #d70015; white-space: pre-wrap; }
+.status { white-space: pre-wrap; margin: 0; padding: 8px 14px; background: white; border-bottom: 1px solid #ececf1; }
 .history table { width: 100%; border-collapse: collapse; background: white; border-radius: 10px; overflow: hidden; }
 .history th, .history td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #f2f2f7; }
 .history .ok { color: #248a3d; }

@@ -4,6 +4,7 @@ import { javascript } from "@codemirror/lang-javascript";
 import { bracketMatching, defaultHighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { EditorState } from "@codemirror/state";
 import { EditorView, drawSelection, keymap, lineNumbers } from "@codemirror/view";
+import { Text } from "./plain";
 import { lineHunks, mapDocY, screenCorrection, type Anchor, type Hunk } from "./syncScroll";
 
 const LEFT = sample("left");
@@ -191,7 +192,7 @@ export function DiffEditor({ onWriteFailed }: { onWriteFailed: () => void }) {
           ))}
         </ul>
         <footer>
-          <span>OrderCenter · src/config/app.config.js</span>
+          <span><Text value="OrderCenter · src/config/app.config.js" /></span>
           <button className="primary" onClick={onWriteFailed}>执行升级</button>
         </footer>
       </div>

@@ -11,6 +11,7 @@ fn main() {
         "history",
         "connections",
         "startup_offers",
+        "startup_failure",
         "ssh_secret_service",
         "save_ssh_secret",
         "ssh_secret_status",

@@ -15,6 +15,7 @@
     "allow-history",
     "allow-connections",
     "allow-startup-offers",
+    "allow-startup-failure",
     "allow-ssh-secret-service",
     "allow-save-ssh-secret",
     "allow-ssh-secret-status",
