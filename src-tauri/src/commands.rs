@@ -180,6 +180,17 @@ pub fn journal_runs(session: tauri::State<crate::Session>) -> Result<Vec<exec::J
     journal_runs_in(&session.db_path)
 }
 
+pub fn rollback_preview_in(db_path: &Path, exec_id: &str) -> Result<exec::RollbackPreview, Error> {
+    let db = exec::open_db(db_path)?;
+    exec::rollback_preview(&db, exec_id)
+}
+
+#[tauri::command]
+pub fn rollback_preview(session: tauri::State<crate::Session>, exec_id: String) -> Result<exec::RollbackPreview, Error> {
+    ready(&session)?;
+    rollback_preview_in(&session.db_path, &exec_id)
+}
+
 #[tauri::command]
 pub fn startup_failure(session: tauri::State<crate::Session>) -> Option<String> {
     session.startup_error.clone()
