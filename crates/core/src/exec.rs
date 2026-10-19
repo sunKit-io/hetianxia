@@ -33,7 +33,7 @@ use crate::model::{ExecPlan, OpKind, PlanOp};
 use crate::pathutil::RelPath;
 use crate::vfs::{now_ms, LocalFs};
 use rusqlite::{params, Connection};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -102,7 +102,7 @@ pub struct PendingTx {
     pub summary: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RollbackChoice {
     Cancel,

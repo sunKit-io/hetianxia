@@ -1,0 +1,37 @@
+[package]
+name = "hetianxia"
+version = "1.0.0"
+edition = "2021"
+description = "合天下桌面壳。命令层调用核心，发布构建不打开开发者工具。"
+license = "MIT"
+
+[features]
+default = []
+# 故障注入从核心透传。发布构建不要开这个 feature，也不要打开开发者工具。
+fault-inject = ["hetianxia-core/fault-inject"]
+
+[dependencies]
+hetianxia-core = { path = "../crates/core" }
+serde = { version = "=1.0.214", features = ["derive"] }
+serde_json = "=1.0.132"
+tauri = "=2.1.1"
+tauri-utils = "=2.1.0"
+tauri-macros = "=2.0.3"
+tauri-runtime = "=2.2.0"
+tauri-runtime-wry = "=2.2.0"
+# 下面这些是传递依赖。钉死版本，避免在 Rust 1.83 上拉到 edition2024。
+idna = "=1.0.3"
+icu_normalizer = "=1.5.0"
+icu_properties = "=1.5.1"
+icu_provider = "=1.5.0"
+icu_collections = "=1.5.0"
+idna_adapter = "=1.2.0"
+dlopen2_derive = "=0.4.1"
+unicode-segmentation = "=1.11.0"
+
+[build-dependencies]
+tauri-build = "=2.0.3"
+tauri-utils = "=2.1.0"
+
+[dev-dependencies]
+tempfile = "=3.14.0"
