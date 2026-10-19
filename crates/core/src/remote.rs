@@ -137,38 +137,108 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// 服务器上唯一允许的命令。不能拼出 uname、cp、sudo。
-pub fn remote_hashes_command(paths: &[String]) -> Result<String> {
+fn path_cannot_be_shell_quoted(path: &str) -> bool {
+    path.chars().any(|c| c == '\n' || c == '\r' || c == '\0')
+}
+
+/// 能放进单引号的路径合成一条 `sha256sum`；换行、回车、空字节无法安全转义，单独走 SFTP。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteHashPlan {
+    pub command: Option<String>,
+    pub sftp_paths: Vec<String>,
+}
+
+pub fn plan_remote_hashes(paths: &[String]) -> Result<RemoteHashPlan> {
     if paths.is_empty() {
         return Err(Error::new(ErrorCode::InvalidLocation, "没有要计算哈希的路径"));
     }
     if paths.len() > MAX_HASH_PATHS {
         return Err(Error::new(ErrorCode::InvalidLocation, format!("一次最多 {MAX_HASH_PATHS} 个路径")));
     }
-    let mut cmd = String::from("sha256sum --");
-    for p in paths {
-        if p.contains('\n') || p.contains('\0') || p.contains('\r') {
-            return Err(Error::new(ErrorCode::InvalidLocation, "路径里不能有换行或空字节"));
+    let mut quoted = Vec::new();
+    let mut sftp_paths = Vec::new();
+    for path in paths {
+        if path_cannot_be_shell_quoted(path) {
+            sftp_paths.push(path.clone());
+        } else {
+            quoted.push(path.clone());
         }
-        cmd.push(' ');
-        cmd.push_str(&shell_quote(p));
     }
-    if !command_allowed(&cmd) {
-        return Err(Error::new(ErrorCode::Unsupported, "生成的命令不在白名单里"));
-    }
-    Ok(cmd)
+    let command = if quoted.is_empty() {
+        None
+    } else {
+        let mut cmd = String::from("sha256sum --");
+        for path in &quoted {
+            cmd.push(' ');
+            cmd.push_str(&shell_quote(path));
+        }
+        if !command_allowed(&cmd) {
+            return Err(Error::new(ErrorCode::Unsupported, "生成的命令不在白名单里"));
+        }
+        Some(cmd)
+    };
+    Ok(RemoteHashPlan { command, sftp_paths })
 }
 
+/// 服务器上唯一允许的命令。路径全部都能转义时返回这一条命令。
+pub fn remote_hashes_command(paths: &[String]) -> Result<String> {
+    let plan = plan_remote_hashes(paths)?;
+    if !plan.sftp_paths.is_empty() {
+        return Err(Error::new(ErrorCode::InvalidLocation, "路径里不能有换行或空字节"));
+    }
+    plan.command.ok_or_else(|| Error::new(ErrorCode::InvalidLocation, "没有要计算哈希的路径"))
+}
+
+/// 单引号里的字符按字面量看。`$`、`;`、`uname`、`cp` 只有出现在引号外才拒绝。
 pub fn command_allowed(cmd: &str) -> bool {
     let cmd = cmd.trim();
-    if cmd.is_empty() || cmd.contains('\n') || cmd.contains(';') || cmd.contains('|') || cmd.contains('`') || cmd.contains('$') {
+    if !cmd.starts_with("sha256sum -- ") {
         return false;
     }
-    let lower = cmd.to_ascii_lowercase();
-    if lower.contains("uname") || lower.contains("sudo") || lower.split_whitespace().any(|w| w == "cp") {
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut unquoted = String::new();
+    let mut in_single = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '\\' {
+            let Some(next) = chars.get(i + 1).copied() else { return false };
+            unquoted.push(next);
+            i += 2;
+            continue;
+        }
+        if c == '\'' {
+            in_single = true;
+            i += 1;
+            continue;
+        }
+        unquoted.push(c);
+        i += 1;
+    }
+    if in_single {
         return false;
     }
-    cmd.starts_with("sha256sum -- ")
+    if unquoted.contains(';')
+        || unquoted.contains('|')
+        || unquoted.contains('`')
+        || unquoted.contains('$')
+        || unquoted.contains('\n')
+        || unquoted.contains('\r')
+    {
+        return false;
+    }
+    let lower = unquoted.to_ascii_lowercase();
+    if lower.contains("uname") || lower.contains("sudo") || unquoted.split_whitespace().any(|w| w == "cp") {
+        return false;
+    }
+    true
 }
 
 pub fn classify_remote(os_release: Option<&str>, plist: Option<&str>) -> RemoteOs {
@@ -246,14 +316,18 @@ fn shell_arg_count(s: &str) -> usize {
 }
 
 /// 准备要在服务器上执行的哈希命令，并写入 `remote-exec` 日志。
-pub fn prepare_remote_hashes(log: &mut RuntimeLog, paths: &[String]) -> Result<String> {
-    let cmd = remote_hashes_command(paths)?;
-    log.record_remote_command(&cmd);
-    Ok(cmd)
+/// 无法转义的路径在 `sftp_paths` 里，不进入这条命令，也不让整批失败。
+pub fn prepare_remote_hashes(log: &mut RuntimeLog, paths: &[String]) -> Result<RemoteHashPlan> {
+    let plan = plan_remote_hashes(paths)?;
+    if let Some(cmd) = &plan.command {
+        log.record_remote_command(cmd);
+    }
+    Ok(plan)
 }
 
 /// 服务器不能算哈希时不中断扫描，返回 `E_REMOTE_HASH_UNAVAILABLE`，调用方改走 SFTP。
-pub fn remote_hash_or_sftp(log: &mut RuntimeLog, sha256sum_ok: bool, paths: &[String]) -> Result<String> {
+/// 能算哈希时，个别无法转义的文件名仍放在 `sftp_paths`，其余合成一条命令。
+pub fn remote_hash_or_sftp(log: &mut RuntimeLog, sha256sum_ok: bool, paths: &[String]) -> Result<RemoteHashPlan> {
     if !sha256sum_ok {
         return Err(Error::new(
             ErrorCode::RemoteHashUnavailable,
@@ -309,7 +383,10 @@ Host intranet-jump\n  HostName 10.1.0.4\n  User ops\n  ProxyJump jump.example\n"
     #[test]
     fn remote_exec_log_redacts_paths_and_keeps_sha256sum() {
         let mut log = RuntimeLog::default();
-        let cmd = prepare_remote_hashes(&mut log, &["secret/license.key".into(), "a b".into()]).unwrap();
+        let cmd = prepare_remote_hashes(&mut log, &["secret/license.key".into(), "a b".into()])
+            .unwrap()
+            .command
+            .unwrap();
         assert!(cmd.contains("license.key"));
         let line = log.remote_exec_lines().next().unwrap();
         assert_eq!(line.category, "remote-exec");
@@ -319,5 +396,46 @@ Host intranet-jump\n  HostName 10.1.0.4\n  User ops\n  ProxyJump jump.example\n"
         let err = remote_hash_or_sftp(&mut log, false, &["secret/license.key".into()]).unwrap_err();
         assert_eq!(err.code_str(), "E_REMOTE_HASH_UNAVAILABLE");
         assert_eq!(log.remote_exec_lines().count(), 1);
+    }
+
+    #[test]
+    fn scan17_quotes_shell_metacharacters_and_falls_back_per_file() {
+        let paths = vec![
+            "Foo$1.class".into(),
+            "$(touch pwned).txt".into(),
+            "a cp b".into(),
+            "pseudo-uname.md".into(),
+            "a;uname".into(),
+            "ok.txt".into(),
+            "has\nnewline".into(),
+            "nul\0name".into(),
+            "cr\rname".into(),
+        ];
+        let plan = plan_remote_hashes(&paths).unwrap();
+        let cmd = plan.command.as_deref().unwrap();
+        assert_eq!(
+            cmd,
+            "sha256sum -- 'Foo$1.class' '$(touch pwned).txt' 'a cp b' 'pseudo-uname.md' 'a;uname' 'ok.txt'"
+        );
+        assert!(command_allowed(cmd));
+        assert_eq!(plan.sftp_paths, vec!["has\nnewline".to_string(), "nul\0name".into(), "cr\rname".into()]);
+        assert!(!command_allowed("sha256sum -- 'a'; uname"));
+        assert!(!command_allowed("sha256sum -- 'a' $(touch pwned)"));
+        assert!(!command_allowed("sha256sum -- 'a' | uname"));
+        let only = plan_remote_hashes(&["a\nb".into()]).unwrap();
+        assert!(only.command.is_none());
+        assert_eq!(only.sftp_paths, vec!["a\nb".to_string()]);
+        assert!(plan_remote_hashes(&["Foo$1.class".into()]).is_ok());
+        let mut log = RuntimeLog::default();
+        let planned = prepare_remote_hashes(&mut log, &paths).unwrap();
+        assert_eq!(planned.sftp_paths.len(), 3);
+        let line = log.remote_exec_lines().next().unwrap();
+        assert_eq!(line.message, "sha256sum -- '<path>' '<path>' '<path>' '<path>' '<path>' '<path>'");
+        assert!(!line.message.contains("Foo$1"));
+        assert!(!line.message.contains("pwned"));
+        assert!(!line.message.contains("newline"));
+        let via = remote_hash_or_sftp(&mut RuntimeLog::default(), true, &paths).unwrap();
+        assert!(via.command.is_some());
+        assert_eq!(via.sftp_paths.len(), 3);
     }
 }
