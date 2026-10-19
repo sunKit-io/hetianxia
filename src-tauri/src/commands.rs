@@ -1,5 +1,5 @@
 use hetianxia_core::error::{Error, ErrorCode};
-use hetianxia_core::exec::{self, ExecOpts, ExecReport, HistoryRow, RollbackChoice};
+use hetianxia_core::exec::{self, ExecOpts, ExecReport, HistoryRow, ResumeChoice, ResumeOutcome, RollbackChoice};
 use hetianxia_core::model::ExecPlan;
 use hetianxia_core::merge::{self, Decision, Rendered};
 use hetianxia_core::pathutil::Ignore;
@@ -80,6 +80,36 @@ pub fn rollback(db_path: String, root: String, exec_id: String, choice: Rollback
     let db = exec::open_db(Path::new(&db_path))?;
     let fsys = LocalFs::new(root);
     exec::rollback(&db, &fsys, &exec_id, choice, hetianxia_core::fault::FaultPlan::default())
+}
+
+fn session_paths(session: &crate::Session) -> (std::path::PathBuf, LocalFs) {
+    (session.db_path.clone(), LocalFs::new(&session.project_root))
+}
+
+#[tauri::command]
+pub fn rollback_run(session: tauri::State<crate::Session>, exec_id: String, choice: RollbackChoice) -> Result<ExecReport, Error> {
+    let (db_path, fsys) = session_paths(session.inner());
+    let db = exec::open_db(&db_path)?;
+    exec::rollback(&db, &fsys, &exec_id, choice, hetianxia_core::fault::FaultPlan::default())
+}
+
+#[tauri::command]
+pub fn resume_run(
+    session: tauri::State<crate::Session>,
+    exec_id: String,
+    choice: ResumeChoice,
+) -> Result<ResumeOutcome, Error> {
+    let (db_path, fsys) = session_paths(session.inner());
+    let db = exec::open_db(&db_path)?;
+    let backup = session.project_root.join("backups");
+    exec::resume(
+        &db,
+        &fsys,
+        &exec_id,
+        choice,
+        &local_opts(backup.display().to_string(), false),
+        hetianxia_core::fault::FaultPlan::default(),
+    )
 }
 
 #[tauri::command]

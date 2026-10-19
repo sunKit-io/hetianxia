@@ -6,6 +6,8 @@ fn main() {
         "merge",
         "execute",
         "rollback",
+        "rollback_run",
+        "resume_run",
         "history",
         "connections",
         "startup_offers",

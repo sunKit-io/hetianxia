@@ -1,5 +1,7 @@
-import { Fragment, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import { Server, ShieldAlert, KeyRound, AlertTriangle } from "lucide-react";
+import { rollbackRun, resumeRun, startupExecId } from "./backend";
+import { externalChoice, keepSource, pendingChoice, rollbackChoice, type ResumeChoice, type RollbackChoice } from "./choices";
 import { DiffEditor } from "./editor";
 import { ALPINE, UNKNOWN, UBUNTU, canContinue, connectionSubtitle, systemTypeLabel, warningBanner, type RemoteOs } from "./os";
 import {
@@ -149,8 +151,36 @@ export function App() {
   const [allowReadonly, setAllowReadonly] = useState(false);
   const [sheet, setSheet] = useState<Sheet>("startup");
   const [cleared, setCleared] = useState<Record<string, boolean>>({});
+  const [execId, setExecId] = useState("pending-upgrade");
+  const [notice, setNotice] = useState<string | null>(null);
   const host = HOSTS.find((h) => h.id === hostId) ?? HOSTS[0];
   const externalTitle = resumeConflictTitle(EXTERNAL_FILES);
+
+  useEffect(() => {
+    void startupExecId().then((id) => {
+      if (id) setExecId(id);
+    }).catch(() => undefined);
+  }, []);
+
+  async function runResume(choice: ResumeChoice, next: Sheet | null) {
+    try {
+      await resumeRun(execId, choice);
+      setNotice(null);
+      setSheet(next);
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function runRollback(choice: RollbackChoice) {
+    try {
+      await rollbackRun(execId, choice);
+      setNotice(null);
+      setSheet(null);
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : String(err));
+    }
+  }
 
   return (
     <div className="desktop">
@@ -171,6 +201,7 @@ export function App() {
           </nav>
           {page === "ssh" && <button className="ghost import">从 ~/.ssh/config 导入</button>}
         </header>
+        {notice && <p className="err" role="alert">{notice}</p>}
         {page === "edit" && <DiffEditor onWriteFailed={() => setSheet("failure")} />}
         {page === "ssh" && (
           <SshPage
@@ -185,32 +216,38 @@ export function App() {
         )}
         {page === "history" && (
           <HistoryPage
-            onRollback={() => setSheet("rollback")}
-            onContinue={() => setSheet("external")}
-            onResumeRollback={() => setSheet("rollbackResume")}
+            onRollback={() => void runResume("rollback", "rollback")}
+            onContinue={() => void runResume("continue", "external")}
+            onResumeRollback={() => void runRollback("proceedBackupCurrent")}
           />
         )}
-        {sheet === "rollback" && <RollbackSheet onClose={() => setSheet(null)} />}
-        {sheet === "log" && <LogSheet onClose={() => setSheet(null)} />}
-        {sheet === "failure" && <WriteFailureSheet onLater={() => setSheet(null)} onRollback={() => setSheet("rollback")} />}
+        {sheet === "rollback" && (
+          <RollbackSheet onCancel={() => setSheet(null)} onApply={(choice) => void runRollback(rollbackChoice(choice))} />
+        )}
+        {sheet === "log" && <LogSheet onClose={() => setSheet(null)} onRollback={() => void runRollback("proceedBackupCurrent")} />}
+        {sheet === "failure" && <WriteFailureSheet onLater={() => setSheet(null)} onRollback={() => void runResume("rollback", "rollback")} />}
         {sheet === "startup" && (
           <StartupSheet
-            onLater={() => setSheet(null)}
-            onRollback={() => setSheet("rollback")}
-            onContinue={() => setSheet("external")}
+            onLater={() => void runResume("cancel", null)}
+            onRollback={() => void runResume("rollback", "rollback")}
+            onContinue={() => void runResume("continue", "external")}
           />
         )}
         {sheet === "external" && (
           <ExternalSheet
             title={externalTitle}
             files={EXTERNAL_FILES}
-            onClose={() => setSheet(null)}
-            onKeep={() => setSheet("pending")}
-            onRollback={() => setSheet("rollback")}
+            onClose={() => void runResume("cancel", null)}
+            onKeep={() => void runResume(externalChoice("keep"), "pending")}
+            onRollback={() => void runResume(externalChoice("rollback"), "rollback")}
           />
         )}
-        {sheet === "pending" && <PendingSheet onClose={() => setSheet(null)} />}
-        {sheet === "rollbackResume" && <RollbackResumeSheet onLater={() => setSheet(null)} onContinue={() => setSheet(null)} />}
+        {sheet === "pending" && (
+          <PendingSheet onCancel={() => setSheet(null)} onApply={(choice) => void runResume(pendingChoice(choice), null)} />
+        )}
+        {sheet === "rollbackResume" && (
+          <RollbackResumeSheet onLater={() => void runResume("cancel", null)} onContinue={() => void runRollback("proceedBackupCurrent")} />
+        )}
       </div>
     </div>
   );
@@ -310,7 +347,7 @@ function PreviewPage({ allowReadonly, setAllowReadonly, onLog }: { allowReadonly
         <ul className="changes">
           <li><i className="add" /> plugins/tracing/index.ts <em>升级包</em></li>
           <li><i className="mod" /> src/config/app.config.js <em>合并结果</em></li>
-          <li><i className="move" /> lib/format.ts → utils/format.ts <em>移动（保留旧文件）</em></li>
+          <li data-keep-source={keepSource("移动（保留旧文件）") ? "1" : "0"}><i className="move" /> lib/format.ts → utils/format.ts <em>移动（保留旧文件）</em></li>
         </ul>
         <div className="ro">
           <b>只读文件（2）</b>
@@ -398,11 +435,11 @@ function HistoryPage({ onRollback, onContinue, onResumeRollback }: { onRollback:
   );
 }
 
-function RollbackSheet({ onClose }: { onClose: () => void }) {
+function RollbackSheet({ onCancel, onApply }: { onCancel: () => void; onApply: (choice: "proceed" | "skip") => void }) {
   const [choice, setChoice] = useState("proceed");
   const hasDeletion = ROLLBACK_FILES.some((file) => file.detail === DETAIL_DELETED);
   return (
-    <div className="mask" data-screen={hasDeletion ? "22" : "11"} onClick={onClose}>
+    <div className="mask" data-screen={hasDeletion ? "22" : "11"} onClick={onCancel}>
       <div className="sheet small" onClick={(e) => e.stopPropagation()}>
         <h1><AlertTriangle size={18} /> 回滚发现 {ROLLBACK_FILES.length} 个冲突文件</h1>
         <p>这些文件在 10月12日 升级后又被改动过。</p>
@@ -417,8 +454,8 @@ function RollbackSheet({ onClose }: { onClose: () => void }) {
         <label className={choice === "proceed" ? "choice on" : "choice"}><input type="radio" name="rollback" checked={choice === "proceed"} onChange={() => setChoice("proceed")} /> {rollbackProceedLabel(hasDeletion)}<small>{rollbackProceedNote(hasDeletion)}</small></label>
         <label className={choice === "skip" ? "choice on" : "choice"}><input type="radio" name="rollback" checked={choice === "skip"} onChange={() => setChoice("skip")} /> 跳过冲突的文件<small>{rollbackSkipNote(hasDeletion)}</small></label>
         <footer>
-          <button className="ghost" onClick={onClose}>取消</button>
-          <button className="primary" onClick={onClose}>继续</button>
+          <button className="ghost" onClick={onCancel}>取消</button>
+          <button className="primary" onClick={() => onApply(choice === "skip" ? "skip" : "proceed")}>继续</button>
         </footer>
       </div>
     </div>
@@ -498,10 +535,10 @@ function ExternalSheet({ title, files, onClose, onKeep, onRollback }: { title: s
   );
 }
 
-function PendingSheet({ onClose }: { onClose: () => void }) {
+function PendingSheet({ onCancel, onApply }: { onCancel: () => void; onApply: (choice: "skip" | "overwrite") => void }) {
   const [choice, setChoice] = useState("skip");
   return (
-    <div className="mask" data-screen="25">
+    <div className="mask" data-screen="25" onClick={onCancel}>
       <div className="sheet small" onClick={(e) => e.stopPropagation()}>
         <h1><AlertTriangle size={18} /> {pendingChangedTitle(PENDING_FILES.length)}</h1>
         <p className="sub">这些文件这次还没写入</p>
@@ -518,8 +555,8 @@ function PendingSheet({ onClose }: { onClose: () => void }) {
           <small>{OVERWRITE_PENDING_NOTE}</small>
         </label>
         <footer>
-          <button className="ghost" onClick={onClose}>取消</button>
-          <button className="primary" onClick={onClose}>继续</button>
+          <button className="ghost" onClick={onCancel}>取消</button>
+          <button className="primary" onClick={() => onApply(choice === "overwrite" ? "overwrite" : "skip")}>继续</button>
         </footer>
       </div>
     </div>
@@ -530,7 +567,7 @@ function RollbackResumeSheet({ onLater, onContinue }: { onLater: () => void; onC
   return (
     <div className="mask" data-screen="24">
       <div className="sheet small" onClick={(e) => e.stopPropagation()}>
-        <h1><AlertTriangle size={18} /> 回滚没有完成</h1>
+        <h1><AlertTriangle size={18} /> 有一次回滚没有完成</h1>
         <p>上次回滚停在中途。可以接着回滚，或先放着。</p>
         <p>已恢复 1 / 3 个文件</p>
         <footer>
@@ -542,7 +579,7 @@ function RollbackResumeSheet({ onLater, onContinue }: { onLater: () => void; onC
   );
 }
 
-function LogSheet({ onClose }: { onClose: () => void }) {
+function LogSheet({ onClose, onRollback }: { onClose: () => void; onRollback: () => void }) {
   return (
     <div className="mask" onClick={onClose}>
       <div className="sheet small" onClick={(e) => e.stopPropagation()}>
@@ -553,7 +590,7 @@ function LogSheet({ onClose }: { onClose: () => void }) {
         <p>备份清单 manifest.json 仍保留已备份的文件。选「稍后处理」后，下次启动会继续提示这次未完成的升级。</p>
         <footer>
           <button className="ghost" onClick={onClose}>稍后处理</button>
-          <button className="primary" onClick={onClose}>回滚</button>
+          <button className="primary" onClick={onRollback}>回滚</button>
         </footer>
       </div>
     </div>

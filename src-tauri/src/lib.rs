@@ -15,6 +15,7 @@ pub const MACOS_TARGET: &str = "universal-apple-darwin";
 
 pub struct Session {
     db_path: PathBuf,
+    project_root: PathBuf,
     lock: Mutex<Option<hetianxia_core::runlock::RunLock>>,
     offers: Vec<hetianxia_core::exec::RecoveryOffer>,
 }
@@ -48,6 +49,7 @@ pub fn run() {
                 hetianxia_core::exec::RunStart::AnotherInstance => std::process::exit(0),
                 hetianxia_core::exec::RunStart::Started { lock, offers, .. } => Session {
                     db_path,
+                    project_root: root,
                     lock: Mutex::new(Some(lock)),
                     offers,
                 },
@@ -69,6 +71,8 @@ pub fn run() {
             commands::merge,
             commands::execute,
             commands::rollback,
+            commands::rollback_run,
+            commands::resume_run,
             commands::history,
             commands::connections,
             commands::startup_offers,

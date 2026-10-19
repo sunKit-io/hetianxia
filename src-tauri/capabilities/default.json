@@ -10,6 +10,8 @@
     "allow-merge",
     "allow-execute",
     "allow-rollback",
+    "allow-rollback-run",
+    "allow-resume-run",
     "allow-history",
     "allow-connections",
     "allow-startup-offers",
