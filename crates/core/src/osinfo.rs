@@ -70,7 +70,7 @@ pub fn warning_banner(os: &RemoteOs) -> Option<String> {
             Some(format!("这台服务器的 Linux 发行版（{id}）未经验证。你可以继续使用，但部分功能可能不正常。"))
         }
         RemoteOs::Unidentified => Some(
-            "未验证的系统：没能识别出这台服务器的系统，第一版只验证了 Linux 和 macOS。你可以继续使用，但部分功能可能不正常。".into(),
+            "未验证的系统：没能识别这台服务器的系统，第一版只验证了 Linux 和 macOS。你可以继续使用，但部分功能可能不正常。".into(),
         ),
         _ => None,
     }
@@ -149,7 +149,11 @@ mod tests {
         assert!(!label.contains("os-release"));
         assert!(!label.contains("Linux"));
         let banner = warning_banner(&os).unwrap();
-        assert!(banner.starts_with("未验证的系统："), "{banner}");
+        assert_eq!(
+            banner,
+            "未验证的系统：没能识别这台服务器的系统，第一版只验证了 Linux 和 macOS。你可以继续使用，但部分功能可能不正常。"
+        );
+        assert!(!banner.contains("识别出"));
         assert!(can_continue(&os));
     }
 
