@@ -28,7 +28,7 @@ uuid = { version = "=1.11.0", features = ["v4", "serde"] }
 chrono = { version = "=0.4.38", features = ["serde"] }
 walkdir = "=2.5.0"
 filetime = "=0.2.25"
-libc = "=0.2.161"
+libc = "=0.2.169"
 fs4 = "=0.8.4"
 zeroize = { version = "=1.8.1", features = ["derive"] }
 # 下面几个是传递依赖，钉死版本，避免在 Rust 1.83 上拉到 edition2024 的新发布。
@@ -39,7 +39,7 @@ zopfli = "=0.8.1"
 # russh 的 home 0.5.12、rand 0.9 的 getrandom 0.3.4 都要用 edition 2024。钉在还能用 1.83 的版本。
 home = "=0.5.11"
 getrandom = "=0.3.3"
-tokio = { version = "=1.40.0", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync"] }
+tokio = { version = "=1.43.1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync"] }
 # 0.54.6 是最后一版能在 Rust 1.83 上编译的 russh。加密后端用 ring，不拉 aws-lc。
 # ssh-key 不单独依赖：这个版本用的是 internal-russh-forked-ssh-key 0.6.11，经 russh::keys 导出。
 russh = { version = "=0.54.6", default-features = false, features = ["ring", "flate2", "rsa"] }

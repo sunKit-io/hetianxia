@@ -114,7 +114,6 @@ pub fn run() {
             commands::diff,
             commands::merge,
             commands::execute,
-            commands::rollback,
             commands::rollback_run,
             commands::resume_run,
             commands::history,
@@ -198,7 +197,7 @@ mod tests {
         assert_eq!(app_db_path(std::path::Path::new("/data")), std::path::PathBuf::from("/data/hetianxia.sqlite"));
         assert_eq!(app_backup_root(std::path::Path::new("/data")), std::path::PathBuf::from("/data/bak"));
         let commands = include_str!("commands.rs");
-        for name in ["execute", "rollback", "rollback_run", "resume_run", "history", "journal_runs", "rollback_preview"] {
+        for name in ["execute", "rollback_run", "resume_run", "history", "journal_runs", "clear_host_fingerprint", "rollback_preview"] {
             let header = command_header(commands, name);
             assert!(!header.contains("db_path"), "{name}: {header}");
             assert!(!header.contains("backup_root"), "{name}: {header}");
@@ -211,6 +210,7 @@ mod tests {
             assert!(!rest[..end].contains("project_root"), "{name}");
         }
         assert!(commands.contains("stored_project_root"));
+        assert!(!commands.contains("pub fn rollback("));
         assert!(commands.contains("session.backup_root"));
         assert!(!commands.contains("join(\"backups\")"));
         assert!(!commands.contains("load_ssh_secret"));
@@ -306,7 +306,10 @@ mod tests {
         let runs = commands::journal_runs_in(&db).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].exec_id, "exec-1");
-        assert!(runs[0].project_root.is_none());
+        assert_eq!(
+            runs[0].project_root.as_deref(),
+            Some(std::fs::canonicalize(dir.path()).unwrap().to_str().unwrap())
+        );
         assert!(!runs[0].remote);
         assert_eq!(runs[0].file_count, 1);
         assert_eq!(runs[0].status, "ROLLED_BACK");
@@ -343,7 +346,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(status, "match");
-        commands::clear_host_fingerprint(db.display().to_string(), "build-01".into(), 22).unwrap();
+        commands::clear_host_fingerprint_at(&db, "build-01", 22).unwrap();
         let again = commands::host_key_status(
             db.display().to_string(),
             known.display().to_string(),

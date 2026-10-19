@@ -125,10 +125,20 @@ pub fn resume_recorded(
     )
 }
 
-#[tauri::command]
-pub fn rollback(session: tauri::State<crate::Session>, root: String, exec_id: String, choice: RollbackChoice) -> Result<ExecReport, Error> {
-    ready(&session)?;
-    rollback_in(&session.db_path, Path::new(&root), &exec_id, choice)
+/// 已回滚的不能再回滚。已完成的升级可以回滚，所以已提交不在这里拒绝。
+pub fn reject_finished(db_path: &Path, exec_id: &str, rollback: bool) -> Result<(), Error> {
+    let db = exec::open_db(db_path)?;
+    let state = exec::read_journal_state(&db, exec_id)?;
+    if state == "ROLLED_BACK" {
+        return Err(Error::new(
+            ErrorCode::InvalidState,
+            if rollback { "这次回滚已经结束" } else { "这次升级已经结束，不能继续" },
+        ));
+    }
+    if state == "COMMITTED" && !rollback {
+        return Err(Error::new(ErrorCode::InvalidState, "这次升级已经结束，不能继续"));
+    }
+    Ok(())
 }
 
 /// 已回滚的不能再回滚。已完成的升级可以回滚，所以已提交不在这里拒绝。
@@ -254,10 +264,15 @@ pub fn host_key_status(
     .to_string())
 }
 
+pub fn clear_host_fingerprint_at(db_path: &Path, host: &str, port: u16) -> Result<(), Error> {
+    let db = exec::open_db(db_path)?;
+    remote::clear_fingerprint(&db, host, port)
+}
+
 #[tauri::command]
-pub fn clear_host_fingerprint(db_path: String, host: String, port: u16) -> Result<(), Error> {
-    let db = exec::open_db(Path::new(&db_path))?;
-    remote::clear_fingerprint(&db, &host, port)
+pub fn clear_host_fingerprint(session: tauri::State<crate::Session>, host: String, port: u16) -> Result<(), Error> {
+    ready(&session)?;
+    clear_host_fingerprint_at(&session.db_path, &host, port)
 }
 
 #[tauri::command]
