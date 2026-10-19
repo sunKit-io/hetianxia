@@ -22,6 +22,8 @@ button, input { font: inherit; }
 .pages button, .ghost, .primary, .danger, .link { border: 0; border-radius: 6px; padding: 6px 10px; background: transparent; }
 .pages button.on { background: #e8e8ed; }
 .import { margin-left: auto; border: 1px solid #d2d2d7; background: white; }
+.import:disabled { opacity: .45; color: #8e8e93; cursor: default; }
+.soon { color: #8e8e93; font-size: 12px; }
 .ssh { display: grid; grid-template-columns: 240px 1fr; min-height: 640px; }
 .ssh aside { background: #ececf1; padding: 12px; display: flex; flex-direction: column; gap: 4px; }
 .search, label input { width: 100%; border: 1px solid #d2d2d7; border-radius: 6px; padding: 6px 8px; background: white; }
@@ -45,6 +47,7 @@ button, input { font: inherit; }
 .row2 { display: grid; grid-template-columns: 120px 1fr; gap: 8px; }
 .auth span { display: inline-block; padding: 4px 8px; background: #f2f2f7; border-radius: 6px; margin-right: 4px; cursor: pointer; }
 .auth span.on { background: #e5e5ea; }
+.auth span.off { color: #8e8e93; cursor: default; }
 .savekey, footer, .hosthead { display: flex; align-items: center; gap: 8px; }
 .ok { color: #248a3d; margin-left: auto; }
 .keyhint, .sub, .ro p { color: #6e6e73; margin: 0; }

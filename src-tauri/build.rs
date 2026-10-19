@@ -32,6 +32,7 @@ fn main() {
         "commit_remote_overwrite",
         "app_bak_dir",
         "probe_remote",
+        "read_ssh_config",
     ]);
     if let Err(error) = tauri_build::try_build(tauri_build::Attributes::new().app_manifest(manifest)) {
         println!("{error:#}");

@@ -47,6 +47,17 @@ test("the frontend has no baked home or product backup path", () => {
   assert.match(app, /commitRemoteOverwrite\(pending\.execId\)/);
   assert.match(app, /新建连接/);
   assert.match(app, /testConnection\(/);
+  assert.match(app, /从 ~\/\.ssh\/config 导入/);
+  assert.match(app, /disabled>从 ~\/\.ssh\/config 导入/);
+  assert.match(app, /ssh-agent<\/span>/);
+  assert.match(app, /className="off">ssh-agent/);
+  assert.match(app, /下一版支持/);
+  assert.equal(app.includes("readSshConfig("), false);
+  assert.match(app, /口令只存在本机钥匙串，不会再显示出来/);
+  assert.equal(app.includes("账号是连接 id"), false);
+  assert.equal(app.includes("probe_remote"), false);
+  assert.equal(app.includes("trust_host_fingerprint"), false);
+  assert.equal(app.includes("trustHostFingerprint"), false);
   for (const needle of ["10.0.8.15", "172.16.2.40", "gateway-1.8", "/opt/gateway", "id_ed25519", "HeTianXia"]) {
     assert.equal(sources.includes(needle), false, needle);
   }

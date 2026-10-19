@@ -67,8 +67,14 @@ pub fn get(conn: &Connection, id: &str) -> Result<SavedConnection> {
 pub fn save(conn: &Connection, input: &SavedConnection) -> Result<SavedConnection> {
     ensure_schema(conn)?;
     let mut saved = input.clone();
+    // 前端带上来的指纹一律丢掉。只有测试连接确认过的指纹能写进来。
+    saved.fingerprint.clear();
     if saved.id.is_empty() {
         saved.id = uuid::Uuid::new_v4().simple().to_string();
+    } else if let Ok(previous) = get(conn, &saved.id) {
+        if previous.host == saved.host && previous.port == saved.port && previous.user == saved.user {
+            saved.fingerprint = previous.fingerprint;
+        }
     }
     validate(&saved)?;
     conn.execute(
@@ -119,7 +125,7 @@ fn validate(input: &SavedConnection) -> Result<()> {
     if input.port == 0 {
         return Err(Error::new(ErrorCode::InvalidLocation, "端口不合法"));
     }
-    if input.auth != "password" && input.auth != "key" && input.auth != "agent" {
+    if input.auth != "password" && input.auth != "key" {
         return Err(Error::new(ErrorCode::InvalidLocation, "认证方式不合法"));
     }
     Ok(())
@@ -165,6 +171,74 @@ mod tests {
         set_fingerprint(&db, &saved.id, "SHA256:next").unwrap();
         assert_eq!(get(&db, &saved.id).unwrap().fingerprint, "SHA256:next");
         delete(&db, &saved.id).unwrap();
+        assert!(list(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn save_ignores_a_frontend_fingerprint_and_clears_it_when_the_endpoint_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = exec::open_db(&dir.path().join("hetianxia.sqlite")).unwrap();
+        let saved = save(
+            &db,
+            &SavedConnection {
+                id: String::new(),
+                name: "build".into(),
+                host: "db.example".into(),
+                port: 22,
+                user: "deploy".into(),
+                auth: "key".into(),
+                key_path: String::new(),
+                fingerprint: "SHA256:from-the-form".into(),
+            },
+        )
+        .unwrap();
+        assert!(saved.fingerprint.is_empty());
+        set_fingerprint(&db, &saved.id, "SHA256:confirmed").unwrap();
+        let kept = save(
+            &db,
+            &SavedConnection {
+                fingerprint: "SHA256:replaced-by-form".into(),
+                ..get(&db, &saved.id).unwrap()
+            },
+        )
+        .unwrap();
+        assert_eq!(kept.fingerprint, "SHA256:confirmed");
+        for (host, port, user) in [("other.example", 22u16, "deploy"), ("db.example", 2222, "deploy"), ("db.example", 22, "root")] {
+            set_fingerprint(&db, &saved.id, "SHA256:confirmed").unwrap();
+            let cleared = save(
+                &db,
+                &SavedConnection {
+                    host: host.into(),
+                    port,
+                    user: user.into(),
+                    fingerprint: "SHA256:still-from-form".into(),
+                    ..get(&db, &saved.id).unwrap()
+                },
+            )
+            .unwrap();
+            assert!(cleared.fingerprint.is_empty(), "{host}:{port} {user}");
+        }
+    }
+
+    #[test]
+    fn agent_auth_cannot_be_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = exec::open_db(&dir.path().join("hetianxia.sqlite")).unwrap();
+        let err = save(
+            &db,
+            &SavedConnection {
+                id: String::new(),
+                name: "build".into(),
+                host: "db.example".into(),
+                port: 22,
+                user: "deploy".into(),
+                auth: "agent".into(),
+                key_path: String::new(),
+                fingerprint: String::new(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.message, "认证方式不合法");
         assert!(list(&db).unwrap().is_empty());
     }
 }

@@ -148,7 +148,12 @@ export function App() {
             <button className={page === "preview" ? "on" : ""} onClick={() => setPage("preview")}>预演</button>
             <button className={page === "history" ? "on" : ""} onClick={() => setPage("history")}>历史</button>
           </nav>
-          {page === "ssh" && <button className="ghost import">从 ~/.ssh/config 导入</button>}
+          {page === "ssh" && (
+            <>
+              <button className="ghost import" type="button" disabled>从 ~/.ssh/config 导入</button>
+              <span className="soon">下一版支持</span>
+            </>
+          )}
         </header>
         {status && !sheet && <p className={status.includes("E_") ? "status err" : "status"} role="status">{status}</p>}
         {page === "edit" && <DiffEditor onWriteFailed={() => setSheet("failure")} />}
@@ -332,7 +337,10 @@ function SshPage({
   async function save() {
     try {
       const saved = await saveConnection(draft);
-      if (secretDraft) {
+      if (saved.auth === "agent") {
+        await deleteSshSecret(saved.id);
+        setSecretDraft("");
+      } else if (secretDraft) {
         await saveSshSecret(saved.id, secretDraft);
         setSecretDraft("");
       }
@@ -425,12 +433,13 @@ function SshPage({
         <div className="auth">认证方式
           <span className={draft.auth === "password" ? "on" : ""} onClick={() => setDraft({ ...draft, auth: "password" })}>密码</span>
           <span className={draft.auth === "key" ? "on" : ""} onClick={() => setDraft({ ...draft, auth: "key" })}>私钥文件</span>
-          <span className={draft.auth === "agent" ? "on" : ""} onClick={() => setDraft({ ...draft, auth: "agent" })}>ssh-agent</span>
+          <span className="off">ssh-agent</span>
+          <span className="soon">下一版支持</span>
         </div>
         <label>私钥文件<input value={draft.keyPath} onChange={(event) => setDraft({ ...draft, keyPath: event.target.value })} disabled={draft.auth !== "key"} /></label>
-        <label>私钥口令或密码<input type="password" value={secretDraft} autoComplete="new-password" placeholder={secretSaved ? "已存入钥匙串，留空则不改" : "只写入钥匙串"} onChange={(event) => setSecretDraft(event.target.value)} /></label>
-        <div className="savekey"><span className={secretSaved ? "ok" : ""}>{secretSaved ? "已存入钥匙串" : "还没存入口令"}</span></div>
-        <p className="keyhint">钥匙串服务名 com.hetianxia.app.ssh，账号是连接 id。口令不会再显示出来。</p>
+        <label>私钥口令或密码<input type="password" value={draft.auth === "agent" ? "" : secretDraft} autoComplete="new-password" disabled={draft.auth === "agent"} placeholder={draft.auth === "agent" ? "ssh-agent 不保存口令" : secretSaved ? "已存入钥匙串，留空则不改" : "只写入钥匙串"} onChange={(event) => setSecretDraft(event.target.value)} /></label>
+        <div className="savekey"><span className={draft.auth !== "agent" && secretSaved ? "ok" : ""}>{draft.auth === "agent" ? "ssh-agent 不保存口令" : secretSaved ? "已存入钥匙串" : "还没存入口令"}</span></div>
+        <p className="keyhint">口令只存在本机钥匙串，不会再显示出来</p>
         <h2>连接测试</h2>
         <ul className="checks">
           <li><span>身份认证</span><em>{probe ? (probe.authOk ? "通过" : "未完成") : "尚未测试"}</em></li>

@@ -43,8 +43,21 @@ export type SavedConnection = {
   fingerprint: string;
 };
 
+export type ImportedHost = {
+  alias: string;
+  hostName: string;
+  user: string | null;
+  port: number;
+  proxyJump: string | null;
+  identityFile: string;
+};
+
 export function listConnections() {
   return invoke<SavedConnection[]>("list_connections");
+}
+
+export function readSshConfig() {
+  return invoke<ImportedHost[]>("read_ssh_config");
 }
 
 export function saveConnection(conn: SavedConnection) {

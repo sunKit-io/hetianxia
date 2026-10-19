@@ -41,7 +41,7 @@ pub struct ProbeRequest {
     pub user: String,
     #[serde(default)]
     pub proxy_jump: Option<String>,
-    /// `password` 或 `key`。
+    /// `password`、`key` 或 `agent`。
     pub auth: String,
     #[serde(default)]
     pub secret: String,
@@ -56,6 +56,9 @@ pub struct ProbeRequest {
     /// 用户在探测之后确认的指纹。`accept_new` 重连时必须带上，并且要和服务器出示的一致。
     #[serde(default)]
     pub confirmed_fingerprint: Option<String>,
+    /// 提交写入时带上许可证里的指纹。有值就只做严格比较，不再询问信任。
+    #[serde(default)]
+    pub strict_fingerprint: Option<String>,
 }
 
 pub fn remote_backup_dir(home: &str, exec_id: &str) -> Result<String> {
@@ -155,6 +158,7 @@ enum SessFail {
     Ssh(russh::Error),
     Changed(String),
     Confirm(String),
+    PermitMismatch,
 }
 
 impl From<russh::Error> for SessFail {
@@ -174,6 +178,7 @@ struct KeyHandler {
     file_fps: Vec<String>,
     accept_new: bool,
     confirmed: Option<String>,
+    strict_fingerprint: Option<String>,
     seen: Arc<Mutex<Option<Observed>>>,
 }
 
@@ -182,6 +187,18 @@ impl Handler for KeyHandler {
 
     async fn check_server_key(&mut self, server_public_key: &russh::keys::PublicKey) -> std::result::Result<bool, Self::Error> {
         let fingerprint = format!("{}", server_public_key.fingerprint(russh::keys::HashAlg::Sha256));
+        if let Some(permit) = &self.strict_fingerprint {
+            if crate::remote::strict_permit_fingerprint(permit, &fingerprint).is_err() {
+                return Err(SessFail::PermitMismatch);
+            }
+            if let Ok(mut slot) = self.seen.lock() {
+                *slot = Some(Observed {
+                    fingerprint,
+                    status: HostKeyStatus::Match,
+                });
+            }
+            return Ok(true);
+        }
         let decision = classify_presented_key(
             self.saved.as_deref(),
             self.cleared,
@@ -266,6 +283,7 @@ impl RemoteSession {
             file_fps,
             accept_new: req.accept_new,
             confirmed: req.confirmed_fingerprint.clone(),
+            strict_fingerprint: req.strict_fingerprint.clone(),
             seen: seen.clone(),
         };
         let config = Arc::new(russh::client::Config {
@@ -283,6 +301,9 @@ impl RemoteSession {
                 ErrorCode::HostkeyChanged,
                 format!("主机指纹变了，需要清除指纹后重新确认：{fp}"),
             ),
+            SessFail::PermitMismatch => {
+                Error::new(ErrorCode::HostkeyChanged, crate::remote::COMMIT_FINGERPRINT_MISMATCH)
+            }
             SessFail::Confirm(fp) => Error::new(ErrorCode::HostkeyChanged, format!("需要确认主机指纹：{fp}")),
             SessFail::Ssh(err) => {
                 let _ = err;
@@ -482,6 +503,7 @@ impl RemoteSession {
             req.secret.zeroize();
             return Err(Error::new(ErrorCode::InvalidState, "写入确认和主机或路径不一致"));
         }
+        lock_commit_fingerprint(req, &granted.connection.fingerprint);
         let write = crate::remote_write::request_from_grant(exec_id, &app_data_dir, true, 0, granted)?;
         let result = block_on(async {
             let connected = RemoteSession::connect(req).await;
@@ -574,7 +596,17 @@ fn ssh_string(value: &str) -> Vec<u8> {
     out
 }
 
+/// 提交只比对许可证里的指纹，并关掉探测用的信任确认。
+fn lock_commit_fingerprint(req: &mut ProbeRequest, permit_fp: &str) {
+    req.strict_fingerprint = Some(permit_fp.to_string());
+    req.accept_new = false;
+    req.confirmed_fingerprint = None;
+}
+
 async fn authenticate(handle: &mut russh::client::Handle<KeyHandler>, req: &ProbeRequest) -> Result<()> {
+    if req.auth == "agent" {
+        return Err(Error::new(ErrorCode::Unsupported, "ssh-agent 这一版还不能用来连接"));
+    }
     let result = if req.auth == "key" {
         let path = req.key_path.as_deref().filter(|p| !p.is_empty()).ok_or_else(|| {
             Error::new(ErrorCode::Auth, "没有私钥路径")
@@ -732,6 +764,7 @@ mod tests {
             db_path: std::env::temp_dir().join("hetianxia-probe-unused.sqlite").display().to_string(),
             accept_new: false,
             confirmed_fingerprint: None,
+            strict_fingerprint: None,
         };
         let err = probe_connection(&mut req).unwrap_err();
         assert_eq!(err.code_str(), "E_UNSUPPORTED");
@@ -748,5 +781,31 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("pw-do-not-leak-9f3a"));
         assert_eq!(remote::remote_write_unsupported().code_str(), "E_INVALID_STATE");
+    }
+
+    #[test]
+    fn commit_locks_the_permit_fingerprint_and_drops_the_trust_prompt() {
+        let mut req = ProbeRequest {
+            host: "web.example".into(),
+            port: 22,
+            user: "deploy".into(),
+            proxy_jump: None,
+            auth: "key".into(),
+            secret: String::new(),
+            account: None,
+            key_path: None,
+            known_hosts_path: String::new(),
+            db_path: String::new(),
+            accept_new: true,
+            confirmed_fingerprint: Some("SHA256:clicked-later".into()),
+            strict_fingerprint: None,
+        };
+        lock_commit_fingerprint(&mut req, "SHA256:permit");
+        assert_eq!(req.strict_fingerprint.as_deref(), Some("SHA256:permit"));
+        assert!(!req.accept_new);
+        assert!(req.confirmed_fingerprint.is_none());
+        let err = crate::remote::strict_permit_fingerprint("SHA256:permit", "SHA256:server").unwrap_err();
+        assert_eq!(err.message, "服务器指纹已变化");
+        assert!(!err.message.contains("需要确认"));
     }
 }

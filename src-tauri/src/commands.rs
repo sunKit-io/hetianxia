@@ -203,7 +203,8 @@ pub fn startup_offers(session: tauri::State<crate::Session>) -> Vec<hetianxia_co
 
 #[tauri::command]
 pub fn connections(ssh_config: String) -> Result<Vec<ImportedHost>, Error> {
-    Ok(remote::parse_ssh_config(&ssh_config))
+    let home = std::env::var_os("HOME").filter(|value| !value.is_empty()).map(PathBuf::from);
+    Ok(remote::parse_ssh_config_with_home(&ssh_config, home.as_deref()))
 }
 
 #[tauri::command]
@@ -253,6 +254,7 @@ pub fn clear_host_fingerprint(db_path: String, host: String, port: u16) -> Resul
 }
 
 #[tauri::command]
+#[allow(dead_code)]
 pub fn trust_host_fingerprint(db_path: String, host: String, port: u16, fingerprint: String) -> Result<(), Error> {
     let db = exec::open_db(Path::new(&db_path))?;
     let now = std::time::SystemTime::now()
@@ -300,7 +302,11 @@ pub fn list_connections(session: tauri::State<crate::Session>) -> Result<Vec<Sav
 pub fn save_connection(session: tauri::State<crate::Session>, conn: SavedConnection) -> Result<SavedConnection, Error> {
     ready_db(&session)?;
     let db = exec::open_db(&session.db_path)?;
-    connections::save(&db, &conn)
+    let saved = connections::save(&db, &conn)?;
+    if saved.auth == "agent" {
+        let _ = KeyringStore.delete(&saved.id);
+    }
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -373,12 +379,35 @@ fn probe_for_saved(
         db_path: session.db_path.display().to_string(),
         accept_new,
         confirmed_fingerprint,
+        strict_fingerprint: None,
     };
     probe.secret.clear();
-    if let Some(secret) = KeyringStore.get(&saved.id)? {
-        probe.secret = secret;
+    if saved.auth != "agent" {
+        if let Some(secret) = KeyringStore.get(&saved.id)? {
+            probe.secret = secret;
+        }
     }
     Ok(probe)
+}
+
+const SSH_CONFIG_EMPTY: &str = "没有在 ~/.ssh/config 里找到可导入的主机";
+
+#[tauri::command]
+pub fn read_ssh_config() -> Result<Vec<ImportedHost>, Error> {
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| Error::new(ErrorCode::NotFound, SSH_CONFIG_EMPTY))?;
+    let path = home.join(".ssh").join("config");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(_) => return Err(Error::new(ErrorCode::NotFound, SSH_CONFIG_EMPTY)),
+    };
+    let hosts = connections(text)?;
+    if hosts.is_empty() {
+        return Err(Error::new(ErrorCode::NotFound, SSH_CONFIG_EMPTY));
+    }
+    Ok(hosts)
 }
 
 #[tauri::command]
@@ -449,11 +478,14 @@ pub fn commit_remote_overwrite(
         db_path: session.db_path.display().to_string(),
         accept_new: !stored.fingerprint.is_empty(),
         confirmed_fingerprint: if stored.fingerprint.is_empty() { None } else { Some(stored.fingerprint) },
+        strict_fingerprint: None,
     };
     probe.secret.clear();
-    if let Some(account) = probe.account.clone() {
-        if let Some(secret) = KeyringStore.get(&account)? {
-            probe.secret = secret;
+    if probe.auth != "agent" {
+        if let Some(account) = probe.account.clone() {
+            if let Some(secret) = KeyringStore.get(&account)? {
+                probe.secret = secret;
+            }
         }
     }
     let remote_path = stored.remote_path.clone();
@@ -466,14 +498,3 @@ pub fn commit_remote_overwrite(
     })
 }
 
-#[tauri::command]
-pub fn probe_remote(mut req: ProbeRequest) -> Result<ProbeReport, Error> {
-    // 界面带上来的口令一律丢掉。连接时只从钥匙串按连接 id 读取。
-    req.secret.clear();
-    if let Some(account) = req.account.clone() {
-        if let Some(secret) = KeyringStore.get(&account)? {
-            req.secret = secret;
-        }
-    }
-    sftp::probe_connection(&mut req)
-}

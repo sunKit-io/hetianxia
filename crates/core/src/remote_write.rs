@@ -204,6 +204,9 @@ fn grant_from(input: &WritePromptInput<'_>, now: i64) -> Result<Grant> {
     if input.host.is_empty() || input.user.is_empty() || input.auth.is_empty() {
         return Err(Error::new(ErrorCode::InvalidLocation, "远程主机、用户或认证方式为空"));
     }
+    if input.fingerprint.trim().is_empty() {
+        return Err(Error::new(ErrorCode::InvalidState, "请先测试连接并确认指纹"));
+    }
     split_remote(input.remote_path)?;
     let content_sha256 = sha256_hex(input.content);
     if let Some(given) = input.content_sha256 {
@@ -822,5 +825,33 @@ mod tests {
         let bak = mem.paths().into_iter().find(|path| path.contains("bak-")).expect("原文件还在 .htx-bak");
         assert_eq!(mem.files.get(&bak).map(Vec::as_slice), Some(b"old-bytes".as_slice()));
         assert!(mem.paths().iter().any(|path| path.contains(TEMP_TAG) && !path.contains("bak-")));
+    }
+
+    #[test]
+    fn empty_fingerprint_refuses_a_permit() {
+        let home = tempfile::tempdir().unwrap();
+        let mut input = sample("build-01", "deploy", "/opt/app.conf", b"new-bytes");
+        input.fingerprint = "";
+        let err = issue_prompt_for(home.path(), "tx-empty-fp", &input, now_ms()).unwrap_err();
+        assert_eq!(err.message, "请先测试连接并确认指纹");
+        assert!(borrow_granted_connection("tx-empty-fp", now_ms()).is_err());
+        input.fingerprint = "   ";
+        assert!(issue_prompt_for(home.path(), "tx-blank-fp", &input, now_ms()).is_err());
+        assert!(borrow_granted_connection("tx-blank-fp", now_ms()).is_err());
+    }
+
+    #[test]
+    fn mismatched_permit_fingerprint_rejects_and_voids_without_a_trust_prompt() {
+        let home = tempfile::tempdir().unwrap();
+        let exec_id = "tx-fp-mismatch";
+        issue_prompt_for(home.path(), exec_id, &sample("build-01", "deploy", "/opt/app.conf", b"new-bytes"), now_ms()).unwrap();
+        let granted = take_granted_write(exec_id, now_ms()).unwrap();
+        let err = crate::remote::strict_permit_fingerprint(&granted.connection.fingerprint, "SHA256:other").unwrap_err();
+        assert_eq!(err.message, "服务器指纹已变化");
+        assert!(!err.message.contains("需要确认"));
+        assert_eq!(granted.connection.fingerprint, "SHA256:stored");
+        void_granted_write(exec_id).unwrap();
+        assert!(borrow_granted_connection(exec_id, now_ms()).is_err());
+        assert!(take_granted_write(exec_id, now_ms()).is_err());
     }
 }
