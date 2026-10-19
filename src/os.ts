@@ -35,7 +35,7 @@ export function connectionSubtitle(os: RemoteOs): string {
 }
 
 export function systemTypeLabel(os: RemoteOs): string {
-  if (os.kind === "unidentified") return "未识别";
+  if (os.kind === "unidentified") return "未识别（os-release 和 SystemVersion.plist 都读不到）";
   if (os.kind === "macos") return "macOS";
   if (os.verified) return pretty(os.id);
   return `未验证的系统（Linux / ${os.id || "unknown"}）`;
