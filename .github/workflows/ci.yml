@@ -38,7 +38,7 @@ jobs:
           command: check
           arguments: --all-features --locked
       - name: banner copy
-        run: node --experimental-strip-types --test src/os.test.ts
+        run: node --experimental-strip-types --test src/os.test.ts src/resumeCopy.test.ts src/syncScroll.test.ts
       - name: javascript licenses
         run: |
           pnpm install --frozen-lockfile

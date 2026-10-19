@@ -1,8 +1,11 @@
 import { useMemo, useState } from "react";
 import { Server, ShieldAlert, KeyRound, AlertTriangle } from "lucide-react";
+import { DiffEditor } from "./editor";
 import { ALPINE, UNKNOWN, UBUNTU, canContinue, connectionSubtitle, systemTypeLabel, warningBanner, type RemoteOs } from "./os";
+import { DETAIL_DELETED, DETAIL_MODIFIED, resumeConflictTitle, type ResumeFile } from "./resumeCopy";
 
-type Page = "ssh" | "preview" | "history";
+type Page = "edit" | "ssh" | "preview" | "history";
+type Sheet = null | "rollback" | "log" | "failure" | "startup" | "external";
 
 type Host = {
   id: string;
@@ -71,19 +74,26 @@ const HOSTS: Host[] = [
 ];
 
 const HISTORY = [
+  { time: "10月18日 16:02", where: "~/work/order-center ← release-3.1.0.zip", change: "覆盖 4 · 已写 2", result: "部分失败", rollback: true, partial: true },
   { time: "10月12日 14:20", where: "~/work/order-center ← release-3.0.0.zip", change: "新增 6 · 覆盖 13 · 移动 1", result: "成功", rollback: true },
   { time: "9月28日 09:41", where: "~/work/order-center ← release-2.3.1.zip", change: "新增 2 · 覆盖 8", result: "成功", rollback: true },
   { time: "9月03日 18:05", where: "prod-gw-01:/opt/gateway ← gateway-1.8", change: "覆盖 21 · 删除 3", result: "已回滚", rollback: false, cleaned: false },
   { time: "8月11日 10:12", where: "~/work/order-center ← release-2.2.0.zip", change: "新增 4 · 覆盖 17", result: "成功", rollback: false, cleaned: true },
 ];
 
+const EXTERNAL_FILES: ResumeFile[] = [
+  { path: "src/routes.js", detail: DETAIL_MODIFIED },
+  { path: "public/old-banner.png", detail: DETAIL_DELETED },
+];
+
 export function App() {
-  const [page, setPage] = useState<Page>("ssh");
+  const [page, setPage] = useState<Page>("edit");
   const [hostId, setHostId] = useState("build-01");
   const [allowReadonly, setAllowReadonly] = useState(false);
-  const [sheet, setSheet] = useState<null | "rollback" | "log">(null);
+  const [sheet, setSheet] = useState<Sheet>("startup");
   const [cleared, setCleared] = useState<Record<string, boolean>>({});
   const host = HOSTS.find((h) => h.id === hostId) ?? HOSTS[0];
+  const externalTitle = resumeConflictTitle(EXTERNAL_FILES);
 
   return (
     <div className="desktop">
@@ -93,16 +103,18 @@ export function App() {
             <i /><i /><i />
           </span>
           <div className="titleblock">
-            <strong>{page === "ssh" ? "SSH 连接" : page === "history" ? "历史记录" : "OrderCenter"}</strong>
-            <span>{page === "ssh" ? `${HOSTS.length} 个连接` : page === "history" ? "OrderCenter · 保留最近 10 次 · 超过 30 天自动清理" : "本机 ~/work/order-center ← release-3.0.0.zip"}</span>
+            <strong>{page === "ssh" ? "SSH 连接" : page === "history" ? "历史记录" : page === "edit" ? "OrderCenter" : "OrderCenter"}</strong>
+            <span>{page === "ssh" ? `${HOSTS.length} 个连接` : page === "history" ? "OrderCenter · 保留最近 10 次 · 超过 30 天自动清理" : page === "edit" ? "src/config/app.config.js · 左右对照" : "本机 ~/work/order-center ← release-3.0.0.zip"}</span>
           </div>
           <nav className="pages">
+            <button className={page === "edit" ? "on" : ""} onClick={() => setPage("edit")}>编辑</button>
             <button className={page === "ssh" ? "on" : ""} onClick={() => setPage("ssh")}>连接</button>
             <button className={page === "preview" ? "on" : ""} onClick={() => setPage("preview")}>预演</button>
             <button className={page === "history" ? "on" : ""} onClick={() => setPage("history")}>历史</button>
           </nav>
           {page === "ssh" && <button className="ghost import">从 ~/.ssh/config 导入</button>}
         </header>
+        {page === "edit" && <DiffEditor onWriteFailed={() => setSheet("failure")} />}
         {page === "ssh" && (
           <SshPage
             host={host}
@@ -114,9 +126,22 @@ export function App() {
         {page === "preview" && (
           <PreviewPage allowReadonly={allowReadonly} setAllowReadonly={setAllowReadonly} onLog={() => setSheet("log")} />
         )}
-        {page === "history" && <HistoryPage onRollback={() => setSheet("rollback")} />}
+        {page === "history" && (
+          <HistoryPage onRollback={() => setSheet("rollback")} onContinue={() => setSheet("external")} />
+        )}
         {sheet === "rollback" && <RollbackSheet onClose={() => setSheet(null)} />}
         {sheet === "log" && <LogSheet onClose={() => setSheet(null)} />}
+        {sheet === "failure" && <WriteFailureSheet onLater={() => setSheet(null)} onRollback={() => setSheet("rollback")} />}
+        {sheet === "startup" && (
+          <StartupSheet
+            onLater={() => setSheet(null)}
+            onRollback={() => setSheet("rollback")}
+            onContinue={() => setSheet("external")}
+          />
+        )}
+        {sheet === "external" && (
+          <ExternalSheet title={externalTitle} files={EXTERNAL_FILES} onClose={() => setSheet(null)} />
+        )}
       </div>
     </div>
   );
@@ -235,7 +260,7 @@ function PreviewPage({ allowReadonly, setAllowReadonly, onLog }: { allowReadonly
   );
 }
 
-function HistoryPage({ onRollback }: { onRollback: () => void }) {
+function HistoryPage({ onRollback, onContinue }: { onRollback: () => void; onContinue: () => void }) {
   return (
     <div className="history">
       <table>
@@ -246,10 +271,15 @@ function HistoryPage({ onRollback }: { onRollback: () => void }) {
               <td>{row.time}</td>
               <td>{row.where}</td>
               <td>{row.change}</td>
-              <td className={row.result === "已回滚" ? "rolled" : "ok"}>{row.result}</td>
+              <td className={row.result === "已回滚" ? "rolled" : row.result === "部分失败" ? "partial" : "ok"}>{row.result}</td>
               <td>
                 {row.where.includes(":/") ? (
                   <button disabled title="远程写入还没支持">回滚…</button>
+                ) : row.partial ? (
+                  <>
+                    <button onClick={onRollback}>回滚…</button>
+                    <button onClick={onContinue}>继续</button>
+                  </>
                 ) : row.cleaned ? (
                   <button disabled>备份已清理</button>
                 ) : row.rollback ? (
@@ -279,6 +309,66 @@ function RollbackSheet({ onClose }: { onClose: () => void }) {
         </ul>
         <label className={choice === "proceed" ? "choice on" : "choice"}><input type="radio" checked={choice === "proceed"} onChange={() => setChoice("proceed")} /> 继续回滚（先备份当前版本）<small>先把这 2 个文件的当前版本备份，再覆盖回升级前的样子</small></label>
         <label className={choice === "skip" ? "choice on" : "choice"}><input type="radio" checked={choice === "skip"} onChange={() => setChoice("skip")} /> 跳过冲突的文件<small>其余文件照常回滚，这 2 个保持现状</small></label>
+        <footer>
+          <button className="ghost" onClick={onClose}>取消</button>
+          <button className="primary" onClick={onClose}>继续</button>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function WriteFailureSheet({ onLater, onRollback }: { onLater: () => void; onRollback: () => void }) {
+  return (
+    <div className="mask" data-screen="18">
+      <div className="sheet small" onClick={(e) => e.stopPropagation()}>
+        <h1><AlertTriangle size={18} /> 升级已停止：有文件写入失败</h1>
+        <p>写入中途失败，后面的文件没有动。不会自动重试，也没有「继续」。</p>
+        <p className="err">E_IO · 写入失败</p>
+        <footer>
+          <button className="ghost" onClick={onLater}>稍后处理</button>
+          <button className="primary" onClick={onRollback}>回滚</button>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function StartupSheet({ onLater, onRollback, onContinue }: { onLater: () => void; onRollback: () => void; onContinue: () => void }) {
+  return (
+    <div className="mask" data-screen="20">
+      <div className="sheet small" onClick={(e) => e.stopPropagation()}>
+        <h1><AlertTriangle size={18} /> 有一次升级没有完成</h1>
+        <p>上次升级停在写入中途。可以继续、回滚，或先放着。</p>
+        <footer>
+          <button className="ghost" onClick={onLater}>稍后处理</button>
+          <button className="ghost" onClick={onRollback}>回滚</button>
+          <button className="primary" onClick={onContinue}>继续</button>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function ExternalSheet({ title, files, onClose }: { title: string; files: ResumeFile[]; onClose: () => void }) {
+  const [choice, setChoice] = useState("keep");
+  return (
+    <div className="mask" data-screen="21">
+      <div className="sheet small" onClick={(e) => e.stopPropagation()}>
+        <h1><AlertTriangle size={18} /> {title}</h1>
+        <p className="sub">继续之前先确认怎么处理这些文件</p>
+        <ul className="changes">
+          {files.map((file) => (
+            <li key={file.path}>{file.path} <em>{file.detail}</em></li>
+          ))}
+        </ul>
+        <label className={choice === "keep" ? "choice on" : "choice"}>
+          <input type="radio" name="external" checked={choice === "keep"} onChange={() => setChoice("keep")} /> 保留外部修改并继续
+        </label>
+        <label className={choice === "rollback" ? "choice on" : "choice"}>
+          <input type="radio" name="external" checked={choice === "rollback"} onChange={() => setChoice("rollback")} /> 回滚
+        </label>
+        <p className="keyhint">取消不会改任何东西，下次打开还会再问。</p>
         <footer>
           <button className="ghost" onClick={onClose}>取消</button>
           <button className="primary" onClick={onClose}>继续</button>
