@@ -216,11 +216,6 @@ pub fn open_db(path: &Path) -> Result<Connection> {
     ensure_column(&conn, "exec_ops", "written", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(&conn, "exec_ops", "kept_hash", "TEXT")?;
     ensure_column(&conn, "exec_journal", "pre_recovery_state", "TEXT")?;
-    ensure_column(&conn, "exec_journal", "created_at", "INTEGER")?;
-    conn.execute(
-        "UPDATE exec_journal SET created_at = COALESCE(started_at, 0) WHERE created_at IS NULL",
-        [],
-    )?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS exec_temps (
             exec_id TEXT NOT NULL,
@@ -777,7 +772,7 @@ pub fn recover_on_startup(db: &Connection, fsys: &LocalFs) -> Result<Vec<Recover
     #[cfg(not(feature = "fault-inject"))]
     let probe_plan = FaultPlan::default();
     let mut stmt = db.prepare(
-        "SELECT exec_id, state, plan_json, backup_root FROM exec_journal ORDER BY created_at, exec_id",
+        "SELECT exec_id, state, plan_json, backup_root FROM exec_journal ORDER BY started_at, exec_id",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok((
@@ -863,8 +858,8 @@ pub fn execute(db: &Connection, fsys: &LocalFs, plan: &ExecPlan, opts: &ExecOpts
     let started = now_ms();
     log_write(db, &mut fault, &plan.id, "prepared", || {
         db.execute(
-            "INSERT INTO exec_journal (exec_id, state, project_key, plan_json, backup_root, started_at, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![plan.id, "PREPARED", plan.project_key, serde_json::to_string(plan).unwrap_or_default(), backup.display().to_string(), started, started],
+            "INSERT INTO exec_journal (exec_id, state, project_key, plan_json, backup_root, started_at) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![plan.id, "PREPARED", plan.project_key, serde_json::to_string(plan).unwrap_or_default(), backup.display().to_string(), started],
         )?;
         for op in &plan.ops {
             db.execute(
@@ -3523,18 +3518,38 @@ mod tests {
     }
 
     #[cfg(feature = "fault-inject")]
-    fn seed_log_failed(db: &Connection, dir: &Path, file: &str, body: &[u8], created_at: i64) -> String {
+    fn seed_log_failed(db: &Connection, dir: &Path, file: &str, body: &[u8]) -> String {
         fs::write(dir.join(file), body).unwrap();
         let fsys = LocalFs::new(dir);
         let p = plan(vec![ov(1, file, body, b"NEW", None)]);
         let mut opts = opts_at(dir);
         opts.stop_after_log = Some("backed_up".into());
         execute(db, &fsys, &p, &opts, FaultPlan::default()).unwrap();
-        db.execute("UPDATE exec_journal SET state='LOG_FAILED', created_at=?2 WHERE exec_id=?1", params![p.id, created_at]).unwrap();
+        db.execute("UPDATE exec_journal SET state='LOG_FAILED' WHERE exec_id=?1", params![p.id]).unwrap();
         let temp = format!(".{file}.htx-probe");
         fs::write(dir.join(&temp), b"temp").unwrap();
         db.execute("INSERT INTO exec_temps (exec_id, path) VALUES (?1,?2)", params![p.id, temp]).unwrap();
         p.id
+    }
+
+    #[cfg(feature = "fault-inject")]
+    fn started_at(db: &Connection, id: &str) -> i64 {
+        db.query_row("SELECT started_at FROM exec_journal WHERE exec_id=?1", params![id], |r| r.get(0)).unwrap()
+    }
+
+    /// 先启动 A，再启动 B。两笔都停在 LOG_FAILED，试写才会发生。
+    #[cfg(feature = "fault-inject")]
+    fn two_log_failed(db: &Connection, dir: &Path) -> (String, String) {
+        let a = seed_log_failed(db, dir, "a.txt", b"old-a");
+        let a_at = started_at(db, &a);
+        while crate::vfs::now_ms() <= a_at {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let b = seed_log_failed(db, dir, "b.txt", b"old-b");
+        assert!(started_at(db, &a) < started_at(db, &b));
+        assert_eq!(journal_state(db, &a), "LOG_FAILED");
+        assert_eq!(journal_state(db, &b), "LOG_FAILED");
+        (a, b)
     }
 
     #[test]
@@ -3648,8 +3663,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = open_db(&dir.path().join("t.sqlite")).unwrap();
         let fsys = LocalFs::new(dir.path());
-        let a = seed_log_failed(&db, dir.path(), "a.txt", b"old-a", 1);
-        let b = seed_log_failed(&db, dir.path(), "b.txt", b"old-b", 2);
+        let (a, b) = two_log_failed(&db, dir.path());
         let _plan = crate::fault::override_plan(crate::fault::parse_spec("log:probe:1").unwrap());
         let offers = recover_on_startup(&db, &fsys).unwrap();
         assert_eq!(offers.len(), 2, "{offers:?}");
@@ -3669,8 +3683,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = open_db(&dir.path().join("t.sqlite")).unwrap();
         let fsys = LocalFs::new(dir.path());
-        let a = seed_log_failed(&db, dir.path(), "a.txt", b"old-a", 1);
-        let b = seed_log_failed(&db, dir.path(), "b.txt", b"old-b", 2);
+        let (a, b) = two_log_failed(&db, dir.path());
         let _plan = crate::fault::override_plan(crate::fault::parse_spec("log:probe:2").unwrap());
         let offers = recover_on_startup(&db, &fsys).unwrap();
         assert_eq!(offers[0].exec_id, a);
