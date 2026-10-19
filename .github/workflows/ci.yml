@@ -28,9 +28,15 @@ jobs:
         run: cargo test -p hetianxia-core --features fault-inject
       - name: release strings
         run: |
+<<<<<<< HEAD
           cargo build -p hetianxia-core --release --locked --bin hetianxia-linkcheck
           python3 scripts/scan_release_strings.py --forbid target/release
           cargo build -p hetianxia-core --release --locked --bin hetianxia-linkcheck --features fault-inject
+=======
+          cargo build -p hetianxia-core --release --locked
+          python3 scripts/scan_release_strings.py --forbid target/release
+          cargo build -p hetianxia-core --release --locked --features fault-inject
+>>>>>>> f71deca (ci: scan release builds for fault-injection strings)
           python3 scripts/scan_release_strings.py --require-sentinel target/release
       - name: cargo deny
         uses: EmbarkStudios/cargo-deny-action@v2
