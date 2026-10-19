@@ -1,5 +1,4 @@
 use hetianxia_core::error::{Error, ErrorCode};
-use serde::Deserialize;
 use tauri::Manager;
 use hetianxia_core::exec::{self, ExecOpts, ExecReport, HistoryRow, ResumeChoice, ResumeOutcome, RollbackChoice};
 use hetianxia_core::model::ExecPlan;
@@ -8,7 +7,8 @@ use hetianxia_core::pathutil::Ignore;
 use hetianxia_core::remote::{self, ImportedHost};
 use hetianxia_core::scan::{self, ScanOptions, ScanOutput};
 use hetianxia_core::secrets::{self, KeyringStore, SecretStatus, SecretStore};
-use hetianxia_core::remote_write::{self, RemoteWritePrompt};
+use hetianxia_core::connections::{self, SavedConnection};
+use hetianxia_core::remote_write::{self, RemoteWritePrompt, WritePromptInput};
 use hetianxia_core::sftp::{self, ProbeReport, ProbeRequest};
 use hetianxia_core::vfs::LocalFs;
 use std::path::{Path, PathBuf};
@@ -281,40 +281,139 @@ pub fn app_bak_dir(session: tauri::State<crate::Session>) -> Result<String, Erro
     Ok(session.backup_root.display().to_string())
 }
 
+fn ready_db(session: &crate::Session) -> Result<(), Error> {
+    ready(session)?;
+    if !session.db_path.is_absolute() {
+        return Err(Error::new(ErrorCode::InvalidState, "本机数据库还没准备好"));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn list_connections(session: tauri::State<crate::Session>) -> Result<Vec<SavedConnection>, Error> {
+    ready_db(&session)?;
+    let db = exec::open_db(&session.db_path)?;
+    connections::list(&db)
+}
+
+#[tauri::command]
+pub fn save_connection(session: tauri::State<crate::Session>, conn: SavedConnection) -> Result<SavedConnection, Error> {
+    ready_db(&session)?;
+    let db = exec::open_db(&session.db_path)?;
+    connections::save(&db, &conn)
+}
+
+#[tauri::command]
+pub fn delete_connection(session: tauri::State<crate::Session>, id: String) -> Result<(), Error> {
+    ready_db(&session)?;
+    let db = exec::open_db(&session.db_path)?;
+    connections::delete(&db, &id)?;
+    let _ = KeyringStore.delete(&id);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn clear_connection_fingerprint(session: tauri::State<crate::Session>, id: String) -> Result<(), Error> {
+    ready_db(&session)?;
+    let db = exec::open_db(&session.db_path)?;
+    let saved = connections::get(&db, &id)?;
+    remote::clear_fingerprint(&db, &saved.host, saved.port)?;
+    connections::set_fingerprint(&db, &id, "")
+}
+
+#[tauri::command]
+pub fn test_connection(
+    app: tauri::AppHandle,
+    session: tauri::State<crate::Session>,
+    id: String,
+    accept_new: bool,
+    confirmed_fingerprint: Option<String>,
+) -> Result<ProbeReport, Error> {
+    ready_db(&session)?;
+    let db = exec::open_db(&session.db_path)?;
+    let saved = connections::get(&db, &id)?;
+    if saved.auth == "agent" {
+        return Err(Error::new(ErrorCode::Unsupported, "ssh-agent 这一版还不能用来连接"));
+    }
+    let confirmed = confirmed_fingerprint.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(str::to_string);
+    if accept_new && confirmed.is_none() {
+        return Err(Error::new(ErrorCode::InvalidState, "确认新指纹时必须带上看到的指纹"));
+    }
+    let app_data = app.path().app_data_dir().map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
+    let mut probe = probe_for_saved(&saved, &app_data, &session, accept_new, confirmed)?;
+    let report = sftp::probe_connection(&mut probe)?;
+    if report.auth_ok && !report.fingerprint.is_empty() {
+        connections::set_fingerprint(&db, &saved.id, &report.fingerprint)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        remote::trust_host_key(&db, &saved.host, saved.port, &report.fingerprint, now)?;
+    }
+    Ok(report)
+}
+
+fn probe_for_saved(
+    saved: &SavedConnection,
+    app_data: &std::path::Path,
+    session: &crate::Session,
+    accept_new: bool,
+    confirmed_fingerprint: Option<String>,
+) -> Result<ProbeRequest, Error> {
+    let mut probe = ProbeRequest {
+        host: saved.host.clone(),
+        port: saved.port,
+        user: saved.user.clone(),
+        proxy_jump: None,
+        auth: saved.auth.clone(),
+        secret: String::new(),
+        account: Some(saved.id.clone()),
+        key_path: if saved.key_path.is_empty() { None } else { Some(saved.key_path.clone()) },
+        known_hosts_path: app_data.join("known_hosts").display().to_string(),
+        db_path: session.db_path.display().to_string(),
+        accept_new,
+        confirmed_fingerprint,
+    };
+    probe.secret.clear();
+    if let Some(secret) = KeyringStore.get(&saved.id)? {
+        probe.secret = secret;
+    }
+    Ok(probe)
+}
+
 #[tauri::command]
 pub fn remote_write_prompt(
     app: tauri::AppHandle,
     session: tauri::State<crate::Session>,
-    host: String,
-    port: u16,
+    connection_id: String,
     remote_path: String,
+    content: Vec<u8>,
+    content_sha256: Option<String>,
 ) -> Result<RemoteWritePrompt, Error> {
     ready(&session)?;
     let app_data = app.path().app_data_dir().map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
     if crate::app_backup_root(&app_data) != session.backup_root {
         return Err(Error::new(ErrorCode::InvalidState, "备份目录和本次运行不一致"));
     }
-    remote_write::issue_write_prompt(&app_data, &host, port, &remote_path)
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RemoteCommit {
-    pub exec_id: String,
-    pub host: String,
-    pub port: u16,
-    pub user: String,
-    pub remote_path: String,
-    pub bytes: Vec<u8>,
-    pub auth: String,
-    #[serde(default)]
-    pub account: Option<String>,
-    #[serde(default)]
-    pub key_path: Option<String>,
-    #[serde(default)]
-    pub accept_new: bool,
-    #[serde(default)]
-    pub confirmed_fingerprint: Option<String>,
+    let db = exec::open_db(&session.db_path)?;
+    let saved = connections::get(&db, &connection_id)?;
+    if saved.auth == "agent" {
+        return Err(Error::new(ErrorCode::Unsupported, "ssh-agent 这一版还不能用来连接"));
+    }
+    let key_path = if saved.key_path.is_empty() { None } else { Some(saved.key_path.clone()) };
+    let input = WritePromptInput {
+        host: &saved.host,
+        port: saved.port,
+        user: &saved.user,
+        auth: &saved.auth,
+        fingerprint: &saved.fingerprint,
+        remote_path: &remote_path,
+        content: &content,
+        content_sha256: content_sha256.as_deref(),
+        account: Some(saved.id.as_str()),
+        key_path: key_path.as_deref(),
+    };
+    remote_write::issue_write_prompt(&app_data, &input)
 }
 
 #[derive(serde::Serialize)]
@@ -329,26 +428,27 @@ pub struct RemoteWriteOutcome {
 pub fn commit_remote_overwrite(
     app: tauri::AppHandle,
     session: tauri::State<crate::Session>,
-    req: RemoteCommit,
+    exec_id: String,
 ) -> Result<RemoteWriteOutcome, Error> {
     ready(&session)?;
     let app_data = app.path().app_data_dir().map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
     if crate::app_backup_root(&app_data) != session.backup_root {
         return Err(Error::new(ErrorCode::InvalidState, "备份目录和本次运行不一致"));
     }
+    let stored = remote_write::borrow_granted_connection(&exec_id, remote_write::now_ms())?;
     let mut probe = ProbeRequest {
-        host: req.host.clone(),
-        port: req.port,
-        user: req.user,
+        host: stored.host.clone(),
+        port: stored.port,
+        user: stored.user.clone(),
         proxy_jump: None,
-        auth: req.auth,
+        auth: stored.auth.clone(),
         secret: String::new(),
-        account: req.account.clone(),
-        key_path: req.key_path,
+        account: stored.account.clone(),
+        key_path: stored.key_path.clone(),
         known_hosts_path: app_data.join("known_hosts").display().to_string(),
         db_path: session.db_path.display().to_string(),
-        accept_new: req.accept_new,
-        confirmed_fingerprint: req.confirmed_fingerprint,
+        accept_new: !stored.fingerprint.is_empty(),
+        confirmed_fingerprint: if stored.fingerprint.is_empty() { None } else { Some(stored.fingerprint) },
     };
     probe.secret.clear();
     if let Some(account) = probe.account.clone() {
@@ -356,21 +456,12 @@ pub fn commit_remote_overwrite(
             probe.secret = secret;
         }
     }
-    let write = remote_write::RemoteWriteRequest {
-        exec_id: req.exec_id.clone(),
-        host: req.host.clone(),
-        port: req.port,
-        remote_path: req.remote_path.clone(),
-        bytes: req.bytes,
-        app_data_dir: app_data,
-        posix_rename: true,
-        index: 0,
-    };
-    let committed = sftp::RemoteSession::commit_overwrite_blocking(&mut probe, write)?;
+    let remote_path = stored.remote_path.clone();
+    let committed = sftp::RemoteSession::commit_overwrite_blocking(&mut probe, &exec_id, app_data)?;
     let remote_write::CommitResult::Written(staged) = committed;
     Ok(RemoteWriteOutcome {
-        exec_id: req.exec_id,
-        remote_path: req.remote_path,
+        exec_id,
+        remote_path,
         backup_path: staged.backup_file.map(|path| path.display().to_string()),
     })
 }

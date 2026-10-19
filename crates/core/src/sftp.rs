@@ -443,7 +443,6 @@ impl RemoteSession {
         &mut self,
         req: crate::remote_write::RemoteWriteRequest,
     ) -> Result<crate::remote_write::CommitResult> {
-        crate::remote_write::authorize_commit(&req.exec_id, &req.host, req.port, &req.remote_path, crate::remote_write::now_ms())?;
         let dest = req.remote_path.clone();
         let original = if self.exists(&dest).await? { Some(self.read_file(&dest).await?) } else { None };
         let staged = crate::remote_write::stage_before_write(&req, original.as_deref())?;
@@ -469,14 +468,36 @@ impl RemoteSession {
     /// 给壳层用的同步入口。口令在返回前清掉。
     pub fn commit_overwrite_blocking(
         req: &mut ProbeRequest,
-        write: crate::remote_write::RemoteWriteRequest,
+        exec_id: &str,
+        app_data_dir: PathBuf,
     ) -> Result<crate::remote_write::CommitResult> {
+        let granted = match crate::remote_write::take_granted_write(exec_id, crate::remote_write::now_ms()) {
+            Ok(granted) => granted,
+            Err(err) => {
+                req.secret.zeroize();
+                return Err(err);
+            }
+        };
+        if !crate::remote_write::grant_binds(&granted.connection, &req.host, req.port, &req.user, &granted.connection.remote_path) {
+            req.secret.zeroize();
+            return Err(Error::new(ErrorCode::InvalidState, "写入确认和主机或路径不一致"));
+        }
+        let write = crate::remote_write::request_from_grant(exec_id, &app_data_dir, true, 0, granted)?;
         let result = block_on(async {
-            let mut session = RemoteSession::connect(req).await?;
+            let connected = RemoteSession::connect(req).await;
+            let mut session = match connected {
+                Ok(session) => session,
+                Err(err) => {
+                    return Err(err);
+                }
+            };
             let committed = session.commit_overwrite(write).await?;
             let _ = session.close().await;
             Ok(committed)
         });
+        if result.as_ref().is_err() {
+            let _ = crate::remote_write::void_granted_write(exec_id);
+        }
         req.secret.zeroize();
         result.and_then(|inner| inner)
     }

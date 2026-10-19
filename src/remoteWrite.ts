@@ -21,13 +21,21 @@ export type PendingRemoteWrite = {
   cancelLabel: string;
   proceedLabel: string;
   defaultButton: string;
-  host: string;
-  port: number;
-  user: string;
-  account: string;
-  keyPath: string;
-  remotePath: string;
 };
+
+/** 预演选中的计划文件。目标路径和要写入的新内容都来自这一份。 */
+export type RemotePlanFile = {
+  remotePath: string;
+  content: string;
+};
+
+/**
+ * TODO(architect): 接上预演选中的计划文件（remotePath + content）。
+ * 本分支还没有计划数据，所以这里返回 null，调用方不得改成演示内容。
+ */
+export function currentRemotePlan(): RemotePlanFile | null {
+  return null;
+}
 
 /** 只有「仍然写入」会调用 write。取消什么都不写。 */
 export function settleRemoteWrite(decision: string, write: () => void): "cancelled" | "wrote" {

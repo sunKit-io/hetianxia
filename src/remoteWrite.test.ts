@@ -33,7 +33,7 @@ function filesUnder(dir: string): string[] {
 test("the frontend has no baked home or product backup path", () => {
   const root = new URL(".", import.meta.url);
   const sources = filesUnder(root.pathname)
-    .filter((path) => !path.endsWith("remoteWrite.test.ts"))
+    .filter((path) => !path.endsWith(".test.ts"))
     .map((path) => readFileSync(path, "utf8"))
     .join("\n");
   const vite = readFileSync(new URL("../vite.config.ts", import.meta.url), "utf8");
@@ -44,7 +44,12 @@ test("the frontend has no baked home or product backup path", () => {
   assert.equal(sources.includes("__HETIANXIA_APP_DATA_DIR__"), false);
   assert.equal(vite.includes("process.env.HOME"), false);
   assert.match(app, /remoteWritePrompt\(/);
-  assert.match(app, /commitRemoteOverwrite\(/);
+  assert.match(app, /commitRemoteOverwrite\(pending\.execId\)/);
+  assert.match(app, /新建连接/);
+  assert.match(app, /testConnection\(/);
+  for (const needle of ["10.0.8.15", "172.16.2.40", "gateway-1.8", "/opt/gateway", "id_ed25519", "HeTianXia"]) {
+    assert.equal(sources.includes(needle), false, needle);
+  }
   assert.match(app, /appBakDir\(/);
   assert.match(app, /VERIFY_FAILED_TITLE/);
   assert.match(app, /VERIFY_FAILED_BUTTON/);
