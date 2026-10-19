@@ -53,7 +53,8 @@ def is_rlib(path: pathlib.Path) -> bool:
 def app_executables(root: pathlib.Path):
     found = []
     for macos in root.rglob("Contents/MacOS"):
-        if macos.parent.suffix != ".app":
+        # .../Name.app/Contents/MacOS — the .app is the grandparent, not Contents.
+        if macos.parent.parent.suffix != ".app":
             continue
         for child in macos.iterdir():
             if child.is_file() and not is_rlib(child):
