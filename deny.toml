@@ -25,6 +25,10 @@ ignore = [
     { id = "RUSTSEC-2025-0081", reason = "unic-char-property 经 urlpattern 0.3 进入 tauri 2.1.1，没有可升级版本。" },
     { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version 经 urlpattern 0.3 进入 tauri 2.1.1，没有可升级版本。" },
     { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident 经 urlpattern 0.3 进入 tauri 2.1.1，没有可升级版本。" },
+    # zbus 6 才把这三个箱子收回去，而 zbus 6 超出 Rust 1.83。公告写明没有安全升级路径。
+    { id = "RUSTSEC-2026-0370", reason = "zvariant 已并入 zbus 6。当前钉 zbus 4.3.1，以留在 Rust 1.83。" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names 已并入 zbus 6。当前钉 zbus 4.3.1，以留在 Rust 1.83。" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive 已并入 zbus 6。当前钉 zbus 4.3.1，以留在 Rust 1.83。" },
 ]
 
 [licenses]
