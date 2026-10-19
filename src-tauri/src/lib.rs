@@ -114,6 +114,7 @@ pub fn run() {
             commands::rollback_run,
             commands::resume_run,
             commands::history,
+            commands::journal_runs,
             commands::connections,
             commands::startup_offers,
             commands::startup_failure,
@@ -183,7 +184,7 @@ mod tests {
         assert_eq!(app_db_path(std::path::Path::new("/data")), std::path::PathBuf::from("/data/hetianxia.sqlite"));
         assert_eq!(app_backup_root(std::path::Path::new("/data")), std::path::PathBuf::from("/data/bak"));
         let commands = include_str!("commands.rs");
-        for name in ["execute", "rollback", "rollback_run", "resume_run", "history"] {
+        for name in ["execute", "rollback", "rollback_run", "resume_run", "history", "journal_runs"] {
             let header = command_header(commands, name);
             assert!(!header.contains("db_path"), "{name}: {header}");
             assert!(!header.contains("backup_root"), "{name}: {header}");
@@ -206,6 +207,7 @@ mod tests {
         assert!(!caps.contains("fs:"));
         assert!(!caps.contains("shell:"));
         assert!(caps.contains("allow-execute"));
+        assert!(caps.contains("allow-journal-runs"));
         assert!(caps.contains("core:default"));
     }
 
@@ -260,6 +262,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rolled.state, "ROLLED_BACK");
+        let runs = commands::journal_runs_in(&db).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].exec_id, "exec-1");
+        assert!(runs[0].project_root.is_none());
+        assert!(!runs[0].remote);
+        assert_eq!(runs[0].file_count, 1);
+        assert_eq!(runs[0].status, "ROLLED_BACK");
 
         let hosts = commands::connections("Host build-01\n  HostName 10.0.8.15\n  User deploy\n".into()).unwrap();
         assert_eq!(hosts[0].alias, "build-01");

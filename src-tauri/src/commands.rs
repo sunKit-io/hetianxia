@@ -148,6 +148,17 @@ pub fn history(session: tauri::State<crate::Session>) -> Result<Vec<HistoryRow>,
     history_in(&session.db_path)
 }
 
+pub fn journal_runs_in(db_path: &Path) -> Result<Vec<exec::JournalRun>, Error> {
+    let db = exec::open_db(db_path)?;
+    exec::list_journal_runs(&db)
+}
+
+#[tauri::command]
+pub fn journal_runs(session: tauri::State<crate::Session>) -> Result<Vec<exec::JournalRun>, Error> {
+    ready(&session)?;
+    journal_runs_in(&session.db_path)
+}
+
 #[tauri::command]
 pub fn startup_failure(session: tauri::State<crate::Session>) -> Option<String> {
     session.startup_error.clone()

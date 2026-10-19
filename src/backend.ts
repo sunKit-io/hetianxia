@@ -17,3 +17,18 @@ export function startupOffers() {
 export function startupFailure() {
   return invoke<string | null>("startup_failure");
 }
+
+export type JournalRun = {
+  execId: string;
+  projectRoot?: string | null;
+  startedAt: number;
+  status: string;
+  fileCount: number;
+  doneCount: number;
+  failedCount: number;
+  remote: boolean;
+};
+
+export function journalRuns() {
+  return invoke<JournalRun[]>("journal_runs");
+}
