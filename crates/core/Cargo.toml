@@ -45,6 +45,10 @@ proptest = "=1.5.0"
 tempfile = "=3.14.0"
 
 [[bin]]
+name = "hetianxia-linkcheck"
+path = "src/bin/linkcheck.rs"
+
+[[bin]]
 name = "fault-check"
 path = "src/bin/fault_check.rs"
 required-features = ["fault-inject"]

@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.83.0
+      - name: cargo test
+        run: cargo test -p hetianxia-core
+      - name: cargo test fault-inject
+        run: cargo test -p hetianxia-core --features fault-inject
+      - name: release strings
+        run: |
+          cargo build -p hetianxia-core --release --locked --bin hetianxia-linkcheck
+          python3 scripts/scan_release_strings.py --forbid target/release
+          cargo build -p hetianxia-core --release --locked --bin hetianxia-linkcheck --features fault-inject
+          python3 scripts/scan_release_strings.py --require-sentinel target/release

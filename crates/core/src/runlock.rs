@@ -6,10 +6,12 @@
 //!
 //! - 锁拿不到：已经有一个实例。这是单实例插件之后的第二道保险。这条路径不改文件内容。
 //! - 拿到锁，文件不存在、是空的，或状态是 `clean`：正常启动，不核对 `needs_verify`。
-//! - 拿到锁，状态是 `running`：上次进程不是干净退出，要先核对 `needs_verify`。
-//! - 两种都先写上 `running` 并 fsync。干净退出时写成 `clean`、fsync，再放开锁。
+//! - 拿到锁，状态是 `running`：上次进程不是干净退出。文件里的 `run` 是那次运行的
+//!   `run_id`，只核对打着这个 id 的 `needs_verify`。
+//! - 两种都先写上本次新的 `run_id` 和 `running` 并 fsync。干净退出时先清掉这次运行打上的
+//!   标记，再写成 `clean`、fsync，然后放开锁。
 //!
-//! pid 和进程启动时间只给诊断看。
+//! pid 和进程启动时间只给诊断看。`run` 用来把 `needs_verify` 对上一次具体的运行。
 
 use crate::error::{Error, ErrorCode, Result};
 use fs4::FileExt;
@@ -29,6 +31,8 @@ pub struct RunLock {
     file: File,
     abnormal: bool,
     released: bool,
+    run_id: String,
+    crashed_run: Option<String>,
 }
 
 impl RunLock {
@@ -37,10 +41,24 @@ impl RunLock {
         self.abnormal
     }
 
-    /// 干净退出：写成 `clean` 并 fsync，然后放开锁。不删除文件。
-    pub fn release_clean(mut self) -> Result<()> {
-        write_status(&self.file, STATUS_CLEAN)?;
-        self.file.unlock()?;
+    /// 这次进程的 `run_id`。新打上的 `needs_verify` 用它。
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    /// 上次异常退出留下的 `run_id`。文件里没有 `run` 时是 `None`，只核对未标记的行。
+    pub fn crashed_run(&self) -> Option<&str> {
+        self.crashed_run.as_deref()
+    }
+
+    /// 干净退出：先清掉这次运行的 `needs_verify`，再写成 `clean` 并 fsync，然后放开锁。不删除文件。
+    pub fn release_clean(mut self, db: &rusqlite::Connection) -> Result<()> {
+        crate::exec::clear_needs_verify_for_run(db, &self.run_id)?;
+        write_status(&self.file, STATUS_CLEAN, &self.run_id)?;
+        match self.file.unlock() {
+            Ok(()) => {}
+            Err(err) => return Err(Error::new(ErrorCode::Io, err.to_string())),
+        }
         self.released = true;
         Ok(())
     }
@@ -48,8 +66,13 @@ impl RunLock {
 
 impl Drop for RunLock {
     fn drop(&mut self) {
-        if !self.released {
-            let _ = self.file.unlock();
+        if self.released {
+            return;
+        }
+        self.released = true;
+        match self.file.unlock() {
+            Ok(()) => {}
+            Err(err) => eprintln!("run.lock unlock: {err}"),
         }
     }
 }
@@ -58,12 +81,15 @@ pub fn acquire_run_lock(data_dir: &Path) -> Result<RunAcquire> {
     fs::create_dir_all(data_dir)?;
     let path = data_dir.join("run.lock");
     // create 不会截断已有内容。截断和改写都放在拿到锁之后。
-    let file = OpenOptions::new().read(true).write(true).create(true).open(&path)?;
+    let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
     match file.try_lock_exclusive() {
         Ok(()) => {
-            let abnormal = read_status(&file)? == Some(STATUS_RUNNING);
-            write_status(&file, STATUS_RUNNING)?;
-            Ok(RunAcquire::Held(RunLock { file, abnormal, released: false }))
+            let prior = read_prior(&file)?;
+            let abnormal = prior.status == Some(STATUS_RUNNING);
+            let crashed_run = if abnormal { prior.run_id } else { None };
+            let run_id = uuid::Uuid::new_v4().simple().to_string();
+            write_status(&file, STATUS_RUNNING, &run_id)?;
+            Ok(RunAcquire::Held(RunLock { file, abnormal, released: false, run_id, crashed_run }))
         }
         Err(err) if lock_held_by_other(&err) => Ok(RunAcquire::AnotherInstance),
         Err(err) => Err(Error::new(ErrorCode::Io, err.to_string())),
@@ -74,27 +100,45 @@ fn lock_held_by_other(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::WouldBlock
 }
 
-fn read_status(file: &File) -> Result<Option<&'static str>> {
+struct PriorLock {
+    status: Option<&'static str>,
+    run_id: Option<String>,
+}
+
+fn read_prior(file: &File) -> Result<PriorLock> {
     let mut file = file;
     file.seek(SeekFrom::Start(0))?;
     let mut buf = String::new();
     file.read_to_string(&mut buf)?;
     if buf.trim().is_empty() {
-        return Ok(None);
+        return Ok(PriorLock { status: None, run_id: None });
     }
+    let mut status = None;
+    let mut run_id = None;
     for line in buf.lines() {
-        let Some(value) = line.trim().strip_prefix("status=") else { continue };
-        return Ok(match value.trim() {
-            STATUS_RUNNING => Some(STATUS_RUNNING),
-            STATUS_CLEAN => Some(STATUS_CLEAN),
-            _ => None,
-        });
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("status=") {
+            status = match value.trim() {
+                STATUS_RUNNING => Some(STATUS_RUNNING),
+                STATUS_CLEAN => Some(STATUS_CLEAN),
+                _ => None,
+            };
+        } else if let Some(value) = line.strip_prefix("run=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                run_id = Some(value.to_string());
+            }
+        }
     }
-    Ok(None)
+    Ok(PriorLock { status, run_id })
 }
 
-fn write_status(file: &File, status: &str) -> Result<()> {
-    let body = format!("status={status}\npid={}\nstart={}\n", std::process::id(), process_start_token());
+fn write_status(file: &File, status: &str, run_id: &str) -> Result<()> {
+    let body = format!(
+        "status={status}\nrun={run_id}\npid={}\nstart={}\n",
+        std::process::id(),
+        process_start_token()
+    );
     let mut file = file;
     file.seek(SeekFrom::Start(0))?;
     file.write_all(body.as_bytes())?;

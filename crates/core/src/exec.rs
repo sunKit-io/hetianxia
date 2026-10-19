@@ -39,6 +39,20 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// 当前进程这一次运行的 `run_id`。`begin_run` 写入，干净退出时清掉。
+static ACTIVE_RUN: Mutex<Option<String>> = Mutex::new(None);
+
+fn set_active_run(id: Option<String>) {
+    if let Ok(mut guard) = ACTIVE_RUN.lock() {
+        *guard = id;
+    }
+}
+
+fn active_run_id() -> Option<String> {
+    ACTIVE_RUN.lock().ok().and_then(|guard| guard.clone())
+}
 
 #[derive(Debug, Clone)]
 pub struct ExecOpts {
@@ -220,6 +234,7 @@ pub fn open_db(path: &Path) -> Result<Connection> {
     ensure_column(&conn, "exec_ops", "written", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(&conn, "exec_ops", "source_removed", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(&conn, "exec_ops", "needs_verify", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(&conn, "exec_ops", "needs_verify_run", "TEXT")?;
     ensure_column(&conn, "exec_ops", "attr_restore_failed", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(&conn, "exec_ops", "kept_hash", "TEXT")?;
     ensure_column(&conn, "history", "attr_failed_json", "TEXT")?;
@@ -414,10 +429,26 @@ fn mark_rollback_done(db: &Connection, exec_id: &str, index: u32) -> Result<()> 
 }
 
 fn record_restored_io(db: &Connection, exec_id: &str, index: u32, err: &Error) -> Result<()> {
+    let run = active_run_id();
     db.execute(
-        "UPDATE exec_ops SET rollback_state='done', needs_verify=1, rollback_error=?3, code=?4 WHERE exec_id=?1 AND op_index=?2",
-        params![exec_id, index, err.message, err.code_str()],
+        "UPDATE exec_ops SET rollback_state='done', needs_verify=1, needs_verify_run=?5, rollback_error=?3, code=?4 WHERE exec_id=?1 AND op_index=?2",
+        params![exec_id, index, err.message, err.code_str(), run],
     )?;
+    Ok(())
+}
+
+/// 干净退出时调用，而且必须在把 `run.lock` 写成 `clean` 之前。
+/// 清掉这次 `run_id` 的标记，也清掉还没带 `run_id` 的旧标记。别的运行留下的标记不动。
+pub(crate) fn clear_needs_verify_for_run(db: &Connection, run_id: &str) -> Result<()> {
+    db.execute(
+        "UPDATE exec_ops SET needs_verify=0, needs_verify_run=NULL WHERE needs_verify=1 AND (needs_verify_run IS NULL OR needs_verify_run=?1)",
+        params![run_id],
+    )?;
+    if let Ok(mut guard) = ACTIVE_RUN.lock() {
+        if guard.as_deref() == Some(run_id) {
+            *guard = None;
+        }
+    }
     Ok(())
 }
 
@@ -883,15 +914,17 @@ fn restore_still_matches(fsys: &LocalFs, backup: &Path, op: &PlanOp) -> Result<b
 }
 
 /// 已恢复但目录同步失败的文件，只在上次进程异常退出后的第一次启动时和备份比哈希。
+/// 只核对 `crashed_run` 那一次运行打上的标记。没有 `run_id` 的旧文件只核对未打标的行。
 /// 一致就清掉 needs_verify。不一致则改成未恢复，历史记「部分回滚」，错误码用 E_IO。不改文件内容。
-fn reconcile_unverified_restores(db: &Connection, fsys: &LocalFs) -> Result<()> {
+fn reconcile_unverified_restores(db: &Connection, fsys: &LocalFs, crashed_run: Option<&str>) -> Result<()> {
     let mut stmt = db.prepare(
         "SELECT o.exec_id, o.op_index, o.op_json, j.backup_root, j.state
          FROM exec_ops o
          JOIN exec_journal j ON j.exec_id = o.exec_id
-         WHERE o.needs_verify = 1 AND o.rollback_state = 'done'",
+         WHERE o.needs_verify = 1 AND o.rollback_state = 'done'
+           AND ((?1 IS NULL AND o.needs_verify_run IS NULL) OR o.needs_verify_run = ?1)",
     )?;
-    let rows = stmt.query_map([], |r| {
+    let rows = stmt.query_map(params![crashed_run], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, i64>(1)? as u32,
@@ -913,7 +946,7 @@ fn reconcile_unverified_restores(db: &Connection, fsys: &LocalFs) -> Result<()> 
         let backup = PathBuf::from(&backup_root);
         if restore_still_matches(fsys, &backup, &op)? {
             db.execute(
-                "UPDATE exec_ops SET needs_verify=0 WHERE exec_id=?1 AND op_index=?2",
+                "UPDATE exec_ops SET needs_verify=0, needs_verify_run=NULL WHERE exec_id=?1 AND op_index=?2",
                 params![exec_id, index],
             )?;
             continue;
@@ -1049,8 +1082,9 @@ pub fn begin_run(db: &Connection, fsys: &LocalFs, data_dir: &Path) -> Result<Run
         crate::runlock::RunAcquire::Held(lock) => {
             let abnormal_exit = lock.abnormal_exit();
             if abnormal_exit {
-                reconcile_unverified_restores(db, fsys)?;
+                reconcile_unverified_restores(db, fsys, lock.crashed_run())?;
             }
+            set_active_run(Some(lock.run_id().to_string()));
             let offers = recover_on_startup(db, fsys)?;
             Ok(RunStart::Started { lock, abnormal_exit, offers })
         }
@@ -1518,25 +1552,11 @@ fn restored_hashes_match(fsys: &LocalFs, backup: &Path, op: &PlanOp) -> Result<(
         }
         OpKind::Overwrite | OpKind::Delete => require_matches_backup(fsys, backup, &op.path),
         OpKind::Move if op.keep_source => {
+            // 保留旧文件时，原路径本来就要留下，用户可以改它。回滚只要求新路径已经不在。
             if live_content_hash(fsys, &op.path)?.is_some() {
                 return Err(Error::new(ErrorCode::Io, format!("{} 回滚后内容和备份不一致", op.path)));
             }
-            let from = op.from.as_deref().unwrap_or("");
-            if backup_content_hash(backup, from).is_some() {
-                return require_matches_backup(fsys, backup, from);
-            }
-            let expect = op
-                .bytes
-                .as_ref()
-                .map(|b| sha256_hex(b))
-                .or_else(|| op.expect.as_ref().map(|s| s.hash.clone()));
-            let Some(expect) = expect else {
-                return Err(Error::new(ErrorCode::NotFound, format!("备份里没有 {from}")));
-            };
-            match live_content_hash(fsys, from)? {
-                Some(hash) if hash == expect => Ok(()),
-                _ => Err(Error::new(ErrorCode::Io, format!("{from} 回滚后内容和备份不一致"))),
-            }
+            Ok(())
         }
         OpKind::Move => {
             let from_raw = op.from.as_deref().unwrap_or("");
@@ -2123,6 +2143,7 @@ fn undo_move(
 ) -> Result<RestoreOutcome> {
     let to = RelPath::parse(&op.path)?;
     if op.keep_source {
+        // 保留旧文件：只删除新路径。不读、不哈希、不覆盖原路径。
         if fsys.stat(&to).is_ok() {
             fsys.remove_path(&to)?;
         }
@@ -2269,7 +2290,7 @@ pub fn rollback_conflicts(fsys: &LocalFs, db: &Connection, exec_id: &str, plan: 
 /// 和当初写下去的内容比。接受过的外部删除或外部哈希不拿来抵消回滚冲突。
 /// 计划内删除、目标已经不在：不是冲突，回滚时用备份恢复。只有外部又把文件建回来且内容和备份不同才算冲突。
 fn recreated_source_conflict(fsys: &LocalFs, backup: &Path, op: &PlanOp, row: &OpRow) -> Result<Option<ConflictFile>> {
-    if op.kind != OpKind::Move {
+    if op.kind != OpKind::Move || op.keep_source {
         return Ok(None);
     }
     if row.rollback_state.as_deref() == Some("done") && !move_other_side_present(fsys, op)? {
@@ -5057,52 +5078,45 @@ mod tests {
     }
 
     #[test]
-    fn rec_27_abnormal_lock_rechecks_needs_verify_before_rollback() {
+    fn rec_27_clean_quit_leaves_status_clean() {
         let dir = tempfile::tempdir().unwrap();
-        let (db, fsys, id) = needs_verify_after_user_edit(dir.path());
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
         let data = dir.path().join("data");
-        fs::create_dir_all(&data).unwrap();
-        fs::write(data.join("run.lock"), b"status=running\npid=1\nstart=1\n").unwrap();
         let started = begin_run(&db, &fsys, &data).unwrap();
-        let RunStart::Started { abnormal_exit, offers, lock } = started else { panic!("expected the lock"); };
-        assert!(abnormal_exit);
-        assert_eq!(journal_state(&db, &id), "ROLLBACK_PARTIAL");
-        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"user-edit");
-        assert_eq!(offers.len(), 1, "{offers:?}");
-        assert_eq!(offers[0].actions, vec!["继续回滚".to_string(), "稍后处理".to_string()]);
-        let state: String = db.query_row("SELECT rollback_state FROM exec_ops WHERE exec_id=?1", params![id], |r| r.get(0)).unwrap();
-        assert_eq!(state, "failed");
-        let while_running = fs::read_to_string(data.join("run.lock")).unwrap();
-        assert!(while_running.starts_with("status=running\n"), "{while_running}");
-        lock.release_clean().unwrap();
-        assert!(data.join("run.lock").is_file());
-        let cleaned = fs::read_to_string(data.join("run.lock")).unwrap();
-        assert!(cleaned.starts_with("status=clean\n"), "{cleaned}");
+        let RunStart::Started { lock, .. } = started else { panic!("expected the lock"); };
+        lock.release_clean(&db).unwrap();
+        let path = data.join("run.lock");
+        assert!(path.is_file());
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("status=clean\n"), "{text}");
+        assert!(text.contains("pid="), "{text}");
+        assert!(text.contains("start="), "{text}");
     }
 
     #[test]
-    fn rec_28_clean_start_does_not_recheck_needs_verify() {
+    fn rec_28_kill_leaves_running_and_next_start_reverifies() {
         let dir = tempfile::tempdir().unwrap();
         let (db, fsys, id) = needs_verify_after_user_edit(dir.path());
         let data = dir.path().join("data");
-        fs::create_dir_all(&data).unwrap();
-        fs::write(data.join("run.lock"), b"status=clean\npid=1\nstart=1\n").unwrap();
         let started = begin_run(&db, &fsys, &data).unwrap();
-        let RunStart::Started { abnormal_exit, offers, lock } = started else { panic!("expected a new lock"); };
+        let RunStart::Started { abnormal_exit, lock, .. } = started else { panic!("expected the lock"); };
         assert!(!abnormal_exit);
-        assert!(offers.is_empty(), "{offers:?}");
-        assert_eq!(journal_state(&db, &id), "ROLLED_BACK");
+        let run = lock.run_id().to_string();
+        db.execute(
+            "UPDATE exec_ops SET needs_verify_run=?2 WHERE exec_id=?1 AND needs_verify=1",
+            params![id, run],
+        )
+        .unwrap();
+        drop(lock);
+        let left = fs::read_to_string(data.join("run.lock")).unwrap();
+        assert!(left.starts_with("status=running\n"), "{left}");
+        let again = begin_run(&db, &fsys, &data).unwrap();
+        let RunStart::Started { abnormal_exit, lock, .. } = again else { panic!("expected the next start"); };
+        assert!(abnormal_exit);
+        assert_eq!(journal_state(&db, &id), "ROLLBACK_PARTIAL");
         assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"user-edit");
-        let nv: i64 = db.query_row("SELECT needs_verify FROM exec_ops WHERE exec_id=?1", params![id], |r| r.get(0)).unwrap();
-        assert_eq!(nv, 1);
-        let listed = list_history(&db).unwrap();
-        assert_eq!(listed[0].result, "已回滚");
-        let nv: i64 = db.query_row("SELECT needs_verify FROM exec_ops WHERE exec_id=?1", params![id], |r| r.get(0)).unwrap();
-        assert_eq!(nv, 1);
-        assert!(fs::read_to_string(data.join("run.lock")).unwrap().starts_with("status=running\n"));
-        lock.release_clean().unwrap();
-        assert!(data.join("run.lock").is_file());
-        assert!(fs::read_to_string(data.join("run.lock")).unwrap().starts_with("status=clean\n"));
+        lock.release_clean(&db).unwrap();
     }
 
     #[test]
@@ -5128,40 +5142,50 @@ mod tests {
     }
 
     #[test]
-    fn rec_29_running_status_rechecks_needs_verify() {
+    fn rec_30_running_status_rechecks_needs_verify() {
         let dir = tempfile::tempdir().unwrap();
         let (db, fsys, id) = needs_verify_after_user_edit(dir.path());
         let data = dir.path().join("data");
         fs::create_dir_all(&data).unwrap();
         fs::write(data.join("run.lock"), b"status=running\npid=4\nstart=4\n").unwrap();
         let started = begin_run(&db, &fsys, &data).unwrap();
-        let RunStart::Started { abnormal_exit, lock, .. } = started else { panic!("expected the lock"); };
+        let RunStart::Started { abnormal_exit, offers, lock } = started else { panic!("expected the lock"); };
         assert!(abnormal_exit);
         assert_eq!(journal_state(&db, &id), "ROLLBACK_PARTIAL");
         assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"user-edit");
-        lock.release_clean().unwrap();
+        assert_eq!(offers.len(), 1, "{offers:?}");
+        assert_eq!(offers[0].actions, vec!["继续回滚".to_string(), "稍后处理".to_string()]);
+        lock.release_clean(&db).unwrap();
     }
 
     #[test]
-    fn rec_29_clean_or_empty_lock_skips_reverify() {
-        let check = |prior: &[u8]| {
+    fn rec_31_clean_empty_or_missing_lock_skips_reverify() {
+        let check = |prior: Option<&[u8]>| {
             let dir = tempfile::tempdir().unwrap();
             let (db, fsys, id) = needs_verify_after_user_edit(dir.path());
             let data = dir.path().join("data");
             fs::create_dir_all(&data).unwrap();
-            fs::write(data.join("run.lock"), prior).unwrap();
+            if let Some(bytes) = prior {
+                fs::write(data.join("run.lock"), bytes).unwrap();
+            }
             let started = begin_run(&db, &fsys, &data).unwrap();
-            let RunStart::Started { abnormal_exit, lock, .. } = started else { panic!("expected the lock"); };
+            let RunStart::Started { abnormal_exit, offers, lock } = started else { panic!("expected the lock"); };
             assert!(!abnormal_exit);
+            assert!(offers.is_empty(), "{offers:?}");
             assert_eq!(journal_state(&db, &id), "ROLLED_BACK");
             assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"user-edit");
+            let listed = list_history(&db).unwrap();
+            assert_eq!(listed[0].result, "已回滚");
+            lock.release_clean(&db).unwrap();
             let nv: i64 = db.query_row("SELECT needs_verify FROM exec_ops WHERE exec_id=?1", params![id], |r| r.get(0)).unwrap();
-            assert_eq!(nv, 1);
-            lock.release_clean().unwrap();
+            assert_eq!(nv, 0);
+            let text = fs::read_to_string(data.join("run.lock")).unwrap();
+            assert!(text.starts_with("status=clean\n"), "{text}");
             assert!(data.join("run.lock").is_file());
         };
-        check(b"status=clean\npid=1\nstart=1\n");
-        check(b"");
+        check(Some(b"status=clean\npid=1\nstart=1\n"));
+        check(Some(b""));
+        check(None);
     }
 
     #[test]
@@ -5184,6 +5208,210 @@ mod tests {
         assert!(abnormal_exit);
         assert_eq!(journal_state(&db, &p.id), "ROLLBACK_PARTIAL");
         assert_eq!(fs::read(dir.path().join("made.txt")).unwrap(), b"came-back");
-        lock.release_clean().unwrap();
+        lock.release_clean(&db).unwrap();
+    }
+
+    fn keep_move_op() -> PlanOp {
+        PlanOp {
+            index: 1,
+            kind: OpKind::Move,
+            path: "new.ts".into(),
+            from: Some("old.ts".into()),
+            bytes: Some(b"body".to_vec()),
+            expect: Some(Snapshot { size: 4, mtime_ms: None, hash: sha256_hex(b"body") }),
+            mode: Some(0o644),
+            source_mtime_ms: None,
+            merged: false,
+            keep_source: true,
+            readonly: false,
+            label: "移动（保留旧文件）".into(),
+        }
+    }
+
+    #[cfg(feature = "fault-inject")]
+    fn plain_move_op() -> PlanOp {
+        let mut op = keep_move_op();
+        op.keep_source = false;
+        op.label = "移动".into();
+        op
+    }
+
+    /// R1 / REC-32 的干净退出一半：没带 run_id 的标记在写成 clean 之前被清掉，之后的崩溃不再核对。
+    #[test]
+    fn r1_clean_exit_clears_unstamped_mark_before_a_later_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, fsys, id) = needs_verify_after_user_edit(dir.path());
+        let data = dir.path().join("data");
+        let started = begin_run(&db, &fsys, &data).unwrap();
+        let RunStart::Started { lock, abnormal_exit, .. } = started else { panic!("expected the lock"); };
+        assert!(!abnormal_exit);
+        lock.release_clean(&db).unwrap();
+        let nv: i64 = db.query_row("SELECT needs_verify FROM exec_ops WHERE exec_id=?1", params![id], |r| r.get(0)).unwrap();
+        assert_eq!(nv, 0);
+        assert!(fs::read_to_string(data.join("run.lock")).unwrap().starts_with("status=clean\n"));
+        fs::write(data.join("run.lock"), b"status=running\nrun=later-crash\npid=1\nstart=1\n").unwrap();
+        let again = begin_run(&db, &fsys, &data).unwrap();
+        let RunStart::Started { lock, .. } = again else { panic!("expected the next start"); };
+        assert_eq!(journal_state(&db, &id), "ROLLED_BACK");
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"user-edit");
+        lock.release_clean(&db).unwrap();
+    }
+
+    /// REC-32：只复核崩溃那次 run_id 的标记。干净退出不清别的运行留下的标记。
+    #[test]
+    fn rec_32_reverify_only_the_crashed_run_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, fsys, id) = needs_verify_after_user_edit(dir.path());
+        db.execute(
+            "UPDATE exec_ops SET needs_verify=1, needs_verify_run='stale-run' WHERE exec_id=?1",
+            params![id],
+        )
+        .unwrap();
+        let data = dir.path().join("data");
+        let started = begin_run(&db, &fsys, &data).unwrap();
+        let RunStart::Started { lock, .. } = started else { panic!("expected the lock"); };
+        let this_run = lock.run_id().to_string();
+        db.execute(
+            "UPDATE exec_ops SET needs_verify=1, needs_verify_run=?2 WHERE exec_id=?1",
+            params![id, this_run],
+        )
+        .unwrap();
+        lock.release_clean(&db).unwrap();
+        let nv: i64 = db.query_row("SELECT needs_verify FROM exec_ops WHERE exec_id=?1", params![id], |r| r.get(0)).unwrap();
+        assert_eq!(nv, 0, "这次运行的标记要在写成 clean 之前清掉");
+        assert!(fs::read_to_string(data.join("run.lock")).unwrap().starts_with("status=clean\n"));
+
+        db.execute(
+            "UPDATE exec_ops SET needs_verify=1, needs_verify_run='stale-run', rollback_state='done' WHERE exec_id=?1",
+            params![id],
+        )
+        .unwrap();
+        db.execute("UPDATE exec_journal SET state='ROLLED_BACK' WHERE exec_id=?1", params![id]).unwrap();
+        let later = begin_run(&db, &fsys, &data).unwrap();
+        let RunStart::Started { lock, abnormal_exit, .. } = later else { panic!("expected the lock"); };
+        assert!(!abnormal_exit);
+        lock.release_clean(&db).unwrap();
+        let kept: String = db
+            .query_row("SELECT needs_verify_run FROM exec_ops WHERE exec_id=?1", params![id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, "stale-run");
+        fs::write(data.join("run.lock"), b"status=running\nrun=other-run\npid=2\nstart=2\n").unwrap();
+        let other = begin_run(&db, &fsys, &data).unwrap();
+        let RunStart::Started { lock, abnormal_exit, .. } = other else { panic!("expected the lock"); };
+        assert!(abnormal_exit);
+        assert_eq!(journal_state(&db, &id), "ROLLED_BACK");
+        let still: i64 = db.query_row("SELECT needs_verify FROM exec_ops WHERE exec_id=?1", params![id], |r| r.get(0)).unwrap();
+        assert_eq!(still, 1);
+        drop(lock);
+
+        fs::write(data.join("run.lock"), b"status=running\nrun=stale-run\npid=3\nstart=3\n").unwrap();
+        let crashed = begin_run(&db, &fsys, &data).unwrap();
+        let RunStart::Started { lock, .. } = crashed else { panic!("expected the lock"); };
+        assert_eq!(journal_state(&db, &id), "ROLLBACK_PARTIAL");
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"user-edit");
+        lock.release_clean(&db).unwrap();
+    }
+
+    /// RB-23 / R2：保留旧文件的移动，原路径被改过也不是冲突。两种选择都只删新路径。
+    #[test]
+    fn rb_23_keep_source_edit_is_not_a_conflict() {
+        for choice in [RollbackChoice::ProceedBackupCurrent, RollbackChoice::SkipConflicts] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("old.ts"), b"body").unwrap();
+            let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+            let fsys = LocalFs::new(dir.path());
+            let p = plan(vec![keep_move_op()]);
+            execute(&db, &fsys, &p, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+            fs::write(dir.path().join("old.ts"), b"user-edit").unwrap();
+            let conflicts = rollback_conflicts(&fsys, &db, &p.id, &p).unwrap();
+            assert!(conflicts.iter().all(|c| c.path != "old.ts"), "{conflicts:?}");
+            let back = rollback(&db, &fsys, &p.id, choice, FaultPlan::default()).unwrap();
+            assert_eq!(back.state, "ROLLED_BACK", "{choice:?} {:?}", back.files);
+            assert_eq!(fs::read(dir.path().join("old.ts")).unwrap(), b"user-edit");
+            assert!(!dir.path().join("new.ts").exists());
+            assert!(!dir.path().join("bak").join(&p.id).join("conflict-current").join("old.ts").exists());
+            let again = rollback(&db, &fsys, &p.id, choice, FaultPlan::default()).unwrap_err();
+            assert_eq!(again.code, ErrorCode::InvalidState);
+            assert_eq!(fs::read(dir.path().join("old.ts")).unwrap(), b"user-edit");
+            assert!(!dir.path().join("new.ts").exists());
+        }
+    }
+
+    #[cfg(feature = "fault-inject")]
+    #[test]
+    fn r3_attr_failure_column_survives_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"old").unwrap();
+        fs::write(dir.path().join("b.txt"), b"old").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let p = plan(vec![ov(1, "a.txt", b"old", b"NEW", None), ov(2, "b.txt", b"old", b"NEW", None)]);
+        execute(&db, &fsys, &p, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        crate::vfs::fail_set_meta_once();
+        let back = rollback(
+            &db,
+            &fsys,
+            &p.id,
+            RollbackChoice::ProceedBackupCurrent,
+            crate::fault::parse_spec("rollback:2").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(back.state, "ROLLBACK_PARTIAL", "{:?}", back.files);
+        let attr: i64 = db
+            .query_row(
+                "SELECT COALESCE(SUM(attr_restore_failed),0) FROM exec_ops WHERE exec_id=?1",
+                params![p.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(attr >= 1, "第一次回滚应记下属性恢复失败");
+        let again = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+        assert_eq!(again.state, "ROLLED_BACK", "{:?}", again.files);
+        let attr_after: i64 = db
+            .query_row(
+                "SELECT COALESCE(SUM(attr_restore_failed),0) FROM exec_ops WHERE exec_id=?1",
+                params![p.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(attr_after, attr, "重试不能清掉已经记下的属性恢复失败");
+    }
+
+    #[cfg(feature = "fault-inject")]
+    #[test]
+    fn r4_rolled_back_move_never_keeps_both_copies() {
+        for n in 1..=4 {
+            for choice in [RollbackChoice::SkipConflicts, RollbackChoice::ProceedBackupCurrent] {
+                let dir = tempfile::tempdir().unwrap();
+                fs::write(dir.path().join("old.ts"), b"body").unwrap();
+                let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+                let fsys = LocalFs::new(dir.path());
+                let p = plan(vec![plain_move_op()]);
+                execute(&db, &fsys, &p, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+                fs::write(dir.path().join("new.ts"), b"user-edit").unwrap();
+                let spec = format!("fsync-dir:{n}");
+                let first = rollback(
+                    &db,
+                    &fsys,
+                    &p.id,
+                    RollbackChoice::ProceedBackupCurrent,
+                    crate::fault::parse_spec(&spec).unwrap(),
+                )
+                .unwrap();
+                assert_move_not_both_when_rolled_back(&first.state, dir.path());
+                if first.state != "ROLLED_BACK" {
+                    let again = rollback(&db, &fsys, &p.id, choice, FaultPlan::default()).unwrap();
+                    assert_move_not_both_when_rolled_back(&again.state, dir.path());
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "fault-inject")]
+    fn assert_move_not_both_when_rolled_back(state: &str, root: &Path) {
+        if state == "ROLLED_BACK" {
+            let both = root.join("old.ts").exists() && root.join("new.ts").exists();
+            assert!(!both, "已回滚时 old.ts 和 new.ts 不能同时留下");
+        }
     }
 }
