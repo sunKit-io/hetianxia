@@ -1,0 +1,28 @@
+{
+  "name": "hetianxia",
+  "private": true,
+  "version": "1.0.0",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 43127 --host 127.0.0.1",
+    "build": "tsc -b && vite build",
+    "licenses": "license-checker --production --excludePrivatePackages --onlyAllow 'MIT;ISC;Apache-2.0;BSD-2-Clause;BSD-3-Clause;BSD;0BSD;CC0-1.0;Unlicense;Zlib;BlueOak-1.0.0'"
+  },
+  "dependencies": {
+    "lucide-react": "^0.460.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "license-checker": "^25.0.1",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.6"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  }
+}

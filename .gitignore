@@ -1,0 +1,24 @@
+node_modules
+dist
+target
+src-tauri/target
+.DS_Store
+*.dmg
+uploads
+*.log
+.vite
+
+# 测试环境和本地密钥。不要把这些推进公开仓库。
+hetianxia-testenv/
+.env
+.env.*
+!.env.example
+keys/
+*.p12
+*.cer
+*.mobileprovision
+*.pem
+*.key
+*.p8
+*.provisionprofile
+AuthKey_*.p8
