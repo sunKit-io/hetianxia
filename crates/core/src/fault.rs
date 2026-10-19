@@ -1,35 +1,19 @@
-//! 故障注入。整个模块在 `fault-inject` feature 关闭时不包含任何实现，
-//! 正式包里既没有解析器，也没有 `UPG_FAULT_MARKER_HETIANXIA` 这个符号。
-//!
-//! 环境变量 `UPG_FAULT`，逗号分隔：
-//! - `stage:N` 或 `stage:N:mode`
-//! - stage: `backup` `write` `verify-pre` `verify-post` `rename` `rollback` `log` `sftp-disconnect`
-//! - N：执行计划里的文件序号，从 1 开始。`log:N` 例外，N 是第 N 次事务日志写入
-//!   （第 1 次 = 打开事务，状态 PREPARED；之后每次状态变更各算一次）。
-//! - `log:begin` 等于 `log:1`。`log:commit` 在最终 COMMITTED 写入之前触发。
-//! - mode: `error`（默认，返回注入错误）、`panic`（进程中止）。
-//!   `sftp-disconnect` 只有 `drop`（省略 mode 即 drop），表示丢掉连接。
-//!   设计文档 12.8 把方式写成 error / panic；断开连接不是这两种，所以单独用 drop。
-//!
-//! 格式不合法分两处拦住，都打印 `UPG_FAULT: ...` 并以退出码 1 结束，不会静默忽略：
-//! - 启动：`check_env_syntax_or_exit` 检查语法（未知阶段、空项、N=0、错误的 mode、
-//!   把 drop 用在别的阶段、给 sftp-disconnect 写 error/panic、单独的 verify）。
-//! - 执行开始：`load_from_env_or_exit` 再按计划检查序号。文件类阶段的 N 大于计划长度，
-//!   或者阶段不适用于该操作，都算非法。`log:N` 按日志写入次数计数，上限是
-//!   `4 + 2 × 计划长度`（prepared、backed_up、每个文件 doing/done、verifying、committed），
-//!   可以大于计划长度。
+//! 故障注入。正式包不包含解析器和标记常量。
+//! 具体语法只在打开 fault-inject 时编译，避免阶段名进入发布产物。
 
 use crate::error::Result;
 #[cfg(feature = "fault-inject")]
 use crate::error::{Error, ErrorCode};
 use crate::model::OpKind;
-use serde::Serialize;
+
+#[cfg(feature = "fault-inject")]
+#[path = "fault_marker.rs"]
+mod fault_marker;
 
 #[cfg(feature = "fault-inject")]
 pub const MARKER: &str = "UPG_FAULT_MARKER_HETIANXIA";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     Backup,
     Write,
@@ -41,12 +25,13 @@ pub enum Stage {
     SftpDisconnect,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Error,
     Panic,
     Drop,
+    /// 只适用于 `backup`：备份写完并 fsync 之后、校验之前，把备份文件中间一字节翻掉。
+    Corrupt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +54,7 @@ impl FaultPlan {
 
 #[derive(Debug, Default)]
 pub struct FaultRuntime {
+    #[cfg_attr(not(feature = "fault-inject"), allow(dead_code))]
     plan: FaultPlan,
     log_writes: u32,
 }
@@ -87,6 +73,7 @@ pub fn load_from_env_or_exit(_ops: &[OpKind]) -> FaultPlan {
 pub fn check_env_syntax_or_exit() {
     #[cfg(feature = "fault-inject")]
     {
+        fault_marker::touch();
         let Ok(spec) = std::env::var("UPG_FAULT") else { return };
         if spec.trim().is_empty() {
             return;
@@ -152,7 +139,7 @@ fn parse_item(raw: &str) -> std::result::Result<Item, String> {
         let mode = if parts.len() == 2 {
             Mode::Error
         } else if parts.len() == 3 {
-            parse_mode(parts[2], raw, false)?
+            parse_mode(parts[2], raw, Stage::Log)?
         } else {
             return Err(format!("无法解析「{raw}」"));
         };
@@ -183,7 +170,7 @@ fn parse_item(raw: &str) -> std::result::Result<Item, String> {
     let mode = if parts.len() == 2 {
         if stage == Stage::SftpDisconnect { Mode::Drop } else { Mode::Error }
     } else {
-        parse_mode(parts[2], raw, stage == Stage::SftpDisconnect)?
+        parse_mode(parts[2], raw, stage)?
     };
     if stage == Stage::SftpDisconnect && mode != Mode::Drop {
         return Err(format!("「{raw}」：sftp-disconnect 只有 drop 模式"));
@@ -195,13 +182,19 @@ fn parse_item(raw: &str) -> std::result::Result<Item, String> {
 }
 
 #[cfg(feature = "fault-inject")]
-fn parse_mode(s: &str, raw: &str, disconnect: bool) -> std::result::Result<Mode, String> {
+fn parse_mode(s: &str, raw: &str, stage: Stage) -> std::result::Result<Mode, String> {
+    let disconnect = stage == Stage::SftpDisconnect;
     match s {
         "error" if !disconnect => Ok(Mode::Error),
         "panic" if !disconnect => Ok(Mode::Panic),
         "drop" if disconnect => Ok(Mode::Drop),
+        "corrupt" if stage == Stage::Backup => Ok(Mode::Corrupt),
+        "corrupt" => Err(format!("「{raw}」：corrupt 只适用于 backup")),
         "error" | "panic" if disconnect => Err(format!("「{raw}」：sftp-disconnect 只有 drop 模式")),
-        other => Err(format!("「{raw}」的模式「{other}」不认识，可用 error、panic{}", if disconnect { "、drop" } else { "" })),
+        other => Err(format!(
+            "「{raw}」的模式「{other}」不认识，可用 error、panic{}",
+            if disconnect { "、drop" } else if stage == Stage::Backup { "、corrupt" } else { "" }
+        )),
     }
 }
 
@@ -283,11 +276,24 @@ impl FaultRuntime {
         Ok(())
     }
 
+    /// 正式包恒为 false。故障注入构建在备份落盘之后、校验之前决定要不要改坏备份。
+    #[cfg(not(feature = "fault-inject"))]
+    pub fn backup_should_corrupt(&self, _index: u32) -> bool {
+        false
+    }
+
+    #[cfg(feature = "fault-inject")]
+    pub fn backup_should_corrupt(&self, index: u32) -> bool {
+        self.plan.items.iter().any(|item| {
+            matches!(item, Item::At { stage: Stage::Backup, n, mode: Mode::Corrupt } if *n == index)
+        })
+    }
+
     #[cfg(feature = "fault-inject")]
     pub fn hit_file(&mut self, stage: Stage, index: u32) -> Result<()> {
         for item in &self.plan.items {
             if let Item::At { stage: s, n, mode } = item {
-                if *s == stage && *n == index {
+                if *s == stage && *n == index && *mode != Mode::Corrupt {
                     return fire(stage, index, *mode);
                 }
             }
@@ -325,11 +331,23 @@ impl FaultRuntime {
 }
 
 #[cfg(feature = "fault-inject")]
+fn real_fault_code(stage: Stage) -> ErrorCode {
+    match stage {
+        Stage::VerifyPre | Stage::VerifyPost | Stage::Backup => ErrorCode::VerifyFailed,
+        Stage::Log => ErrorCode::LogWrite,
+        Stage::Write | Stage::Rename => ErrorCode::Internal,
+        Stage::Rollback => ErrorCode::RollbackPartial,
+        Stage::SftpDisconnect => ErrorCode::Net,
+    }
+}
+
+#[cfg(feature = "fault-inject")]
 fn fire(stage: Stage, n: u32, mode: Mode) -> Result<()> {
     let label = format!("{stage:?}:{n}");
     match mode {
-        Mode::Drop => Err(Error::new(ErrorCode::Net, format!("UPG_FAULT sftp-disconnect at {label}"))),
-        Mode::Error => Err(Error::new(ErrorCode::Fault, format!("UPG_FAULT error at {label}"))),
+        Mode::Drop => Err(Error::new(ErrorCode::Net, format!("injected disconnect at {label}"))),
+        Mode::Corrupt => Ok(()),
+        Mode::Error => Err(Error::new(real_fault_code(stage), format!("injected {label}"))),
         Mode::Panic => {
             let msg = format!("UPG_FAULT panic at {label}");
             eprintln!("{msg}");
@@ -347,6 +365,7 @@ fn fire(stage: Stage, n: u32, mode: Mode) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "fault-inject")]
     use super::*;
 
     #[test]
@@ -372,7 +391,12 @@ mod tests {
         assert!(parse_spec("backup:0").unwrap_err().contains("0"));
         assert!(parse_spec("write:1:drop").unwrap_err().contains("drop"));
         assert!(parse_spec("sftp-disconnect:1:panic").unwrap_err().contains("drop"));
+        assert!(parse_spec("sftp-disconnect:1:error").unwrap_err().contains("drop"));
+        assert!(parse_spec("write:2:corrupt").unwrap_err().contains("corrupt"));
         assert!(parse_spec("nope:1").unwrap_err().contains("未知阶段"));
+        let corrupt = parse_spec("backup:1:corrupt").unwrap();
+        assert!(matches!(corrupt.items[0], Item::At { stage: Stage::Backup, n: 1, mode: Mode::Corrupt }));
+        assert!(matches!(parse_spec("sftp-disconnect:2").unwrap().items[0], Item::At { mode: Mode::Drop, .. }));
     }
 
     #[test]

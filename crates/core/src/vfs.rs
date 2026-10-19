@@ -5,7 +5,7 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::hashutil::{hash_file_sha256, hash_file_xxh};
 use crate::pathutil::{Ignore, RelPath};
 use serde::Serialize;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -237,7 +237,7 @@ impl LocalFs {
         };
         let path = self.abs(&tmp_rel)?;
         {
-            let mut f = File::create(&path)?;
+            let mut f = OpenOptions::new().write(true).create_new(true).open(&path)?;
             f.write_all(data)?;
             f.sync_all()?;
         }
@@ -316,6 +316,8 @@ impl LocalFs {
             return Err(Error::new(ErrorCode::SymlinkRefused, "不备份符号链接目标内容"));
         }
         fs::copy(&src, dest)?;
+        let file = File::open(dest)?;
+        file.sync_all()?;
         Ok(())
     }
 
@@ -488,6 +490,16 @@ fn chflags(path: &Path, flags: u32) -> Result<()> {
     Ok(())
 }
 
+fn fsync_parent(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else { return Ok(()) };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let dir = File::open(parent)?;
+    dir.sync_all()?;
+    Ok(())
+}
+
 pub fn atomic_rename(from: &Path, to: &Path) -> Result<()> {
     #[cfg(windows)]
     {
@@ -505,11 +517,13 @@ pub fn atomic_rename(from: &Path, to: &Path) -> Result<()> {
         if ok == 0 {
             return Err(Error::new(ErrorCode::Io, "MoveFileExW 失败"));
         }
+        fsync_parent(to)?;
         return Ok(());
     }
     #[cfg(not(windows))]
     {
         fs::rename(from, to)?;
+        fsync_parent(to)?;
         Ok(())
     }
 }

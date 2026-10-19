@@ -11,7 +11,7 @@ pub mod pathutil;
 pub mod prefs;
 pub mod vfs;
 
-/// 进程启动时调用。故障注入构建会在这里检查 `UPG_FAULT` 的语法。
+/// 进程启动时调用。故障注入构建会在这里检查环境变量语法。
 pub fn boot() {
     fault::check_env_syntax_or_exit();
 }
