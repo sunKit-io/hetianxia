@@ -203,6 +203,14 @@ mod tests {
             assert!(!header.contains("db_path"), "{name}: {header}");
             assert!(!header.contains("backup_root"), "{name}: {header}");
         }
+        for name in ["rollback_run", "resume_run"] {
+            let marker = format!("pub fn {name}(");
+            let start = commands.find(&marker).unwrap_or_else(|| panic!("missing {name}"));
+            let rest = &commands[start..];
+            let end = rest[marker.len()..].find("\npub fn ").map(|index| index + marker.len()).unwrap_or(rest.len());
+            assert!(!rest[..end].contains("project_root"), "{name}");
+        }
+        assert!(commands.contains("stored_project_root"));
         assert!(commands.contains("session.backup_root"));
         assert!(!commands.contains("join(\"backups\")"));
         assert!(!commands.contains("load_ssh_secret"));
@@ -346,5 +354,72 @@ mod tests {
         .unwrap();
         assert_eq!(again, "new");
         assert_eq!(std::fs::read(&known).unwrap(), before);
+    }
+
+    fn overwrite_plan(id: &str, bytes: &[u8]) -> ExecPlan {
+        ExecPlan {
+            id: id.into(),
+            project_key: "demo".into(),
+            ops: vec![PlanOp {
+                index: 1,
+                kind: OpKind::Overwrite,
+                path: "a.txt".into(),
+                from: None,
+                bytes: Some(bytes.to_vec()),
+                expect: None,
+                mode: None,
+                source_mtime_ms: None,
+                merged: false,
+                keep_source: false,
+                readonly: false,
+                label: "覆盖".into(),
+            }],
+            summary: Summary { overwrite: 1, ..Summary::default() },
+        }
+    }
+
+    /// A 执行后再在 B 执行。回滚 A 必须改 A，不能改 B。
+    /// 已回滚再调 rollback_run、已结束再调 resume_run，都只观察是否再写文件。
+    #[test]
+    fn rollback_run_and_resume_run_follow_the_journal_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("a.txt"), b"old").unwrap();
+        std::fs::write(b.join("a.txt"), b"from-b").unwrap();
+        let db = dir.path().join("t.sqlite");
+        let backup = dir.path().join("bak");
+        commands::execute_in(&db, &a, &backup, overwrite_plan("exec-a", b"NEW"), false).unwrap();
+        commands::execute_in(&db, &b, &backup, overwrite_plan("exec-b", b"from-b-new"), false).unwrap();
+
+        let rolled = commands::rollback_recorded(&db, "exec-a", hetianxia_core::exec::RollbackChoice::ProceedBackupCurrent).unwrap();
+        assert_eq!(rolled.state, "ROLLED_BACK");
+        assert_eq!(std::fs::read(a.join("a.txt")).unwrap(), b"old");
+        assert_eq!(std::fs::read(b.join("a.txt")).unwrap(), b"from-b-new");
+
+        let again = commands::rollback_recorded(&db, "exec-a", hetianxia_core::exec::RollbackChoice::ProceedBackupCurrent);
+        assert!(again.is_err(), "已回滚后再 rollback_run 不应再执行: {again:?}");
+        assert_eq!(std::fs::read(a.join("a.txt")).unwrap(), b"old");
+        assert_eq!(std::fs::read(b.join("a.txt")).unwrap(), b"from-b-new");
+
+        let resume_rolled = commands::resume_recorded(&db, &backup, "exec-a", hetianxia_core::exec::ResumeChoice::Continue);
+        assert!(resume_rolled.is_err(), "已回滚后再 resume_run 不应再执行: {resume_rolled:?}");
+        assert_eq!(std::fs::read(a.join("a.txt")).unwrap(), b"old");
+        assert_eq!(std::fs::read(b.join("a.txt")).unwrap(), b"from-b-new");
+
+        let resume_done = commands::resume_recorded(&db, &backup, "exec-b", hetianxia_core::exec::ResumeChoice::Continue);
+        assert!(resume_done.is_err(), "已完成后再 resume_run 不应再执行: {resume_done:?}");
+        assert_eq!(std::fs::read(b.join("a.txt")).unwrap(), b"from-b-new");
+
+        // 已完成的升级，第一次 rollback_run 是回滚本身，不是再跑一遍。
+        let rolled_done = commands::rollback_recorded(&db, "exec-b", hetianxia_core::exec::RollbackChoice::ProceedBackupCurrent);
+        assert!(rolled_done.is_ok(), "已完成的升级第一次回滚返回了错误: {rolled_done:?}");
+        assert_eq!(std::fs::read(b.join("a.txt")).unwrap(), b"from-b");
+        let rolled_done_again = commands::rollback_recorded(&db, "exec-b", hetianxia_core::exec::RollbackChoice::ProceedBackupCurrent);
+        assert!(rolled_done_again.is_err(), "已回滚后再 rollback_run 不应再执行: {rolled_done_again:?}");
+        assert_eq!(std::fs::read(b.join("a.txt")).unwrap(), b"from-b");
+        assert_eq!(std::fs::read(a.join("a.txt")).unwrap(), b"old");
     }
 }

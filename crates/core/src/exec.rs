@@ -919,6 +919,19 @@ fn restore_still_matches(fsys: &LocalFs, backup: &Path, op: &PlanOp) -> Result<b
     }
 }
 
+pub fn stored_project_root(db: &Connection, exec_id: &str) -> Result<PathBuf> {
+    let stored: Option<String> = db
+        .query_row("SELECT root FROM exec_journal WHERE exec_id=?1", params![exec_id], |row| row.get(0))
+        .map_err(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => Error::new(ErrorCode::NotFound, "没有这次执行"),
+            other => Error::new(ErrorCode::Internal, other.to_string()),
+        })?;
+    match nonempty_root(stored) {
+        Some(root) => Ok(PathBuf::from(root)),
+        None => Err(Error::new(ErrorCode::InvalidLocation, "没有记下这次的项目目录，不能借用当前项目")),
+    }
+}
+
 fn nonempty_root(value: Option<String>) -> Option<String> {
     value.and_then(|text| {
         let text = text.trim();
