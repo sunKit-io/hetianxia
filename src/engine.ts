@@ -100,6 +100,21 @@ export function formatEngineError(err: unknown): string {
   return String(err);
 }
 
+const FILE_STATE: Record<string, string> = {
+  done: "已写入",
+  skipped: "已跳过",
+  failed: "失败",
+  doing: "进行中",
+  pending: "未开始",
+  conflict: "有冲突",
+};
+
+/** 执行结果列表：状态用中文，错误码原样保留。 */
+export function formatFileResult(file: Pick<FileResult, "state" | "code" | "error">): string {
+  const state = FILE_STATE[file.state] ?? file.state;
+  return [state, file.code, file.error].filter(Boolean).join(" · ");
+}
+
 export function formatReport(report: ExecReport): string {
   const head = report.historyResult ? `${report.state} · ${report.historyResult}` : report.state;
   const lines = [head];

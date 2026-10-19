@@ -273,7 +273,7 @@ export function DiffEditor({
         <footer>
           <span>
             <Text value={fileLabel} />
-            {edited && <em className="edited">edited</em>}
+            {edited && <em className="edited">已编辑</em>}
           </span>
           <button className="primary" disabled={!ready} onClick={() => onExecute(editedContents())}>执行升级</button>
         </footer>

@@ -11,7 +11,10 @@ test("preview empty state and execute stay on the real plan", () => {
   assert.match(app, /选择项目目录…/);
   assert.match(app, /选择升级包…/);
   assert.match(app, /备份并执行/);
-  assert.match(app, /disabled=\{target === "local" \? !localReady : false\}/);
+  assert.match(app, /disabled=\{target === "local" \? !localReady : !remoteReady\}/);
+  assert.match(app, /connectionSelected && currentRemotePlan\(\) != null/);
+  assert.match(app, /执行前备份到/);
+  assert.equal(app.includes("defaultChecked"), false);
   assert.match(app, /executeLocal\(/);
   assert.match(app, /scanPair\(/);
   assert.match(backend, /"scan"/);
@@ -36,7 +39,7 @@ test("editor uses the shared execute path and real diff text", () => {
   assert.match(editor, /先选项目目录和升级包/);
   assert.match(editor, /loadFileTexts/);
   assert.match(editor, /editedContents\(\)/);
-  assert.match(editor, /className="edited"/);
+  assert.match(editor, /className="edited">已编辑/);
   assert.match(editor, /disabled=\{!ready\}/);
   assert.equal(editor.includes("onWriteFailed"), false);
   assert.equal(editor.includes("keep1"), false);

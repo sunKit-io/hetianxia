@@ -3,7 +3,7 @@ import { Server, ShieldAlert, KeyRound, AlertTriangle } from "lucide-react";
 import { appBakDir, clearConnectionFingerprint, commitRemoteOverwrite, deleteConnection, deleteSshSecret, executeLocal, journalRuns, listConnections, mergeTexts, pickProjectDirectory, pickUpgradePackage, readSide, remoteWritePrompt, rollbackPreview, rollbackRun, resumeRun, saveConnection, saveSshSecret, scanPair, sshSecretStatus, startupFailure, startupOffers, testConnection, type JournalRun, type ProbeReport, type SavedConnection } from "./backend";
 import { externalChoice, keepSource, pendingChoice, rollbackChoice, type ResumeChoice, type RollbackChoice } from "./choices";
 import { DiffEditor } from "./editor";
-import { afterResume, engineCode, formatEngineError, formatOffer, formatReport, type ConflictFile, type ExecReport, type RecoveryOffer } from "./engine";
+import { afterResume, engineCode, formatEngineError, formatFileResult, formatOffer, formatReport, type ConflictFile, type ExecReport, type RecoveryOffer } from "./engine";
 import {
   attachFlowStatus,
   baseName,
@@ -226,6 +226,9 @@ export function App() {
     }
   }
 
+  noteShownFile(plan, currentFile);
+  noteRemoteRoot(connectionRemoteRoot(selected));
+
   return (
     <div className="desktop">
       <div className="window">
@@ -283,6 +286,7 @@ export function App() {
             onPickPackage={() => { void onPickPackage(); }}
             onExecute={() => { void backupAndExecute(editedContents()); }}
             onOpenFile={(path) => { setCurrentFile(path); setPage("edit"); }}
+            connectionSelected={selected != null}
             onRemoteWrite={() => {
               const plan = currentRemotePlan();
               if (!selected) {
@@ -601,6 +605,7 @@ function PreviewPage({
   onPickPackage,
   onExecute,
   onOpenFile,
+  connectionSelected,
   onRemoteWrite,
 }: {
   allowReadonly: boolean;
@@ -616,11 +621,13 @@ function PreviewPage({
   onPickPackage: () => void;
   onExecute: () => void;
   onOpenFile: (path: string) => void;
+  connectionSelected: boolean;
   onRemoteWrite: () => void;
 }) {
   const [target, setTarget] = useState<"local" | "remote">("local");
   const counts = useMemo(() => previewCounts(plan?.files ?? [], allowReadonly), [plan, allowReadonly]);
   const localReady = Boolean(plan) && !scanning && !running;
+  const remoteReady = connectionSelected && currentRemotePlan() != null;
   const localSub = projectRoot && packagePath ? `${baseName(projectRoot)} · ${projectRoot} ← ${baseName(packagePath)}` : "";
   const readonlyFiles = (plan?.files ?? []).filter((file) => file.readonly && (file.kind === "overwrite" || file.kind === "delete"));
   return (
@@ -672,15 +679,15 @@ function PreviewPage({
             {report.files.map((file) => (
               <li key={`${file.index}-${file.path}`}>
                 <span><Text value={file.path} /></span>
-                <em>{[file.state, file.code, file.error].filter(Boolean).join(" · ")}</em>
+                <em>{formatFileResult(file)}</em>
               </li>
             ))}
           </ul>
         )}
         {running && <p role="status">正在备份并执行…</p>}
-        <label className="bak"><input type="checkbox" defaultChecked /> 执行前备份到 {bakDir ? <Text value={bakDir} /> : "…"}</label>
+        <p className="bak">执行前备份到 {bakDir ? <Text value={bakDir} /> : "…"}</p>
         <footer>
-          <button className="primary" disabled={target === "local" ? !localReady : false} onClick={() => { if (target === "remote") onRemoteWrite(); else onExecute(); }}>{target === "remote" ? "写入远程" : "备份并执行"}</button>
+          <button className="primary" disabled={target === "local" ? !localReady : !remoteReady} onClick={() => { if (target === "remote") onRemoteWrite(); else onExecute(); }}>{target === "remote" ? "写入远程" : "备份并执行"}</button>
         </footer>
       </div>
     </div>

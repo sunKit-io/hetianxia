@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { afterResume, engineCode, formatEngineError, formatOffer, formatReport, parseResume, type ExecReport } from "./engine.ts";
+import { afterResume, engineCode, formatEngineError, formatFileResult, formatOffer, formatReport, parseResume, type ExecReport } from "./engine.ts";
 
 const stopped: ExecReport = {
   execId: "exec-1",
@@ -52,6 +52,13 @@ test("resume outcomes pick the sheet from the engine", () => {
   const pending = afterResume("keepExternal", parseResume({ changesSinceScan: [{ path: "config/local.env", hashChanged: true, detail: "升级后被修改" }] }));
   assert.equal(pending.sheet, "pending");
   if (pending.sheet === "pending") assert.equal(pending.files[0].path, "config/local.env");
+});
+
+test("file results use Chinese states and keep the error code", () => {
+  assert.equal(formatFileResult({ state: "done", code: null, error: null }), "已写入");
+  assert.equal(formatFileResult({ state: "skipped", code: "E_PERMISSION", error: null }), "已跳过 · E_PERMISSION");
+  assert.equal(formatFileResult({ state: "failed", code: "E_IO", error: "写入失败" }), "失败 · E_IO · 写入失败");
+  assert.equal(formatFileResult({ state: "doing", code: null, error: null }), "进行中");
 });
 
 test("startup offer shows the state and code", () => {
