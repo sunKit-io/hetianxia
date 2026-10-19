@@ -47,7 +47,7 @@ export function warningBanner(os: RemoteOs): string | null {
     return `这台服务器的 Linux 发行版（${id}）未经验证。你可以继续使用，但部分功能可能不正常。`;
   }
   if (os.kind === "unidentified") {
-    return "未验证的系统：没能识别出这台服务器的系统，第一版只验证了 Linux 和 macOS。你可以继续使用，但部分功能可能不正常。";
+    return "未验证的系统：没能识别这台服务器的系统，第一版只验证了 Linux 和 macOS。你可以继续使用，但部分功能可能不正常。";
   }
   return null;
 }
