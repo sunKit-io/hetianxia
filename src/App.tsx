@@ -4,7 +4,7 @@ import { appBakDir, commitRemoteOverwrite, journalRuns, remoteWritePrompt, rollb
 import { externalChoice, keepSource, pendingChoice, rollbackChoice, type ResumeChoice, type RollbackChoice } from "./choices";
 import { DiffEditor } from "./editor";
 import { afterResume, engineCode, formatEngineError, formatOffer, formatReport, type ConflictFile, type RecoveryOffer } from "./engine";
-import { formatFileCounts, formatRunTime, historyContinue, historyRollback, REMOTE_ROLLBACK_TITLE, type HistoryContinue, type HistoryRollback } from "./historyRows";
+import { formatFileCounts, formatRunTime, historyContinue, historyRowButtons, historyStatusLabel, REMOTE_ROLLBACK_TITLE, type HistoryContinue } from "./historyRows";
 import { ALPINE, UNKNOWN, UBUNTU, canContinue, connectionSubtitle, systemTypeLabel, warningBanner, type RemoteOs } from "./os";
 import { Text } from "./plain";
 import { VERIFY_FAILED_BUTTON, VERIFY_FAILED_TITLE, settleRemoteWrite, type PendingRemoteWrite } from "./remoteWrite";
@@ -253,7 +253,10 @@ export function App() {
         )}
         {page === "history" && (
           <HistoryPage
-            onRollback={(action) => void applyRollback(action.execId, action.choice)}
+            onRollback={(execId) => {
+              setFlowId(execId);
+              setSheet("rollback");
+            }}
             onContinue={(action) => void applyResume(action.execId, action.choice)}
           />
         )}
@@ -464,7 +467,7 @@ function PreviewPage({ allowReadonly, setAllowReadonly, bakDir, onLog, onRemoteW
   );
 }
 
-function HistoryPage({ onRollback, onContinue }: { onRollback: (action: HistoryRollback) => void; onContinue: (action: HistoryContinue) => void }) {
+function HistoryPage({ onRollback, onContinue }: { onRollback: (execId: string) => void; onContinue: (action: HistoryContinue) => void }) {
   const [runs, setRuns] = useState<JournalRun[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   useEffect(() => {
@@ -481,24 +484,28 @@ function HistoryPage({ onRollback, onContinue }: { onRollback: (action: HistoryR
       <table>
         <thead><tr><th>时间</th><th>位置</th><th>变更</th><th>结果</th><th /></tr></thead>
         <tbody>
-          {runs.map((run) => (
+          {runs.map((run) => {
+            const label = historyStatusLabel(run.status);
+            const buttons = historyRowButtons(label);
+            return (
             <tr key={run.execId}>
               <td><Text value={formatRunTime(run.startedAt)} /></td>
               <td><Text value={run.projectRoot ?? ""} /></td>
               <td><Text value={formatFileCounts(run)} /></td>
-              <td><Text value={run.status} /></td>
+              <td><Text value={label} /></td>
               <td>
                 {run.remote ? (
                   <button type="button" disabled title={REMOTE_ROLLBACK_TITLE}>回滚</button>
                 ) : (
                   <>
-                    <button type="button" onClick={() => onRollback(historyRollback(run.execId))}>回滚…</button>
-                    <button type="button" onClick={() => onContinue(historyContinue(run.execId))}>继续</button>
+                    {buttons.rollback && <button type="button" onClick={() => onRollback(run.execId)}>回滚…</button>}
+                    {buttons.resume && <button type="button" onClick={() => onContinue(historyContinue(run.execId))}>继续</button>}
                   </>
                 )}
               </td>
             </tr>
-          ))}
+            );
+          })}
         </tbody>
       </table>
     </div>

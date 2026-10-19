@@ -115,8 +115,25 @@ pub fn rollback(session: tauri::State<crate::Session>, root: String, exec_id: St
     rollback_in(&session.db_path, Path::new(&root), &exec_id, choice)
 }
 
+/// 已回滚的不能再回滚。已完成的升级可以回滚，所以已提交不在这里拒绝。
+pub fn reject_finished(db_path: &Path, exec_id: &str, rollback: bool) -> Result<(), Error> {
+    let db = exec::open_db(db_path)?;
+    let state = exec::read_journal_state(&db, exec_id)?;
+    if state == "ROLLED_BACK" {
+        return Err(Error::new(
+            ErrorCode::InvalidState,
+            if rollback { "这次回滚已经结束" } else { "这次升级已经结束，不能继续" },
+        ));
+    }
+    if state == "COMMITTED" && !rollback {
+        return Err(Error::new(ErrorCode::InvalidState, "这次升级已经结束，不能继续"));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn rollback_run(session: tauri::State<crate::Session>, exec_id: String, choice: RollbackChoice) -> Result<ExecReport, Error> {
+    reject_finished(&session.db_path, &exec_id, true)?;
     let root = project_root(&session)?;
     rollback_in(&session.db_path, &root, &exec_id, choice)
 }
@@ -127,6 +144,7 @@ pub fn resume_run(
     exec_id: String,
     choice: ResumeChoice,
 ) -> Result<ResumeOutcome, Error> {
+    reject_finished(&session.db_path, &exec_id, false)?;
     let root = project_root(&session)?;
     let db = exec::open_db(&session.db_path)?;
     let fsys = LocalFs::new(root);
