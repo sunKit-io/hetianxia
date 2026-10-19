@@ -46,6 +46,11 @@ fn project_root(session: &crate::Session) -> Result<PathBuf, Error> {
         .map_err(|_| Error::new(ErrorCode::Internal, "项目目录锁被占用"))
 }
 
+/// 壳层把数据库放在 `app_data_dir`。备份目录是旁边的 `bak/`，不写死产品名路径。
+fn backup_dir(db_path: &str) -> PathBuf {
+    Path::new(db_path).parent().unwrap_or(Path::new(".")).join("bak")
+}
+
 #[tauri::command]
 pub fn scan(left: String, right: String) -> Result<ScanOutput, Error> {
     let left = LocalFs::new(left);

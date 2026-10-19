@@ -3,7 +3,9 @@
 //!
 //! 第二个进程由单实例插件把已有窗口拉到前面，然后自己退出，不改 `run.lock`。
 //! `begin_run` 在任何恢复提示之前完成：先核对崩溃那次的 `needs_verify`，再写新的 `run_id`。
-//! 窗口关闭、退出请求和进程退出都会 `release_clean`。
+//! 数据库、`bak/` 和 `run.lock` 都在 Tauri 的 `app_data_dir`
+//! （macOS：`~/Library/Application Support/com.hetianxia.app/`）。
+//! 执行或回滚还在进行时，窗口关闭和退出都不写成 `clean`。没有进行中的工作时，退出才 `release_clean`。
 
 pub mod commands;
 
@@ -69,11 +71,13 @@ fn open_session(data: PathBuf) -> Result<Session, String> {
 }
 
 fn end_session(session: &Session) {
+    let Ok(db) = hetianxia_core::exec::open_db(&session.db_path) else { return };
+    if hetianxia_core::exec::run_in_flight(&db).unwrap_or(true) {
+        return;
+    }
     let Ok(mut guard) = session.lock.lock() else { return };
     let Some(lock) = guard.take() else { return };
-    if let Ok(db) = hetianxia_core::exec::open_db(&session.db_path) {
-        let _ = lock.release_clean(&db);
-    }
+    let _ = lock.release_clean(&db);
 }
 
 pub fn run() {
@@ -189,6 +193,8 @@ mod tests {
         assert!(source.contains("startup_offers"));
         assert!(source.contains("startup_failure"));
         assert!(source.contains("failed_session"));
+        assert!(source.contains("app_data_dir"));
+        assert!(source.contains("run_in_flight"));
         assert_eq!(app_db_path(std::path::Path::new("/data")), std::path::PathBuf::from("/data/hetianxia.sqlite"));
         assert_eq!(app_backup_root(std::path::Path::new("/data")), std::path::PathBuf::from("/data/bak"));
         let commands = include_str!("commands.rs");
@@ -214,6 +220,8 @@ mod tests {
             assert!(!header.contains("db_path"), "{name}: {header}");
             assert!(!header.contains("backup_root"), "{name}: {header}");
         }
+        let hardcoded = format!("local_{}dir", "data_");
+        assert!(!source.contains(&hardcoded));
     }
 
     #[test]
