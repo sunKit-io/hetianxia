@@ -55,3 +55,18 @@ export function commitRemoteOverwrite(args: {
 }) {
   return invoke<RemoteWriteOutcome>("commit_remote_overwrite", { req: args });
 }
+
+export type JournalRun = {
+  execId: string;
+  projectRoot?: string | null;
+  startedAt: number;
+  status: string;
+  fileCount: number;
+  doneCount: number;
+  failedCount: number;
+  remote: boolean;
+};
+
+export function journalRuns() {
+  return invoke<JournalRun[]>("journal_runs");
+}

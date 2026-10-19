@@ -1839,6 +1839,146 @@ pub fn list_history(db: &Connection) -> Result<Vec<HistoryRow>> {
     Ok(out)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JournalRun {
+    pub exec_id: String,
+    /// 日志里有项目根才填。没有这一列、计划里也没有时为 None。
+    pub project_root: Option<String>,
+    pub started_at: i64,
+    pub status: String,
+    pub file_count: u32,
+    pub done_count: u32,
+    pub failed_count: u32,
+    pub remote: bool,
+}
+
+/// 只读 `exec_journal`。项目根只在日志列或计划 JSON 里出现时返回，不用别的目录顶上。
+pub fn list_journal_runs(db: &Connection) -> Result<Vec<JournalRun>> {
+    let (project_col, remote_col) = journal_flag_columns(db)?;
+    let sql = format!(
+        "SELECT exec_id, state, plan_json, COALESCE(started_at, 0){}{} FROM exec_journal ORDER BY started_at DESC",
+        if project_col { ", project_root" } else { "" },
+        if remote_col { ", remote" } else { "" },
+    );
+    let mut stmt = db.prepare(&sql)?;
+    let mapped = stmt.query_map([], |row| {
+        let exec_id: String = row.get(0)?;
+        let status: String = row.get(1)?;
+        let plan_json: Option<String> = row.get(2)?;
+        let started_at: i64 = row.get(3)?;
+        let column_root: Option<String> = if project_col { row.get(4)? } else { None };
+        let column_remote: Option<i64> = if remote_col {
+            let idx = if project_col { 5 } else { 4 };
+            row.get(idx)?
+        } else {
+            None
+        };
+        Ok((exec_id, status, plan_json, started_at, column_root, column_remote))
+    })?;
+    let mut raw = Vec::new();
+    for row in mapped {
+        raw.push(row?);
+    }
+    drop(stmt);
+    let mut out = Vec::with_capacity(raw.len());
+    for (exec_id, status, plan_json, started_at, column_root, column_remote) in raw {
+        let plan = plan_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let (file_count, done_count, failed_count) = journal_file_counts(db, &exec_id, &plan)?;
+        out.push(JournalRun {
+            exec_id,
+            project_root: nonempty(column_root).or_else(|| plan_project_root(&plan)),
+            started_at,
+            status,
+            file_count,
+            done_count,
+            failed_count,
+            remote: match column_remote {
+                Some(value) => value != 0,
+                None => plan.get("remote").and_then(|value| value.as_bool()).unwrap_or(false),
+            },
+        });
+    }
+    Ok(out)
+}
+
+fn journal_flag_columns(db: &Connection) -> Result<(bool, bool)> {
+    let mut stmt = db.prepare("PRAGMA table_info(exec_journal)")?;
+    let mut rows = stmt.query([])?;
+    let mut project_root = false;
+    let mut remote = false;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "project_root" {
+            project_root = true;
+        } else if name == "remote" {
+            remote = true;
+        }
+    }
+    Ok((project_root, remote))
+}
+
+fn nonempty(value: Option<String>) -> Option<String> {
+    value.and_then(|text| {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn plan_project_root(plan: &serde_json::Value) -> Option<String> {
+    for key in ["projectRoot", "project_root"] {
+        if let Some(text) = plan.get(key).and_then(|value| value.as_str()) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn journal_file_counts(db: &Connection, exec_id: &str, plan: &serde_json::Value) -> Result<(u32, u32, u32)> {
+    let (total, done, failed): (i64, i64, i64) = db.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN state = 'done' OR COALESCE(written, 0) != 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END), 0)
+         FROM exec_ops WHERE exec_id = ?1",
+        params![exec_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if total == 0 {
+        return Ok((plan_file_count(plan), 0, 0));
+    }
+    Ok((as_u32(total), as_u32(done), as_u32(failed)))
+}
+
+fn as_u32(value: i64) -> u32 {
+    u32::try_from(value).unwrap_or(0)
+}
+
+fn plan_file_count(plan: &serde_json::Value) -> u32 {
+    let Some(summary) = plan.get("summary") else {
+        return 0;
+    };
+    let move_count = summary
+        .get("moveCount")
+        .or_else(|| summary.get("move_count"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as u32;
+    ["create", "overwrite", "delete"]
+        .into_iter()
+        .map(|key| summary.get(key).and_then(|value| value.as_u64()).unwrap_or(0) as u32)
+        .sum::<u32>()
+        + move_count
+}
+
 pub fn pending(db: &Connection) -> Result<Vec<PendingTx>> {
     let mut stmt = db.prepare("SELECT exec_id, state, project_key, backup_root, plan_json FROM exec_journal WHERE state NOT IN ('COMMITTED','ROLLED_BACK')")?;
     let rows = stmt.query_map([], |r| {
@@ -5471,6 +5611,68 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn journal_runs_read_the_row_that_was_clicked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir.path().join("journal.sqlite")).unwrap();
+        db.execute(
+            "INSERT INTO exec_journal (exec_id, state, project_key, plan_json, started_at) VALUES (?1,?2,?3,?4,?5)",
+            params![
+                "local-1",
+                "COMMITTED",
+                "proj",
+                r#"{"projectRoot":"/work/order-center","remote":false,"summary":{"create":2,"overwrite":1,"moveCount":0,"delete":0}}"#,
+                100,
+            ],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO exec_journal (exec_id, state, project_key, plan_json, started_at) VALUES (?1,?2,?3,?4,?5)",
+            params!["snake-1", "PREPARED", "proj", r#"{"project_root":"/from-snake"}"#, 50],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO exec_journal (exec_id, state, project_key, plan_json, started_at) VALUES (?1,?2,?3,?4,?5)",
+            params!["remote-1", "STOPPED", "not-a-root", r#"{"remote":true}"#, 200],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO exec_ops (exec_id, op_index, op_json, state, written) VALUES (?1,1,'{}','done',1)",
+            params!["remote-1"],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO exec_ops (exec_id, op_index, op_json, state, written) VALUES (?1,2,'{}','failed',0)",
+            params!["remote-1"],
+        )
+        .unwrap();
+
+        let runs = list_journal_runs(&db).unwrap();
+        assert_eq!(runs.iter().map(|run| run.exec_id.as_str()).collect::<Vec<_>>(), vec!["remote-1", "local-1", "snake-1"]);
+        let remote = &runs[0];
+        assert_eq!(remote.status, "STOPPED");
+        assert_eq!(remote.started_at, 200);
+        assert!(remote.project_root.is_none());
+        assert!(remote.remote);
+        assert_eq!((remote.file_count, remote.done_count, remote.failed_count), (2, 1, 1));
+        assert_eq!(runs[1].project_root.as_deref(), Some("/work/order-center"));
+        assert!(!runs[1].remote);
+        assert_eq!((runs[1].file_count, runs[1].done_count, runs[1].failed_count), (3, 0, 0));
+        assert_eq!(runs[2].project_root.as_deref(), Some("/from-snake"));
+
+        db.execute("ALTER TABLE exec_journal ADD COLUMN project_root TEXT", []).unwrap();
+        db.execute("ALTER TABLE exec_journal ADD COLUMN remote INTEGER", []).unwrap();
+        db.execute(
+            "INSERT INTO exec_journal (exec_id, state, plan_json, started_at, project_root, remote) VALUES (?1,?2,?3,?4,?5,?6)",
+            params!["col-1", "COMMITTED", r#"{"projectRoot":"/from-plan","remote":true}"#, 300, "/from-column", 0],
+        )
+        .unwrap();
+        let runs = list_journal_runs(&db).unwrap();
+        let column = runs.iter().find(|run| run.exec_id == "col-1").unwrap();
+        assert_eq!(column.project_root.as_deref(), Some("/from-column"));
+        assert!(!column.remote);
     }
 
     #[cfg(feature = "fault-inject")]
