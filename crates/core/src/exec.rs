@@ -31,7 +31,7 @@ use crate::vfs::{now_ms, LocalFs};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -99,6 +99,70 @@ pub struct ConflictFile {
     pub detail: String,
 }
 
+/// 已写完的文件后来被改过。设计 21 的行标签。
+pub const DETAIL_MODIFIED: &str = "升级后被修改";
+/// 已写完的文件后来被删掉。
+pub const DETAIL_DELETED: &str = "升级后被删除";
+/// 记在原事务日志里的“当时是删除”状态。不是文件哈希。
+pub const KEPT_DELETED: &str = "deleted";
+
+/// 崩溃恢复后是否把 PREPARED / BACKED_UP / VERIFYING / LOG_FAILED 改写成 STOPPED。
+/// 架构师还没定。默认 false：保留原状态，靠白名单判断能不能继续。
+const REWRITE_RECOVERY_TO_STOPPED: bool = false;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeAdmission {
+    /// 可以继续升级。
+    Upgrade,
+    /// 只能接着回滚。
+    RollbackOnly,
+    /// 拒绝。
+    Reject,
+}
+
+/// 单一入口。改归一策略时只动 `REWRITE_RECOVERY_TO_STOPPED`。
+pub fn resume_admission(state: &str) -> ResumeAdmission {
+    match state {
+        "STOPPED" | "LOG_FAILED" | "PREPARED" | "BACKED_UP" | "VERIFYING" => ResumeAdmission::Upgrade,
+        "ROLLING_BACK" | "ROLLBACK_PARTIAL" => ResumeAdmission::RollbackOnly,
+        _ => ResumeAdmission::Reject,
+    }
+}
+
+pub fn resume_actions(state: &str) -> Vec<&'static str> {
+    match resume_admission(state) {
+        ResumeAdmission::Upgrade => vec!["继续", "回滚", "稍后处理"],
+        ResumeAdmission::RollbackOnly => vec!["继续回滚"],
+        ResumeAdmission::Reject => Vec::new(),
+    }
+}
+
+pub fn resume_conflict_title(files: &[ConflictFile]) -> String {
+    let n = files.len();
+    if files.iter().any(|f| f.detail == DETAIL_DELETED) {
+        format!("有 {n} 个已经写完的文件被改过或删除")
+    } else {
+        format!("有 {n} 个已经写完的文件被改过")
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeConflict {
+    pub title: String,
+    pub files: Vec<ConflictFile>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryOffer {
+    pub exec_id: String,
+    pub state: String,
+    pub pre_recovery_state: String,
+    pub actions: Vec<String>,
+    pub conflicts: Vec<ConflictFile>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChangeHit {
@@ -146,7 +210,30 @@ pub fn open_db(path: &Path) -> Result<Connection> {
             backup_available INTEGER
          );",
     )?;
+    ensure_column(&conn, "exec_ops", "written", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(&conn, "exec_ops", "kept_hash", "TEXT")?;
+    ensure_column(&conn, "exec_journal", "pre_recovery_state", "TEXT")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS exec_temps (
+            exec_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            PRIMARY KEY (exec_id, path)
+        );",
+    )?;
     Ok(conn)
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(());
+        }
+    }
+    conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])?;
+    Ok(())
 }
 
 pub fn detect_changes(fsys: &LocalFs, ops: &[PlanOp]) -> Result<Vec<ChangeHit>> {
@@ -197,6 +284,319 @@ pub fn detect_changes(fsys: &LocalFs, ops: &[PlanOp]) -> Result<Vec<ChangeHit>> 
     Ok(hits)
 }
 
+fn injected_panic(err: &Error) -> bool {
+    err.code == ErrorCode::Internal && err.message.starts_with("panic ")
+}
+
+struct OpRow {
+    state: String,
+    written: bool,
+    kept_hash: Option<String>,
+    after_hash: Option<String>,
+}
+
+fn load_rows(db: &Connection, exec_id: &str) -> Result<HashMap<u32, OpRow>> {
+    let mut stmt = db.prepare(
+        "SELECT op_index, state, COALESCE(written,0), kept_hash, after_hash FROM exec_ops WHERE exec_id=?1",
+    )?;
+    let rows = stmt.query_map(params![exec_id], |r| {
+        Ok((
+            r.get::<_, i64>(0)? as u32,
+            OpRow {
+                state: r.get(1)?,
+                written: r.get::<_, i64>(2)? != 0,
+                kept_hash: r.get(3)?,
+                after_hash: r.get(4)?,
+            },
+        ))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (index, op) = row?;
+        map.insert(index, op);
+    }
+    Ok(map)
+}
+
+fn remember_temp(db: &Connection, exec_id: &str, rel: &RelPath) -> Result<()> {
+    db.execute(
+        "INSERT OR REPLACE INTO exec_temps (exec_id, path) VALUES (?1,?2)",
+        params![exec_id, rel.as_str()],
+    )?;
+    Ok(())
+}
+
+fn forget_temp(db: &Connection, exec_id: &str, rel: &RelPath) -> Result<()> {
+    db.execute("DELETE FROM exec_temps WHERE exec_id=?1 AND path=?2", params![exec_id, rel.as_str()])?;
+    Ok(())
+}
+
+/// 写失败时删掉这次的临时文件。删掉了才从日志里消掉；删不掉就留着，崩溃恢复再试。
+fn discard_temp(fsys: &LocalFs, db: &Connection, exec_id: &str, rel: &RelPath) {
+    let _ = fsys.remove_path(rel);
+    if fsys.stat(rel).is_err() {
+        let _ = forget_temp(db, exec_id, rel);
+    }
+}
+
+pub fn recover_registered_temps(db: &Connection, fsys: &LocalFs, exec_id: &str) -> Result<Vec<String>> {
+    let mut stmt = db.prepare("SELECT path FROM exec_temps WHERE exec_id=?1")?;
+    let rows = stmt.query_map(params![exec_id], |r| r.get::<_, String>(0))?;
+    let mut removed = Vec::new();
+    for row in rows {
+        let path = row?;
+        let rel = RelPath::parse(&path)?;
+        if fsys.stat(&rel).is_ok() {
+            fsys.remove_path(&rel)?;
+            removed.push(path.clone());
+        }
+        db.execute("DELETE FROM exec_temps WHERE exec_id=?1 AND path=?2", params![exec_id, path])?;
+    }
+    Ok(removed)
+}
+
+fn mark_written(db: &Connection, exec_id: &str, index: u32) -> Result<()> {
+    db.execute(
+        "UPDATE exec_ops SET written=1 WHERE exec_id=?1 AND op_index=?2",
+        params![exec_id, index],
+    )?;
+    Ok(())
+}
+
+fn file_hash(path: &Path) -> Option<String> {
+    fs::read(path).ok().map(|b| sha256_hex(&b))
+}
+
+/// 备份还能用：哈希等于升级前快照，或者等于当前原文件。
+/// 和快照一致时，即使原文件后来被改过也不删，回滚还要靠它。
+/// 对不上快照、也对不上当前文件的，是坏备份，删掉。原文件已经不在时不删。
+fn backup_still_valid(fsys: &LocalFs, backup: &Path, rel: &RelPath, expect_hash: Option<&str>) -> Result<bool> {
+    let dest = backup.join("files").join(rel.as_str());
+    let Some(got) = file_hash(&dest) else {
+        return Ok(false);
+    };
+    if expect_hash.is_some_and(|expect| got == expect) {
+        return Ok(true);
+    }
+    let Ok(src) = fsys.hash(rel, true) else {
+        return Ok(false);
+    };
+    if got == src {
+        return Ok(true);
+    }
+    let _ = fs::remove_file(&dest);
+    Ok(false)
+}
+
+fn manifest_has(backup: &Path, path: &str) -> Result<bool> {
+    Ok(read_manifest(backup)?.iter().any(|v| v.get("path").and_then(|p| p.as_str()) == Some(path)))
+}
+
+fn backup_op(
+    db: &Connection,
+    fsys: &LocalFs,
+    plan: &ExecPlan,
+    backup: &Path,
+    op: &PlanOp,
+    fault: &mut FaultRuntime,
+) -> Result<()> {
+    if !needs_backup(op) {
+        return Ok(());
+    }
+    let rel = RelPath::parse(op.from.as_deref().unwrap_or(&op.path))?;
+    if fsys.stat(&rel).is_err() {
+        return Ok(());
+    }
+    let expect_hash = op.expect.as_ref().map(|s| s.hash.as_str());
+    if backup_still_valid(fsys, backup, &rel, expect_hash)? {
+        if !manifest_has(backup, rel.as_str())? {
+            append_manifest(
+                backup,
+                &json!({
+                    "execId": plan.id,
+                    "projectKey": plan.project_key,
+                    "index": op.index,
+                    "path": rel.as_str(),
+                    "backup": format!("files/{}", rel.as_str()),
+                }),
+            )?;
+        }
+        return Ok(());
+    }
+    if let Err(e) = fault.hit_file(Stage::Backup, op.index) {
+        return Err(real_code(e));
+    }
+    let dest = backup.join("files").join(rel.as_str());
+    fsys.copy_to(&rel, &dest)?;
+    if fault.backup_should_corrupt(op.index) {
+        flip_middle(&dest)?;
+    }
+    let expect = fsys.hash(&rel, true).unwrap_or_default();
+    let got = file_hash(&dest).unwrap_or_default();
+    if got != expect {
+        let _ = fs::remove_file(&dest);
+        return Err(Error::new(
+            ErrorCode::VerifyFailed,
+            format!("{} 的备份和原文件哈希不一致，原文件未改", rel.as_str()),
+        ));
+    }
+    append_manifest(
+        backup,
+        &json!({
+            "execId": plan.id,
+            "projectKey": plan.project_key,
+            "index": op.index,
+            "path": rel.as_str(),
+            "backup": format!("files/{}", rel.as_str()),
+        }),
+    )?;
+    let _ = db;
+    Ok(())
+}
+
+fn observed_state(db: &Connection, exec_id: &str) -> Result<String> {
+    let state: String = db.query_row(
+        "SELECT state FROM exec_journal WHERE exec_id=?1",
+        params![exec_id],
+        |r| r.get(0),
+    )?;
+    Ok(state)
+}
+
+fn settle_recovery_state(current: &str) -> &'static str {
+    if REWRITE_RECOVERY_TO_STOPPED && matches!(current, "PREPARED" | "BACKED_UP" | "VERIFYING" | "LOG_FAILED") {
+        "STOPPED"
+    } else {
+        match current {
+            "PREPARED" => "PREPARED",
+            "BACKED_UP" => "BACKED_UP",
+            "VERIFYING" => "VERIFYING",
+            "LOG_FAILED" => "LOG_FAILED",
+            "STOPPED" => "STOPPED",
+            "ROLLING_BACK" => "ROLLING_BACK",
+            "ROLLBACK_PARTIAL" => "ROLLBACK_PARTIAL",
+            "COMMITTED" => "COMMITTED",
+            "ROLLED_BACK" => "ROLLED_BACK",
+            _ => "STOPPED",
+        }
+    }
+}
+
+fn note_pre_recovery(db: &Connection, exec_id: &str, observed: &str) -> Result<String> {
+    let next = settle_recovery_state(observed);
+    db.execute(
+        "UPDATE exec_journal SET pre_recovery_state=COALESCE(pre_recovery_state, ?2), state=?3 WHERE exec_id=?1",
+        params![exec_id, observed, next],
+    )?;
+    Ok(next.to_string())
+}
+
+fn probe_log_write(db: &Connection) -> Result<()> {
+    db.execute_batch("CREATE TABLE IF NOT EXISTS exec_log_probe (id INTEGER PRIMARY KEY, note TEXT);")
+        .map_err(|e| Error::new(ErrorCode::LogWrite, e.to_string()))?;
+    db.execute("INSERT INTO exec_log_probe (note) VALUES ('probe')", [])
+        .map_err(|e| Error::new(ErrorCode::LogWrite, e.to_string()))?;
+    db.execute("DELETE FROM exec_log_probe", [])
+        .map_err(|e| Error::new(ErrorCode::LogWrite, e.to_string()))?;
+    Ok(())
+}
+
+enum WriteGuess {
+    Written,
+    NotWritten,
+    Conflict(ConflictFile),
+}
+
+fn guess_written(fsys: &LocalFs, backup: &Path, op: &PlanOp) -> Result<WriteGuess> {
+    let target_rel = RelPath::parse(&op.path)?;
+    let target_hash = op.bytes.as_ref().map(|b| sha256_hex(b));
+    let expect_hash = op.expect.as_ref().map(|s| s.hash.clone());
+    let current = fsys.hash(&target_rel, true).ok();
+    let source = op.from.as_deref().unwrap_or(op.path.as_str());
+    let bak = file_hash(&backup.join("files").join(source));
+    if let (Some(cur), Some(target)) = (&current, &target_hash) {
+        if cur == target {
+            return Ok(WriteGuess::Written);
+        }
+    }
+    if let (Some(cur), Some(expect)) = (&current, &expect_hash) {
+        if cur == expect {
+            return Ok(WriteGuess::NotWritten);
+        }
+    }
+    if let (Some(cur), Some(bak)) = (&current, &bak) {
+        if cur == bak {
+            return Ok(WriteGuess::NotWritten);
+        }
+    }
+    if current.is_none() && matches!(op.kind, OpKind::Create) {
+        return Ok(WriteGuess::NotWritten);
+    }
+    if current.is_none() {
+        return Ok(WriteGuess::Conflict(ConflictFile {
+            path: op.path.clone(),
+            detail: DETAIL_DELETED.into(),
+        }));
+    }
+    Ok(WriteGuess::Conflict(ConflictFile {
+        path: op.path.clone(),
+        detail: "无法判断是否已经写入".into(),
+    }))
+}
+
+fn op_touched(row: &OpRow) -> bool {
+    row.written || row.state == "done" || row.state == "doing"
+}
+
+/// 启动时的崩溃恢复。不按文件名扫临时文件。原状态默认保留，并记下恢复前的状态。
+pub fn recover_on_startup(db: &Connection, fsys: &LocalFs) -> Result<Vec<RecoveryOffer>> {
+    let mut stmt = db.prepare("SELECT exec_id, state, plan_json, backup_root FROM exec_journal")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut offers = Vec::new();
+    for row in rows {
+        let (exec_id, state, plan_json, backup_root) = row?;
+        if matches!(resume_admission(&state), ResumeAdmission::Reject) {
+            continue;
+        }
+        let kept = note_pre_recovery(db, &exec_id, &state)?;
+        let _ = recover_registered_temps(db, fsys, &exec_id)?;
+        let mut conflicts = Vec::new();
+        if resume_admission(&kept) == ResumeAdmission::Upgrade {
+            if let Ok(plan) = serde_json::from_str::<ExecPlan>(&plan_json) {
+                let progress = load_rows(db, &exec_id)?;
+                let backup = PathBuf::from(&backup_root);
+                for op in &plan.ops {
+                    let Some(row) = progress.get(&op.index) else { continue };
+                    // 只有 doing 的日志不完整。failed 且 written=0 表示这次写入没有落地。
+                    if row.state != "doing" || row.written {
+                        continue;
+                    }
+                    match guess_written(fsys, &backup, op)? {
+                        WriteGuess::Written => mark_written(db, &exec_id, op.index)?,
+                        WriteGuess::NotWritten => {}
+                        WriteGuess::Conflict(c) => conflicts.push(c),
+                    }
+                }
+            }
+        }
+        offers.push(RecoveryOffer {
+            exec_id,
+            state: kept.clone(),
+            pre_recovery_state: state,
+            actions: resume_actions(&kept).into_iter().map(|s| s.to_string()).collect(),
+            conflicts,
+        });
+    }
+    Ok(offers)
+}
+
 pub fn execute(db: &Connection, fsys: &LocalFs, plan: &ExecPlan, opts: &ExecOpts, fault: FaultPlan) -> Result<ExecReport> {
     #[cfg(feature = "fault-inject")]
     if !opts.remote && fault.items.iter().any(|i| matches!(i, crate::fault::Item::At { stage: Stage::SftpDisconnect, .. })) {
@@ -230,39 +630,8 @@ pub fn execute(db: &Connection, fsys: &LocalFs, plan: &ExecPlan, opts: &ExecOpts
     }
 
     for op in &plan.ops {
-        if needs_backup(op) {
-            if let Err(e) = fault.hit_file(Stage::Backup, op.index) {
-                return finish_stopped(db, plan, &backup, files, op, &real_code(e));
-            }
-            let rel = RelPath::parse(op.from.as_deref().unwrap_or(&op.path))?;
-            if fsys.stat(&rel).is_ok() {
-                let dest = backup.join("files").join(rel.as_str());
-                if let Err(e) = fsys.copy_to(&rel, &dest) {
-                    return finish_stopped(db, plan, &backup, files, op, &real_code(e));
-                }
-                if fault.backup_should_corrupt(op.index) {
-                    if let Err(e) = flip_middle(&dest) {
-                        return finish_stopped(db, plan, &backup, files, op, &real_code(e));
-                    }
-                }
-                let expect = fsys.hash(&rel, true).unwrap_or_default();
-                let got = sha256_hex(&fs::read(&dest).unwrap_or_default());
-                if got != expect {
-                    let err = Error::new(ErrorCode::VerifyFailed, format!("{} 的备份和原文件哈希不一致，原文件未改", rel.as_str()));
-                    return finish_stopped(db, plan, &backup, files, op, &err);
-                }
-                let entry = json!({
-                    "execId": plan.id,
-                    "projectKey": plan.project_key,
-                    "index": op.index,
-                    "path": rel.as_str(),
-                    "backup": format!("files/{}", rel.as_str()),
-                });
-                // 每备份一个文件就追加一行。中途崩溃时，前面已经 fsync 的行仍然可读。
-                if let Err(e) = append_manifest(&backup, &entry) {
-                    return finish_stopped(db, plan, &backup, files, op, &real_code(e));
-                }
-            }
+        if let Err(e) = backup_op(db, fsys, plan, &backup, op, &mut fault) {
+            return finish_stopped(db, plan, &backup, files, op, &real_code(e));
         }
     }
     log_write(db, &mut fault, &plan.id, "backed_up", || {
@@ -287,7 +656,7 @@ pub fn execute(db: &Connection, fsys: &LocalFs, plan: &ExecPlan, opts: &ExecOpts
             files.push(fr(op, "doing", None, None));
             return Ok(partial(plan, &backup, "BACKED_UP", files, true));
         }
-        let res = apply_one(fsys, op, opts, &mut fault, &mut recorded_temps);
+        let res = apply_one(db, &plan.id, fsys, op, opts, &mut fault, &mut recorded_temps);
         match res {
             Ok(()) => {
                 let done = format!("done:{}", op.index);
@@ -307,7 +676,7 @@ pub fn execute(db: &Connection, fsys: &LocalFs, plan: &ExecPlan, opts: &ExecOpts
                     return Ok(partial(plan, &backup, "BACKED_UP", files, true));
                 }
             }
-            Err(e) if e.code == ErrorCode::LogWrite => {
+            Err(e) if e.code == ErrorCode::LogWrite || injected_panic(&e) => {
                 return Err(e);
             }
             Err(e) => {
@@ -321,6 +690,9 @@ pub fn execute(db: &Connection, fsys: &LocalFs, plan: &ExecPlan, opts: &ExecOpts
         db.execute("UPDATE exec_journal SET state='VERIFYING' WHERE exec_id=?1", params![plan.id])?;
         Ok(())
     })?;
+    if stop(opts, "verifying") {
+        return Ok(partial(plan, &backup, "VERIFYING", files, true));
+    }
     for op in &plan.ops {
         if !will_apply(op, opts.allow_readonly) {
             continue;
@@ -339,6 +711,9 @@ pub fn execute(db: &Connection, fsys: &LocalFs, plan: &ExecPlan, opts: &ExecOpts
         }
     }
     if let Err(e) = fault.hit_commit() {
+        if injected_panic(&e) {
+            return Err(e);
+        }
         let err = Error::new(ErrorCode::LogWrite, e.message);
         let _ = db.execute("UPDATE exec_journal SET state='LOG_FAILED' WHERE exec_id=?1", params![plan.id]);
         return Err(err);
@@ -356,7 +731,15 @@ pub fn execute(db: &Connection, fsys: &LocalFs, plan: &ExecPlan, opts: &ExecOpts
     Ok(base_report(&plan.id, "COMMITTED", files, &backup, false, "成功", false))
 }
 
-fn apply_one(fsys: &LocalFs, op: &PlanOp, opts: &ExecOpts, fault: &mut FaultRuntime, temps: &mut Vec<RelPath>) -> Result<()> {
+fn apply_one(
+    db: &Connection,
+    exec_id: &str,
+    fsys: &LocalFs,
+    op: &PlanOp,
+    opts: &ExecOpts,
+    fault: &mut FaultRuntime,
+    temps: &mut Vec<RelPath>,
+) -> Result<()> {
     if opts.remote {
         if let Err(e) = fault.hit_file(Stage::SftpDisconnect, op.index) {
             return Err(real_code(e));
@@ -383,7 +766,7 @@ fn apply_one(fsys: &LocalFs, op: &PlanOp, opts: &ExecOpts, fault: &mut FaultRunt
             if restore {
                 fsys.set_readonly(&dest, false)?;
             }
-            let wrote = write_one(fsys, op, opts, fault, temps, &dest, &bytes);
+            let wrote = write_one(db, exec_id, fsys, op, opts, fault, temps, &dest, &bytes);
             if wrote.is_err() && restore {
                 fsys.set_readonly(&dest, true)?;
             }
@@ -392,10 +775,30 @@ fn apply_one(fsys: &LocalFs, op: &PlanOp, opts: &ExecOpts, fault: &mut FaultRunt
     }
 }
 
-fn write_one(fsys: &LocalFs, op: &PlanOp, opts: &ExecOpts, fault: &mut FaultRuntime, temps: &mut Vec<RelPath>, dest: &RelPath, bytes: &[u8]) -> Result<()> {
-    fault.hit_file(Stage::Write, op.index).map_err(real_code)?;
+fn write_one(
+    db: &Connection,
+    exec_id: &str,
+    fsys: &LocalFs,
+    op: &PlanOp,
+    opts: &ExecOpts,
+    fault: &mut FaultRuntime,
+    temps: &mut Vec<RelPath>,
+    dest: &RelPath,
+    bytes: &[u8],
+) -> Result<()> {
+    if let Err(e) = fault.hit_file(Stage::Write, op.index) {
+        return Err(real_code(e));
+    }
     let tmp = fsys.write_temp(dest, bytes)?;
+    remember_temp(db, exec_id, &tmp)?;
     temps.push(tmp.clone());
+    let bail = |e: Error| -> Result<()> {
+        if injected_panic(&e) {
+            return Err(e);
+        }
+        discard_temp(fsys, db, exec_id, &tmp);
+        Err(e)
+    };
     #[cfg(any(test, feature = "fault-inject"))]
     if opts.corrupt_temp {
         let p = fsys.abs(&tmp)?;
@@ -404,29 +807,27 @@ fn write_one(fsys: &LocalFs, op: &PlanOp, opts: &ExecOpts, fault: &mut FaultRunt
         fs::write(&p, &data)?;
     }
     if let Err(e) = fault.hit_file(Stage::VerifyPre, op.index) {
-        let _ = fsys.remove_path(&tmp);
-        return Err(real_code(e));
+        return bail(real_code(e));
     }
     let got = fsys.read_temp_hash(&tmp)?;
     let expect = sha256_hex(bytes);
     if got != expect {
-        fsys.remove_path(&tmp)?;
-        return Err(Error::new(ErrorCode::VerifyFailed, format!("{} 临时文件校验失败，原文件未改", op.path)));
+        return bail(Error::new(ErrorCode::VerifyFailed, format!("{} 临时文件校验失败，原文件未改", op.path)));
     }
     if let Some(mode) = op.mode {
         if let Err(e) = fsys.set_meta(&tmp, Some(mode), None) {
-            let _ = fsys.remove_path(&tmp);
-            return Err(e);
+            return bail(e);
         }
     }
     if let Err(e) = fault.hit_file(Stage::Rename, op.index) {
-        let _ = fsys.remove_path(&tmp);
-        return Err(real_code(e));
+        return bail(real_code(e));
     }
     if let Err(e) = fsys.rename_over(&tmp, dest) {
-        let _ = fsys.remove_path(&tmp);
-        return Err(e);
+        return bail(e);
     }
+    forget_temp(db, exec_id, &tmp)?;
+    // 改名已经落地。后面的步骤失败也要能回滚这个文件。
+    mark_written(db, exec_id, op.index)?;
     if !op.merged {
         if let Some(ms) = op.source_mtime_ms {
             fsys.set_meta(dest, None, Some(ms))?;
@@ -723,6 +1124,10 @@ pub fn rollback_conflict_error(files: &[ConflictFile]) -> Option<Error> {
 
 fn log_write<F: FnOnce() -> Result<()>>(db: &Connection, fault: &mut FaultRuntime, exec_id: &str, _label: &str, f: F) -> Result<()> {
     if let Err(e) = fault.hit_log() {
+        // panic 是进程中断，停在上一次成功的日志，不改成 LOG_FAILED，错误码是 E_INTERNAL。
+        if injected_panic(&e) {
+            return Err(e);
+        }
         let err = Error::new(ErrorCode::LogWrite, format!("事务日志写入失败：{}", e.message));
         let _ = db.execute("UPDATE exec_journal SET state='LOG_FAILED' WHERE exec_id=?1", params![exec_id]);
         return Err(err);
@@ -804,14 +1209,14 @@ pub fn rollback(db: &Connection, fsys: &LocalFs, exec_id: &str, choice: Rollback
     let backup = PathBuf::from(&backup);
     db.execute("UPDATE exec_journal SET state='ROLLING_BACK' WHERE exec_id=?1", params![exec_id])?;
     let conflicts = rollback_conflicts(fsys, db, exec_id, &plan)?;
-    let states = load_op_states(db, exec_id)?;
+    let states = load_rows(db, exec_id)?;
     let mut fault = FaultRuntime::new(fault);
     let mut files = Vec::new();
     let mut any_fail = false;
-    // 只动已经写过（done）或写到一半（doing）的操作。未执行的 Create 不能删目标。
+    // 已写入的文件都要还原，包括改名之后才失败、状态被标成 failed 的。未执行的 Create 不能删目标。
     for op in plan.ops.iter().rev() {
-        let state = states.get(&op.index).map(|s| s.as_str()).unwrap_or("pending");
-        if state != "done" && state != "doing" {
+        let Some(row) = states.get(&op.index) else { continue };
+        if !op_touched(row) {
             continue;
         }
         if conflicts.iter().any(|c| c.path == op.path) && choice == RollbackChoice::SkipConflicts {
@@ -868,17 +1273,6 @@ pub fn rollback(db: &Connection, fsys: &LocalFs, exec_id: &str, choice: Rollback
     Ok(base_report(exec_id, state, files, &backup, false, history_result, false))
 }
 
-fn load_op_states(db: &Connection, exec_id: &str) -> Result<HashMap<u32, String>> {
-    let mut stmt = db.prepare("SELECT op_index, state FROM exec_ops WHERE exec_id=?1")?;
-    let rows = stmt.query_map(params![exec_id], |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, String>(1)?)))?;
-    let mut map = HashMap::new();
-    for row in rows {
-        let (index, state) = row?;
-        map.insert(index, state);
-    }
-    Ok(map)
-}
-
 fn restore_one(fsys: &LocalFs, backup: &Path, op: &PlanOp) -> Result<()> {
     match op.kind {
         OpKind::Create => {
@@ -910,17 +1304,17 @@ fn restore_one(fsys: &LocalFs, backup: &Path, op: &PlanOp) -> Result<()> {
                 }
             } else if let Some(from) = &op.from {
                 let src_rel = RelPath::parse(from)?;
-                if fsys.stat(&to).is_ok() {
-                    // 移回
+                let src = backup.join("files").join(from);
+                if src.is_file() {
+                    fsys.copy_in_atomic(&src, &src_rel, op.mode, None)?;
+                    if fsys.stat(&to).is_ok() {
+                        fsys.remove_path(&to)?;
+                    }
+                } else if fsys.stat(&to).is_ok() {
                     let data = fsys.read(&to)?;
                     let tmp = fsys.write_temp(&src_rel, &data)?;
                     fsys.rename_over(&tmp, &src_rel)?;
                     fsys.remove_path(&to)?;
-                } else {
-                    let src = backup.join("files").join(from);
-                    if src.exists() {
-                        fsys.copy_in_atomic(&src, &src_rel, op.mode, None)?;
-                    }
                 }
             }
             Ok(())
@@ -929,33 +1323,43 @@ fn restore_one(fsys: &LocalFs, backup: &Path, op: &PlanOp) -> Result<()> {
 }
 
 pub fn rollback_conflicts(fsys: &LocalFs, db: &Connection, exec_id: &str, plan: &ExecPlan) -> Result<Vec<ConflictFile>> {
-    let states = load_op_states(db, exec_id)?;
+    let states = load_rows(db, exec_id)?;
     let mut out = Vec::new();
     for op in &plan.ops {
-        let state = states.get(&op.index).map(|s| s.as_str()).unwrap_or("pending");
-        if state != "done" && state != "doing" {
+        let Some(row) = states.get(&op.index) else { continue };
+        if !op_touched(row) {
             continue;
         }
-        if op.bytes.is_none() { continue; }
-        let rel = RelPath::parse(&op.path)?;
-        let Ok(hash) = fsys.hash(&rel, true) else { continue };
-        let after: Option<String> = db
-            .query_row(
-                "SELECT after_hash FROM exec_ops WHERE exec_id=?1 AND op_index=?2",
-                params![exec_id, op.index],
-                |r| r.get(0),
-            )
-            .ok();
-        let wrote = sha256_hex(op.bytes.as_deref().unwrap_or_default());
-        let expect = after.unwrap_or(wrote);
-        if hash != expect {
-            out.push(ConflictFile {
-                path: op.path.clone(),
-                detail: "升级后又被改过".into(),
-            });
+        if let Some(hit) = written_file_conflict(fsys, op, row)? {
+            out.push(hit);
         }
     }
     Ok(out)
+}
+
+/// 和当初写下去的内容比。接受过的外部删除或外部哈希不拿来抵消回滚冲突。
+fn written_file_conflict(fsys: &LocalFs, op: &PlanOp, row: &OpRow) -> Result<Option<ConflictFile>> {
+    if op.bytes.is_none() && !row.written && row.state != "done" {
+        return Ok(None);
+    }
+    let rel = RelPath::parse(&op.path)?;
+    let wrote = row.after_hash.clone().or_else(|| op.bytes.as_ref().map(|b| sha256_hex(b)));
+    match fsys.hash(&rel, true) {
+        Ok(hash) => {
+            if let Some(expect) = wrote {
+                if hash != expect {
+                    return Ok(Some(ConflictFile { path: op.path.clone(), detail: DETAIL_MODIFIED.into() }));
+                }
+            }
+            Ok(None)
+        }
+        Err(_) => {
+            if wrote.is_some() || row.written || row.kept_hash.as_deref() == Some(KEPT_DELETED) {
+                return Ok(Some(ConflictFile { path: op.path.clone(), detail: DETAIL_DELETED.into() }));
+            }
+            Ok(None)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -963,10 +1367,16 @@ pub fn rollback_conflicts(fsys: &LocalFs, db: &Connection, exec_id: &str, plan: 
 pub enum ResumeChoice {
     /// 什么都不改，下次启动再提示。
     Cancel,
+    /// 点「继续」。有未处理冲突就只返回清单，不写文件。
+    Continue,
     /// 已写文件被外部改过时：不碰这些文件，从失败处接着写，并让以后的回滚把它们当冲突。
     KeepExternal,
     /// 进入已有的三选一回滚流程。这里不改文件。
     Rollback,
+    /// 还没写的文件在扫描后变了：跳过这些文件。
+    SkipChanged,
+    /// 还没写的文件在扫描后变了：仍然覆盖。
+    OverwriteChanged,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -974,14 +1384,72 @@ pub enum ResumeChoice {
 pub enum ResumeOutcome {
     Unchanged,
     Continued(ExecReport),
-    RollbackPrompt(Vec<ConflictFile>),
+    RollbackPrompt(ResumeConflict),
+    /// 失败文件或还没写的文件在扫描后又变了。选择前不写这些文件。
+    ChangesSinceScan(Vec<ChangeHit>),
 }
 
 /// 用原来的事务和原来的备份继续。不新开事务，这样回滚仍覆盖前后两次写过的文件。
+fn resume_seen_conflict(fsys: &LocalFs, op: &PlanOp, row: &OpRow) -> Result<Option<ConflictFile>> {
+    if row.state != "done" && !row.written {
+        return Ok(None);
+    }
+    let rel = RelPath::parse(&op.path)?;
+    let current = fsys.hash(&rel, true).ok();
+    if let Some(kept) = &row.kept_hash {
+        if kept == KEPT_DELETED {
+            return Ok(if current.is_none() {
+                None
+            } else {
+                Some(ConflictFile { path: op.path.clone(), detail: DETAIL_MODIFIED.into() })
+            });
+        }
+        return Ok(match current {
+            None => Some(ConflictFile { path: op.path.clone(), detail: DETAIL_DELETED.into() }),
+            Some(h) if &h == kept => None,
+            Some(_) => Some(ConflictFile { path: op.path.clone(), detail: DETAIL_MODIFIED.into() }),
+        });
+    }
+    let expect = row.after_hash.clone().or_else(|| op.bytes.as_ref().map(|b| sha256_hex(b)));
+    Ok(match (current, expect) {
+        (None, Some(_)) => Some(ConflictFile { path: op.path.clone(), detail: DETAIL_DELETED.into() }),
+        (Some(h), Some(e)) if h != e => Some(ConflictFile { path: op.path.clone(), detail: DETAIL_MODIFIED.into() }),
+        _ => None,
+    })
+}
+
+fn record_kept(db: &Connection, fsys: &LocalFs, exec_id: &str, op: &PlanOp) -> Result<()> {
+    let rel = RelPath::parse(&op.path)?;
+    let (kept, detail) = match fsys.hash(&rel, true) {
+        Ok(h) => (h, DETAIL_MODIFIED),
+        Err(_) => (KEPT_DELETED.to_string(), DETAIL_DELETED),
+    };
+    db.execute(
+        "UPDATE exec_ops SET kept_hash=?3, code='E_CHANGED_SINCE_SCAN', error=?4, rollback_state='conflict' WHERE exec_id=?1 AND op_index=?2",
+        params![exec_id, op.index, kept, detail],
+    )?;
+    Ok(())
+}
+
 pub fn resume(db: &Connection, fsys: &LocalFs, exec_id: &str, choice: ResumeChoice, opts: &ExecOpts, fault: FaultPlan) -> Result<ResumeOutcome> {
     if choice == ResumeChoice::Cancel {
         return Ok(ResumeOutcome::Unchanged);
     }
+    let observed = observed_state(db, exec_id)?;
+    match resume_admission(&observed) {
+        ResumeAdmission::Reject => {
+            return Err(Error::new(ErrorCode::Internal, "这次升级已经结束，不能继续"));
+        }
+        ResumeAdmission::RollbackOnly => {
+            return Err(Error::new(ErrorCode::Internal, "这次只能继续回滚，不能继续升级"));
+        }
+        ResumeAdmission::Upgrade => {}
+    }
+    if observed == "LOG_FAILED" {
+        probe_log_write(db)?;
+    }
+    note_pre_recovery(db, exec_id, &observed)?;
+    recover_registered_temps(db, fsys, exec_id)?;
     let (plan_json, backup): (String, String) = {
         let mut stmt = db.prepare("SELECT plan_json, backup_root FROM exec_journal WHERE exec_id=?1")?;
         stmt.query_row(params![exec_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
@@ -991,74 +1459,141 @@ pub fn resume(db: &Connection, fsys: &LocalFs, exec_id: &str, choice: ResumeChoi
         return Err(Error::new(ErrorCode::Internal, "事务 id 和计划不一致"));
     }
     let backup = PathBuf::from(backup);
-    let states = load_op_states(db, exec_id)?;
-    let mut external = Vec::new();
-    for op in &plan.ops {
-        if states.get(&op.index).map(|s| s.as_str()) != Some("done") {
-            continue;
-        }
-        let Some(bytes) = &op.bytes else { continue };
-        let rel = RelPath::parse(&op.path)?;
-        let Ok(hash) = fsys.hash(&rel, true) else { continue };
-        let after: Option<String> = db
-            .query_row(
-                "SELECT after_hash FROM exec_ops WHERE exec_id=?1 AND op_index=?2",
-                params![exec_id, op.index],
-                |r| r.get(0),
-            )
-            .ok();
-        let expect = after.unwrap_or_else(|| sha256_hex(bytes));
-        if hash != expect {
-            external.push(ConflictFile { path: op.path.clone(), detail: "升级后被改过".into() });
-        }
-    }
-    if !external.is_empty() && choice == ResumeChoice::Rollback {
-        return Ok(ResumeOutcome::RollbackPrompt(external));
-    }
-    if !external.is_empty() && choice == ResumeChoice::KeepExternal {
+    let mut recovery_conflicts = Vec::new();
+    {
+        let progress = load_rows(db, exec_id)?;
         for op in &plan.ops {
-            if external.iter().any(|c| c.path == op.path) {
-                db.execute(
-                    "UPDATE exec_ops SET code='E_CHANGED_SINCE_SCAN', error='升级后被改过', rollback_state='conflict' WHERE exec_id=?1 AND op_index=?2",
-                    params![exec_id, op.index],
-                )?;
+            let Some(row) = progress.get(&op.index) else { continue };
+            if row.state != "doing" || row.written {
+                continue;
+            }
+            match guess_written(fsys, &backup, op)? {
+                WriteGuess::Written => mark_written(db, exec_id, op.index)?,
+                WriteGuess::NotWritten => {}
+                WriteGuess::Conflict(c) => recovery_conflicts.push(c),
+            }
+        }
+    }
+    let states = load_rows(db, exec_id)?;
+    let mut external = recovery_conflicts;
+    for op in &plan.ops {
+        let Some(row) = states.get(&op.index) else { continue };
+        if let Some(hit) = resume_seen_conflict(fsys, op, row)? {
+            if !external.iter().any(|c| c.path == hit.path) {
+                external.push(hit);
             }
         }
     }
     if choice == ResumeChoice::Rollback {
-        let conflicts = rollback_conflicts(fsys, db, exec_id, &plan)?;
-        return Ok(ResumeOutcome::RollbackPrompt(conflicts));
+        if external.is_empty() {
+            external = rollback_conflicts(fsys, db, exec_id, &plan)?;
+        }
+        return Ok(ResumeOutcome::RollbackPrompt(ResumeConflict {
+            title: resume_conflict_title(&external),
+            files: external,
+        }));
     }
-    let report = continue_same_transaction(db, fsys, &plan, &backup, opts, fault)?;
-    Ok(ResumeOutcome::Continued(report))
-}
-
-fn continue_same_transaction(db: &Connection, fsys: &LocalFs, plan: &ExecPlan, backup: &Path, opts: &ExecOpts, fault: FaultPlan) -> Result<ExecReport> {
-    let mut fault = FaultRuntime::new(fault);
-    let states = load_op_states(db, &plan.id)?;
+    let states = load_rows(db, exec_id)?;
     let remaining: Vec<PlanOp> = plan
         .ops
         .iter()
         .filter(|op| {
-            let st = states.get(&op.index).map(|s| s.as_str()).unwrap_or("pending");
-            st != "done" && st != "skipped"
+            let Some(row) = states.get(&op.index) else { return true };
+            row.state != "done" && row.state != "skipped" && row.kept_hash.is_none() && !row.written
         })
         .cloned()
         .collect();
-    let _hits = detect_changes(fsys, &remaining)?;
+    let hits = detect_changes(fsys, &remaining)?;
+    if choice == ResumeChoice::Continue && !external.is_empty() {
+        return Ok(ResumeOutcome::RollbackPrompt(ResumeConflict {
+            title: resume_conflict_title(&external),
+            files: external,
+        }));
+    }
+    if !hits.is_empty() && matches!(choice, ResumeChoice::Continue | ResumeChoice::KeepExternal) {
+        return Ok(ResumeOutcome::ChangesSinceScan(hits));
+    }
+    let accepting = matches!(
+        choice,
+        ResumeChoice::KeepExternal | ResumeChoice::SkipChanged | ResumeChoice::OverwriteChanged
+    );
+    if !external.is_empty() && accepting {
+        for op in &plan.ops {
+            if external.iter().any(|c| c.path == op.path) {
+                record_kept(db, fsys, exec_id, op)?;
+            }
+        }
+    }
+    let report = continue_same_transaction(db, fsys, &plan, &backup, opts, fault, choice, &hits)?;
+    Ok(ResumeOutcome::Continued(report))
+}
+
+fn continue_same_transaction(
+    db: &Connection,
+    fsys: &LocalFs,
+    plan: &ExecPlan,
+    backup: &Path,
+    opts: &ExecOpts,
+    fault: FaultPlan,
+    choice: ResumeChoice,
+    hits: &[ChangeHit],
+) -> Result<ExecReport> {
+    let mut fault = FaultRuntime::new(fault);
+    let states = load_rows(db, &plan.id)?;
+    let skip_paths: HashSet<&str> = if choice == ResumeChoice::SkipChanged {
+        hits.iter().map(|h| h.path.as_str()).collect()
+    } else {
+        HashSet::new()
+    };
     let mut files = Vec::new();
     for op in &plan.ops {
-        let st = states.get(&op.index).map(|s| s.as_str()).unwrap_or("pending");
-        if st == "done" {
+        let Some(row) = states.get(&op.index) else { continue };
+        if row.kept_hash.is_some() {
+            files.push(fr(op, "done", Some("E_CHANGED_SINCE_SCAN"), None));
+        } else if row.state == "done" {
             files.push(fr(op, "done", None, None));
-        } else if st == "skipped" {
+        } else if row.state == "skipped" {
             files.push(fr(op, "skipped", Some("E_PERMISSION"), Some("跳过（只读）")));
         }
     }
+    // 先把还没备份、并且这次真的要写的文件补上，校验通过才往下写。
+    for op in &plan.ops {
+        if !will_resume_write(&states, op, opts, &skip_paths) {
+            continue;
+        }
+        if let Err(e) = backup_op(db, fsys, plan, backup, op, &mut fault) {
+            if e.code == ErrorCode::LogWrite || injected_panic(&e) {
+                return Err(e);
+            }
+            return finish_stopped(db, plan, backup, files, op, &real_code(e));
+        }
+    }
+    log_write(db, &mut fault, &plan.id, "backed_up", || {
+        db.execute("UPDATE exec_journal SET state='BACKED_UP' WHERE exec_id=?1", params![plan.id])?;
+        Ok(())
+    })?;
+    if stop(opts, "backed_up") {
+        return Ok(partial(plan, backup, "BACKED_UP", files, true));
+    }
+
     let mut temps = Vec::new();
     for op in &plan.ops {
-        let st = states.get(&op.index).map(|s| s.as_str()).unwrap_or("pending");
-        if st == "done" || st == "skipped" {
+        let row = states.get(&op.index);
+        if let Some(row) = row {
+            if row.kept_hash.is_some() || row.state == "done" || row.state == "skipped" {
+                continue;
+            }
+            if row.written {
+                set_op(db, &plan.id, op.index, "done", None, None)?;
+                if !files.iter().any(|f| f.index == op.index) {
+                    files.push(fr(op, "done", None, None));
+                }
+                continue;
+            }
+        }
+        if skip_paths.contains(op.path.as_str()) {
+            set_op(db, &plan.id, op.index, "skipped", Some("扫描后内容已变，按选择跳过"), Some("E_CHANGED_SINCE_SCAN"))?;
+            files.push(fr(op, "skipped", Some("E_CHANGED_SINCE_SCAN"), Some("扫描后内容已变，按选择跳过")));
             continue;
         }
         if !will_apply(op, opts.allow_readonly) {
@@ -1068,7 +1603,11 @@ fn continue_same_transaction(db: &Connection, fsys: &LocalFs, plan: &ExecPlan, b
         }
         let doing = format!("doing:{}", op.index);
         log_write(db, &mut fault, &plan.id, &doing, || set_op(db, &plan.id, op.index, "doing", None, None))?;
-        match apply_one(fsys, op, opts, &mut fault, &mut temps) {
+        if stop(opts, &doing) {
+            files.push(fr(op, "doing", None, None));
+            return Ok(partial(plan, backup, "BACKED_UP", files, true));
+        }
+        match apply_one(db, &plan.id, fsys, op, opts, &mut fault, &mut temps) {
             Ok(()) => {
                 let done = format!("done:{}", op.index);
                 let wrote = op.bytes.as_ref().map(|b| sha256_hex(b));
@@ -1083,10 +1622,20 @@ fn continue_same_transaction(db: &Connection, fsys: &LocalFs, plan: &ExecPlan, b
                     Ok(())
                 })?;
                 files.push(fr(op, "done", None, None));
+                if stop(opts, &done) {
+                    return Ok(partial(plan, backup, "BACKED_UP", files, true));
+                }
             }
-            Err(e) if e.code == ErrorCode::LogWrite => return Err(e),
+            Err(e) if e.code == ErrorCode::LogWrite || injected_panic(&e) => return Err(e),
             Err(e) => return finish_stopped(db, plan, backup, files, op, &real_code(e)),
         }
+    }
+    log_write(db, &mut fault, &plan.id, "verifying", || {
+        db.execute("UPDATE exec_journal SET state='VERIFYING' WHERE exec_id=?1", params![plan.id])?;
+        Ok(())
+    })?;
+    if stop(opts, "verifying") {
+        return Ok(partial(plan, backup, "VERIFYING", files, true));
     }
     for op in &plan.ops {
         if files.iter().find(|f| f.index == op.index).map(|f| f.state.as_str()) != Some("done") {
@@ -1111,6 +1660,9 @@ fn continue_same_transaction(db: &Connection, fsys: &LocalFs, plan: &ExecPlan, b
         }
     }
     if let Err(e) = fault.hit_commit() {
+        if injected_panic(&e) {
+            return Err(e);
+        }
         let err = Error::new(ErrorCode::LogWrite, e.message);
         db.execute("UPDATE exec_journal SET state='LOG_FAILED' WHERE exec_id=?1", params![plan.id])?;
         return Err(err);
@@ -1126,6 +1678,16 @@ fn continue_same_transaction(db: &Connection, fsys: &LocalFs, plan: &ExecPlan, b
     })?;
     cleanup_recorded(fsys, &temps)?;
     Ok(base_report(&plan.id, "COMMITTED", files, backup, false, "成功", false))
+}
+
+fn will_resume_write(states: &HashMap<u32, OpRow>, op: &PlanOp, opts: &ExecOpts, skip_paths: &HashSet<&str>) -> bool {
+    if skip_paths.contains(op.path.as_str()) || !will_apply(op, opts.allow_readonly) {
+        return false;
+    }
+    match states.get(&op.index) {
+        Some(row) => row.state != "done" && row.state != "skipped" && row.kept_hash.is_none() && !row.written,
+        None => true,
+    }
 }
 
 pub fn mark_backup_cleaned(db: &Connection, exec_id: &str) -> Result<()> {
@@ -1615,9 +2177,10 @@ mod tests {
         assert_eq!(pending(&db).unwrap().len(), 1);
 
         let prompted = resume(&db, &fsys, &p.id, ResumeChoice::Rollback, &opts_at(dir.path()), FaultPlan::default()).unwrap();
-        let ResumeOutcome::RollbackPrompt(files) = prompted else { panic!("expected rollback prompt"); };
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path, "a.txt");
+        let ResumeOutcome::RollbackPrompt(prompt) = prompted else { panic!("expected rollback prompt"); };
+        assert_eq!(prompt.files.len(), 1);
+        assert_eq!(prompt.files[0].path, "a.txt");
+        assert_eq!(prompt.files[0].detail, DETAIL_MODIFIED);
         assert_eq!(fs::read(dir.path().join("b.txt")).unwrap(), b"old-b");
         assert_eq!(pending(&db).unwrap().len(), 1);
 
@@ -1700,5 +2263,610 @@ mod tests {
         assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"old-bytes");
         assert_eq!(fs::read(dir.path().join("b.txt")).unwrap(), b"other");
         assert!(crate::error::SPEC_CODES.contains(&"E_VERIFY_FAILED"));
+    }
+
+    fn journal_state(db: &Connection, id: &str) -> String {
+        db.query_row("SELECT state FROM exec_journal WHERE exec_id=?1", params![id], |r| r.get(0)).unwrap()
+    }
+
+    fn pre_recovery(db: &Connection, id: &str) -> Option<String> {
+        db.query_row("SELECT pre_recovery_state FROM exec_journal WHERE exec_id=?1", params![id], |r| r.get(0)).unwrap()
+    }
+
+    struct DirMode<'a> {
+        path: &'a Path,
+    }
+
+    impl Drop for DirMode<'_> {
+        fn drop(&mut self) {
+            if let Ok(meta) = fs::metadata(self.path) {
+                let mut perm = meta.permissions();
+                perm.set_mode(0o755);
+                let _ = fs::set_permissions(self.path, perm);
+            }
+        }
+    }
+
+    #[test]
+    fn resumable_states_are_one_whitelist() {
+        assert_eq!(resume_admission("STOPPED"), ResumeAdmission::Upgrade);
+        assert_eq!(resume_admission("LOG_FAILED"), ResumeAdmission::Upgrade);
+        assert_eq!(resume_admission("PREPARED"), ResumeAdmission::Upgrade);
+        assert_eq!(resume_admission("BACKED_UP"), ResumeAdmission::Upgrade);
+        assert_eq!(resume_admission("VERIFYING"), ResumeAdmission::Upgrade);
+        assert_eq!(resume_admission("ROLLING_BACK"), ResumeAdmission::RollbackOnly);
+        assert_eq!(resume_admission("ROLLBACK_PARTIAL"), ResumeAdmission::RollbackOnly);
+        assert_eq!(resume_admission("COMMITTED"), ResumeAdmission::Reject);
+        assert_eq!(resume_admission("ROLLED_BACK"), ResumeAdmission::Reject);
+        assert_eq!(resume_actions("STOPPED"), vec!["继续", "回滚", "稍后处理"]);
+        assert_eq!(resume_actions("ROLLING_BACK"), vec!["继续回滚"]);
+        assert!(resume_actions("COMMITTED").is_empty());
+        let files = vec![
+            ConflictFile { path: "a".into(), detail: DETAIL_MODIFIED.into() },
+            ConflictFile { path: "b".into(), detail: DETAIL_DELETED.into() },
+        ];
+        assert_eq!(resume_conflict_title(&files), "有 2 个已经写完的文件被改过或删除");
+        assert_eq!(
+            resume_conflict_title(&files[..1]),
+            "有 1 个已经写完的文件被改过"
+        );
+    }
+
+    #[test]
+    fn move_source_delete_failure_still_rolls_back_the_written_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("old")).unwrap();
+        fs::create_dir_all(dir.path().join("new")).unwrap();
+        fs::write(dir.path().join("old/m.txt"), b"orig").unwrap();
+        fs::write(dir.path().join("tail.txt"), b"tail").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let mv = PlanOp {
+            index: 1,
+            kind: OpKind::Move,
+            path: "new/m.txt".into(),
+            from: Some("old/m.txt".into()),
+            bytes: Some(b"orig".to_vec()),
+            expect: Some(Snapshot { size: 4, mtime_ms: None, hash: sha256_hex(b"orig") }),
+            mode: Some(0o644),
+            source_mtime_ms: None,
+            merged: false,
+            keep_source: false,
+            readonly: false,
+            label: "移动".into(),
+        };
+        let p = plan(vec![mv, ov(2, "tail.txt", b"tail", b"TAIL", None)]);
+        let old = dir.path().join("old");
+        let _guard = DirMode { path: &old };
+        let mut perm = fs::metadata(&old).unwrap().permissions();
+        perm.set_mode(0o555);
+        fs::set_permissions(&old, perm).unwrap();
+        let rep = execute(&db, &fsys, &p, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        assert_eq!(rep.state, "STOPPED");
+        assert_eq!(rep.files[0].code.as_deref(), Some("E_PERMISSION"));
+        assert_ne!(rep.files[0].code.as_deref(), Some("E_FAULT"));
+        let written: i64 = db
+            .query_row("SELECT written FROM exec_ops WHERE exec_id=?1 AND op_index=1", params![p.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(written, 1);
+        assert_eq!(fs::read(dir.path().join("new/m.txt")).unwrap(), b"orig");
+        assert_eq!(fs::read(dir.path().join("old/m.txt")).unwrap(), b"orig");
+        assert_eq!(fs::read(dir.path().join("tail.txt")).unwrap(), b"tail");
+        let mut perm = fs::metadata(&old).unwrap().permissions();
+        perm.set_mode(0o755);
+        fs::set_permissions(&old, perm).unwrap();
+        let back = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+        assert_eq!(back.state, "ROLLED_BACK");
+        assert!(!dir.path().join("new/m.txt").exists());
+        assert_eq!(fs::read(dir.path().join("old/m.txt")).unwrap(), b"orig");
+        assert_eq!(fs::read(dir.path().join("tail.txt")).unwrap(), b"tail");
+    }
+
+    #[test]
+    fn resume_uses_change_detection_and_keeps_or_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"old").unwrap();
+        fs::write(dir.path().join("b.txt"), b"old").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let p = plan(vec![ov(1, "a.txt", b"old", b"NEW", None), ov(2, "b.txt", b"old", b"NEW", None)]);
+        let opts = ExecOpts { allow_readonly: false, backup_root: dir.path().join("bak"), remote: false, stop_after_log: None, corrupt_temp: true };
+        execute(&db, &fsys, &p, &opts, FaultPlan::default()).unwrap();
+        fs::write(dir.path().join("a.txt"), b"ext-a").unwrap();
+        fs::write(dir.path().join("b.txt"), b"ext-b").unwrap();
+        let listed = resume(&db, &fsys, &p.id, ResumeChoice::Continue, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        let ResumeOutcome::ChangesSinceScan(hits) = listed else { panic!("expected scan hits, got {listed:?}"); };
+        assert_eq!(hits.len(), 2);
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"ext-a");
+        assert_eq!(fs::read(dir.path().join("b.txt")).unwrap(), b"ext-b");
+        let skipped = resume(&db, &fsys, &p.id, ResumeChoice::SkipChanged, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        let ResumeOutcome::Continued(rep) = skipped else { panic!("expected continue"); };
+        assert_eq!(rep.state, "COMMITTED");
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"ext-a");
+        assert_eq!(fs::read(dir.path().join("b.txt")).unwrap(), b"ext-b");
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"old").unwrap();
+        fs::write(dir.path().join("b.txt"), b"old").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let p = plan(vec![ov(1, "a.txt", b"old", b"NEW", Some(1)), ov(2, "b.txt", b"old", b"NEW", Some(1))]);
+        let opts = ExecOpts { allow_readonly: false, backup_root: dir.path().join("bak"), remote: false, stop_after_log: None, corrupt_temp: true };
+        execute(&db, &fsys, &p, &opts, FaultPlan::default()).unwrap();
+        filetime::set_file_mtime(dir.path().join("b.txt"), filetime::FileTime::from_unix_time(90, 0)).unwrap();
+        let continued = resume(&db, &fsys, &p.id, ResumeChoice::Continue, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        let ResumeOutcome::Continued(rep) = continued else { panic!("touch is not a change: {continued:?}"); };
+        assert_eq!(rep.state, "COMMITTED");
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"NEW");
+        assert_eq!(fs::read(dir.path().join("b.txt")).unwrap(), b"NEW");
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"old").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let p = plan(vec![ov(1, "a.txt", b"old", b"NEW", None)]);
+        let opts = ExecOpts { allow_readonly: false, backup_root: dir.path().join("bak"), remote: false, stop_after_log: Some("backed_up".into()), corrupt_temp: false };
+        execute(&db, &fsys, &p, &opts, FaultPlan::default()).unwrap();
+        fs::write(dir.path().join("a.txt"), b"ext").unwrap();
+        let wrote = resume(&db, &fsys, &p.id, ResumeChoice::OverwriteChanged, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        let ResumeOutcome::Continued(_) = wrote else { panic!("expected overwrite"); };
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"NEW");
+        let back = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+        assert_eq!(back.state, "ROLLED_BACK");
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn deleted_written_file_is_a_resume_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"old-a").unwrap();
+        fs::write(dir.path().join("b.txt"), b"old-b").unwrap();
+        fs::write(dir.path().join("c.txt"), b"old-c").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let p = plan(vec![
+            ov(1, "a.txt", b"old-a", b"new-a", None),
+            ov(2, "b.txt", b"old-b", b"new-b", None),
+            ov(3, "c.txt", b"old-c", b"new-c", None),
+        ]);
+        let opts = ExecOpts { allow_readonly: false, backup_root: dir.path().join("bak"), remote: false, stop_after_log: Some("done:2".into()), corrupt_temp: false };
+        execute(&db, &fsys, &p, &opts, FaultPlan::default()).unwrap();
+        fs::remove_file(dir.path().join("a.txt")).unwrap();
+        fs::write(dir.path().join("b.txt"), b"external-b").unwrap();
+        let listed = resume(&db, &fsys, &p.id, ResumeChoice::Continue, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        let ResumeOutcome::RollbackPrompt(prompt) = listed else { panic!("expected conflict"); };
+        assert_eq!(prompt.title, "有 2 个已经写完的文件被改过或删除");
+        assert!(prompt.files.iter().any(|f| f.path == "a.txt" && f.detail == DETAIL_DELETED));
+        assert!(prompt.files.iter().any(|f| f.path == "b.txt" && f.detail == DETAIL_MODIFIED));
+        assert_eq!(fs::read(dir.path().join("c.txt")).unwrap(), b"old-c");
+        assert!(!dir.path().join("a.txt").exists());
+    }
+
+    #[test]
+    fn resume_rejects_finished_and_rollback_only_states() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"old").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let p = plan(vec![ov(1, "a.txt", b"old", b"new", None)]);
+        execute(&db, &fsys, &p, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        let err = resume(&db, &fsys, &p.id, ResumeChoice::Continue, &opts_at(dir.path()), FaultPlan::default()).unwrap_err();
+        assert_eq!(err.message, "这次升级已经结束，不能继续");
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"new");
+        assert_eq!(journal_state(&db, &p.id), "COMMITTED");
+
+        let back = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+        assert_eq!(back.state, "ROLLED_BACK");
+        let err = resume(&db, &fsys, &p.id, ResumeChoice::Continue, &opts_at(dir.path()), FaultPlan::default()).unwrap_err();
+        assert_eq!(err.message, "这次升级已经结束，不能继续");
+        assert_eq!(journal_state(&db, &p.id), "ROLLED_BACK");
+
+        db.execute("UPDATE exec_journal SET state='ROLLING_BACK' WHERE exec_id=?1", params![p.id]).unwrap();
+        let err = resume(&db, &fsys, &p.id, ResumeChoice::Continue, &opts_at(dir.path()), FaultPlan::default()).unwrap_err();
+        assert_eq!(err.message, "这次只能继续回滚，不能继续升级");
+        assert_eq!(journal_state(&db, &p.id), "ROLLING_BACK");
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"old");
+
+        db.execute("UPDATE exec_journal SET state='ROLLBACK_PARTIAL' WHERE exec_id=?1", params![p.id]).unwrap();
+        let err = resume(&db, &fsys, &p.id, ResumeChoice::Continue, &opts_at(dir.path()), FaultPlan::default()).unwrap_err();
+        assert_eq!(err.message, "这次只能继续回滚，不能继续升级");
+        assert_eq!(journal_state(&db, &p.id), "ROLLBACK_PARTIAL");
+    }
+
+    #[test]
+    fn startup_recovery_keeps_state_and_only_registered_temps() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"old").unwrap();
+        fs::write(dir.path().join("b.txt"), b"old").unwrap();
+        fs::write(dir.path().join(".a.txt.htx-userkeep"), b"user").unwrap();
+        fs::write(dir.path().join(".a.txt.htx-registered"), b"temp").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let p = plan(vec![ov(1, "a.txt", b"old", b"new", None), ov(2, "b.txt", b"old", b"new", None)]);
+        let opts = ExecOpts { allow_readonly: false, backup_root: dir.path().join("bak"), remote: false, stop_after_log: Some("doing:1".into()), corrupt_temp: false };
+        execute(&db, &fsys, &p, &opts, FaultPlan::default()).unwrap();
+        fs::write(dir.path().join("a.txt"), b"neither").unwrap();
+        db.execute(
+            "INSERT INTO exec_temps (exec_id, path) VALUES (?1, '.a.txt.htx-registered')",
+            params![p.id],
+        )
+        .unwrap();
+        let offers = recover_on_startup(&db, &fsys).unwrap();
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].state, "BACKED_UP");
+        assert_eq!(offers[0].pre_recovery_state, "BACKED_UP");
+        assert_eq!(offers[0].actions, vec!["继续".to_string(), "回滚".to_string(), "稍后处理".to_string()]);
+        assert!(offers[0].conflicts.iter().any(|c| c.path == "a.txt" && c.detail == "无法判断是否已经写入"));
+        assert_eq!(journal_state(&db, &p.id), "BACKED_UP");
+        assert!(!dir.path().join(".a.txt.htx-registered").exists());
+        assert_eq!(fs::read(dir.path().join(".a.txt.htx-userkeep")).unwrap(), b"user");
+
+        let opts = ExecOpts { allow_readonly: false, backup_root: dir.path().join("bak2"), remote: false, stop_after_log: Some("prepared".into()), corrupt_temp: false };
+        let p2 = plan(vec![ov(1, "b.txt", b"old", b"new", None)]);
+        execute(&db, &fsys, &p2, &opts, FaultPlan::default()).unwrap();
+        let offers = recover_on_startup(&db, &fsys).unwrap();
+        let prepared = offers.iter().find(|o| o.exec_id == p2.id).unwrap();
+        assert_eq!(prepared.state, "PREPARED");
+        assert_eq!(prepared.pre_recovery_state, "PREPARED");
+        assert_eq!(journal_state(&db, &p2.id), "PREPARED");
+
+        let opts = ExecOpts { allow_readonly: false, backup_root: dir.path().join("bak3"), remote: false, stop_after_log: Some("verifying".into()), corrupt_temp: false };
+        fs::write(dir.path().join("b.txt"), b"old").unwrap();
+        let p3 = plan(vec![ov(1, "b.txt", b"old", b"new", None)]);
+        let rep = execute(&db, &fsys, &p3, &opts, FaultPlan::default()).unwrap();
+        assert_eq!(rep.state, "VERIFYING");
+        let offers = recover_on_startup(&db, &fsys).unwrap();
+        let verifying = offers.iter().find(|o| o.exec_id == p3.id).unwrap();
+        assert_eq!(verifying.state, "VERIFYING");
+        assert_eq!(verifying.pre_recovery_state, "VERIFYING");
+        assert_eq!(journal_state(&db, &p3.id), "VERIFYING");
+    }
+
+    #[test]
+    fn inferred_write_is_not_rewritten_and_log_probe_gates_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"old").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let p = plan(vec![ov(1, "a.txt", b"old", b"new", None)]);
+        let opts = ExecOpts { allow_readonly: false, backup_root: dir.path().join("bak"), remote: false, stop_after_log: Some("doing:1".into()), corrupt_temp: false };
+        execute(&db, &fsys, &p, &opts, FaultPlan::default()).unwrap();
+        fs::write(dir.path().join("a.txt"), b"new").unwrap();
+        let offers = recover_on_startup(&db, &fsys).unwrap();
+        assert!(offers[0].conflicts.is_empty(), "{:?}", offers[0].conflicts);
+        let written: i64 = db
+            .query_row("SELECT written FROM exec_ops WHERE exec_id=?1 AND op_index=1", params![p.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(written, 1);
+        let continued = resume(&db, &fsys, &p.id, ResumeChoice::Continue, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        let ResumeOutcome::Continued(rep) = continued else { panic!("expected continue"); };
+        assert_eq!(rep.state, "COMMITTED");
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"new");
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"old").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let p = plan(vec![ov(1, "a.txt", b"old", b"new", None)]);
+        let opts = ExecOpts { allow_readonly: false, backup_root: dir.path().join("bak"), remote: false, stop_after_log: Some("backed_up".into()), corrupt_temp: false };
+        execute(&db, &fsys, &p, &opts, FaultPlan::default()).unwrap();
+        db.execute("UPDATE exec_journal SET state='LOG_FAILED' WHERE exec_id=?1", params![p.id]).unwrap();
+        db.execute_batch("PRAGMA query_only=ON").unwrap();
+        let err = resume(&db, &fsys, &p.id, ResumeChoice::Continue, &opts_at(dir.path()), FaultPlan::default()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::LogWrite);
+        assert_ne!(err.code_str(), "E_FAULT");
+        assert_eq!(journal_state(&db, &p.id), "LOG_FAILED");
+        assert!(pre_recovery(&db, &p.id).is_none());
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"old");
+        db.execute_batch("PRAGMA query_only=OFF").unwrap();
+        let continued = resume(&db, &fsys, &p.id, ResumeChoice::Continue, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        let ResumeOutcome::Continued(rep) = continued else { panic!("expected continue"); };
+        assert_eq!(rep.state, "COMMITTED");
+        assert_eq!(pre_recovery(&db, &p.id).as_deref(), Some("LOG_FAILED"));
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn kept_external_is_not_listed_again_until_it_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"old-a").unwrap();
+        fs::write(dir.path().join("b.txt"), b"old-b").unwrap();
+        fs::write(dir.path().join("c.txt"), b"old-c").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let p = plan(vec![
+            ov(1, "a.txt", b"old-a", b"new-a", None),
+            ov(2, "b.txt", b"old-b", b"new-b", None),
+            ov(3, "c.txt", b"old-c", b"new-c", None),
+        ]);
+        let opts = ExecOpts { allow_readonly: false, backup_root: dir.path().join("bak"), remote: false, stop_after_log: Some("done:1".into()), corrupt_temp: false };
+        execute(&db, &fsys, &p, &opts, FaultPlan::default()).unwrap();
+        fs::write(dir.path().join("a.txt"), b"external").unwrap();
+        let mut mid = opts_at(dir.path());
+        mid.stop_after_log = Some("done:2".into());
+        let kept = resume(&db, &fsys, &p.id, ResumeChoice::KeepExternal, &mid, FaultPlan::default()).unwrap();
+        let ResumeOutcome::Continued(rep) = kept else { panic!("expected partial continue"); };
+        assert_ne!(rep.state, "COMMITTED");
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"external");
+        assert_eq!(fs::read(dir.path().join("b.txt")).unwrap(), b"new-b");
+        assert_eq!(fs::read(dir.path().join("c.txt")).unwrap(), b"old-c");
+        let again = resume(&db, &fsys, &p.id, ResumeChoice::Continue, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        let ResumeOutcome::Continued(rep) = again else { panic!("kept file listed again: {again:?}"); };
+        assert_eq!(rep.state, "COMMITTED");
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"external");
+        assert_eq!(fs::read(dir.path().join("c.txt")).unwrap(), b"new-c");
+        let conflicts = rollback_conflicts(&fsys, &db, &p.id, &p).unwrap();
+        assert!(conflicts.iter().any(|c| c.path == "a.txt"));
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"old-a").unwrap();
+        fs::write(dir.path().join("b.txt"), b"old-b").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let p = plan(vec![ov(1, "a.txt", b"old-a", b"new-a", None), ov(2, "b.txt", b"old-b", b"new-b", None)]);
+        let opts = ExecOpts { allow_readonly: false, backup_root: dir.path().join("bak"), remote: false, stop_after_log: Some("done:1".into()), corrupt_temp: false };
+        execute(&db, &fsys, &p, &opts, FaultPlan::default()).unwrap();
+        fs::write(dir.path().join("a.txt"), b"external").unwrap();
+        let mut mid = opts_at(dir.path());
+        mid.stop_after_log = Some("backed_up".into());
+        resume(&db, &fsys, &p.id, ResumeChoice::KeepExternal, &mid, FaultPlan::default()).unwrap();
+        fs::write(dir.path().join("a.txt"), b"external-again").unwrap();
+        let listed = resume(&db, &fsys, &p.id, ResumeChoice::Continue, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        let ResumeOutcome::RollbackPrompt(prompt) = listed else { panic!("expected relist, got {listed:?}"); };
+        assert_eq!(prompt.files.len(), 1);
+        assert_eq!(prompt.files[0].path, "a.txt");
+        assert_eq!(fs::read(dir.path().join("b.txt")).unwrap(), b"old-b");
+    }
+
+    #[test]
+    fn resume_rollback_choice_writes_nothing_until_rollback_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"old-a").unwrap();
+        fs::write(dir.path().join("b.txt"), b"old-b").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let p = plan(vec![ov(1, "a.txt", b"old-a", b"new-a", None), ov(2, "b.txt", b"old-b", b"new-b", None)]);
+        let opts = ExecOpts { allow_readonly: false, backup_root: dir.path().join("bak"), remote: false, stop_after_log: Some("done:1".into()), corrupt_temp: false };
+        execute(&db, &fsys, &p, &opts, FaultPlan::default()).unwrap();
+        fs::write(dir.path().join("a.txt"), b"external").unwrap();
+        let prompted = resume(&db, &fsys, &p.id, ResumeChoice::Rollback, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        let ResumeOutcome::RollbackPrompt(prompt) = prompted else { panic!("expected prompt"); };
+        assert_eq!(prompt.files.len(), 1);
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"external");
+        assert_eq!(fs::read(dir.path().join("b.txt")).unwrap(), b"old-b");
+        let err = rollback(&db, &fsys, &p.id, RollbackChoice::Cancel, FaultPlan::default()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Cancelled);
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"external");
+        let skipped = rollback(&db, &fsys, &p.id, RollbackChoice::SkipConflicts, FaultPlan::default()).unwrap();
+        assert_eq!(skipped.state, "ROLLED_BACK");
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"external");
+        assert_eq!(fs::read(dir.path().join("b.txt")).unwrap(), b"old-b");
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"old-a").unwrap();
+        fs::write(dir.path().join("b.txt"), b"old-b").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let p = plan(vec![ov(1, "a.txt", b"old-a", b"new-a", None), ov(2, "b.txt", b"old-b", b"new-b", None)]);
+        let opts = ExecOpts { allow_readonly: false, backup_root: dir.path().join("bak"), remote: false, stop_after_log: Some("done:1".into()), corrupt_temp: false };
+        execute(&db, &fsys, &p, &opts, FaultPlan::default()).unwrap();
+        fs::write(dir.path().join("a.txt"), b"external").unwrap();
+        resume(&db, &fsys, &p.id, ResumeChoice::Rollback, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        let back = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+        assert_eq!(back.state, "ROLLED_BACK");
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"old-a");
+        assert_eq!(fs::read(dir.path().join("b.txt")).unwrap(), b"old-b");
+    }
+
+    #[test]
+    fn resume_cancel_records_nothing_and_prompts_again() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"old").unwrap();
+        fs::write(dir.path().join("b.txt"), b"old").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let p = plan(vec![ov(1, "a.txt", b"old", b"new", None), ov(2, "b.txt", b"old", b"new", None)]);
+        let opts = ExecOpts { allow_readonly: false, backup_root: dir.path().join("bak"), remote: false, stop_after_log: Some("done:1".into()), corrupt_temp: false };
+        execute(&db, &fsys, &p, &opts, FaultPlan::default()).unwrap();
+        let state_before = journal_state(&db, &p.id);
+        fs::write(dir.path().join("a.txt"), b"external").unwrap();
+        let cancelled = resume(&db, &fsys, &p.id, ResumeChoice::Cancel, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        assert!(matches!(cancelled, ResumeOutcome::Unchanged));
+        let kept: Option<String> = db
+            .query_row("SELECT kept_hash FROM exec_ops WHERE exec_id=?1 AND op_index=1", params![p.id], |r| r.get(0))
+            .unwrap();
+        assert!(kept.is_none());
+        assert_eq!(journal_state(&db, &p.id), state_before);
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"external");
+        assert_eq!(fs::read(dir.path().join("b.txt")).unwrap(), b"old");
+        let listed = resume(&db, &fsys, &p.id, ResumeChoice::Continue, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        assert!(matches!(listed, ResumeOutcome::RollbackPrompt(_)));
+        assert_eq!(fs::read(dir.path().join("b.txt")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn kept_deletion_stays_deleted_until_rollback_restores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"old-a").unwrap();
+        fs::write(dir.path().join("b.txt"), b"old-b").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let p = plan(vec![ov(1, "a.txt", b"old-a", b"new-a", None), ov(2, "b.txt", b"old-b", b"new-b", None)]);
+        let opts = ExecOpts { allow_readonly: false, backup_root: dir.path().join("bak"), remote: false, stop_after_log: Some("done:1".into()), corrupt_temp: false };
+        execute(&db, &fsys, &p, &opts, FaultPlan::default()).unwrap();
+        fs::remove_file(dir.path().join("a.txt")).unwrap();
+        let kept = resume(&db, &fsys, &p.id, ResumeChoice::KeepExternal, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        let ResumeOutcome::Continued(rep) = kept else { panic!("expected continue"); };
+        assert_eq!(rep.state, "COMMITTED");
+        assert!(!dir.path().join("a.txt").exists());
+        assert_eq!(fs::read(dir.path().join("b.txt")).unwrap(), b"new-b");
+        let kept_hash: String = db
+            .query_row("SELECT kept_hash FROM exec_ops WHERE exec_id=?1 AND op_index=1", params![p.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept_hash, KEPT_DELETED);
+        let skipped = rollback(&db, &fsys, &p.id, RollbackChoice::SkipConflicts, FaultPlan::default()).unwrap();
+        assert_eq!(skipped.state, "ROLLED_BACK");
+        assert!(!dir.path().join("a.txt").exists());
+        assert_eq!(fs::read(dir.path().join("b.txt")).unwrap(), b"old-b");
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"old-a").unwrap();
+        fs::write(dir.path().join("b.txt"), b"old-b").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let p = plan(vec![ov(1, "a.txt", b"old-a", b"new-a", None), ov(2, "b.txt", b"old-b", b"new-b", None)]);
+        let opts = ExecOpts { allow_readonly: false, backup_root: dir.path().join("bak"), remote: false, stop_after_log: Some("done:1".into()), corrupt_temp: false };
+        execute(&db, &fsys, &p, &opts, FaultPlan::default()).unwrap();
+        fs::remove_file(dir.path().join("a.txt")).unwrap();
+        resume(&db, &fsys, &p.id, ResumeChoice::KeepExternal, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        let back = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+        assert_eq!(back.state, "ROLLED_BACK");
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"old-a");
+        assert_eq!(fs::read(dir.path().join("b.txt")).unwrap(), b"old-b");
+    }
+
+    #[test]
+    #[cfg(feature = "fault-inject")]
+    fn verify_post_failure_rolls_back_the_written_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ops = Vec::new();
+        for i in 1..=5 {
+            let name = format!("f{i}.txt");
+            fs::write(dir.path().join(&name), b"old").unwrap();
+            ops.push(ov(i, &name, b"old", b"new", None));
+        }
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let p = plan(ops);
+        let mut fp = FaultPlan::default();
+        fp.items.push(crate::fault::Item::At { stage: Stage::VerifyPost, n: 3, mode: crate::fault::Mode::Error });
+        let rep = execute(&db, &fsys, &p, &opts_at(dir.path()), fp).unwrap();
+        assert_eq!(rep.state, "STOPPED");
+        assert_eq!(rep.files.iter().find(|f| f.path == "f3.txt").unwrap().code.as_deref(), Some("E_VERIFY_FAILED"));
+        let written: i64 = db
+            .query_row("SELECT written FROM exec_ops WHERE exec_id=?1 AND op_index=3", params![p.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(written, 1);
+        for i in 1..=5 {
+            assert_eq!(fs::read(dir.path().join(format!("f{i}.txt"))).unwrap(), b"new");
+        }
+        let back = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+        assert_eq!(back.state, "ROLLED_BACK");
+        for i in 1..=5 {
+            assert_eq!(fs::read(dir.path().join(format!("f{i}.txt"))).unwrap(), b"old");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "fault-inject")]
+    fn resume_backs_up_missing_files_and_replaces_corrupt_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ops = Vec::new();
+        for i in 1..=6 {
+            let name = format!("f{i}.txt");
+            fs::write(dir.path().join(&name), format!("old{i}")).unwrap();
+            ops.push(ov(i, &name, format!("old{i}").as_bytes(), b"NEW", None));
+        }
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let p = plan(ops);
+        let mut fp = FaultPlan::default();
+        fp.items.push(crate::fault::Item::At { stage: Stage::Backup, n: 3, mode: crate::fault::Mode::Error });
+        let rep = execute(&db, &fsys, &p, &opts_at(dir.path()), fp).unwrap();
+        assert_eq!(rep.state, "STOPPED");
+        assert_eq!(rep.files[0].code.as_deref(), Some("E_IO"));
+        let rows = read_manifest(&dir.path().join("bak").join(&p.id)).unwrap();
+        assert_eq!(rows.len(), 2);
+        let continued = resume(&db, &fsys, &p.id, ResumeChoice::Continue, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        let ResumeOutcome::Continued(rep) = continued else { panic!("expected continue"); };
+        assert_eq!(rep.state, "COMMITTED");
+        assert_eq!(rep.exec_id, p.id);
+        let rows = read_manifest(&dir.path().join("bak").join(&p.id)).unwrap();
+        let paths: std::collections::HashSet<_> = rows.iter().filter_map(|v| v["path"].as_str()).collect();
+        assert_eq!(paths.len(), 6, "{rows:?}");
+        for i in 1..=6 {
+            let name = format!("f{i}.txt");
+            assert_eq!(fs::read(dir.path().join(&name)).unwrap(), b"NEW");
+            let bak = fs::read(dir.path().join("bak").join(&p.id).join("files").join(&name)).unwrap();
+            assert_eq!(bak, format!("old{i}").into_bytes());
+        }
+        let back = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+        assert_eq!(back.state, "ROLLED_BACK");
+        for i in 1..=6 {
+            assert_eq!(fs::read(dir.path().join(format!("f{i}.txt"))).unwrap(), format!("old{i}").into_bytes());
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"old-bytes").unwrap();
+        fs::write(dir.path().join("b.txt"), b"other").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let p = plan(vec![ov(1, "a.txt", b"old-bytes", b"NEW", None), ov(2, "b.txt", b"other", b"NEXT", None)]);
+        let mut fp = FaultPlan::default();
+        fp.items.push(crate::fault::Item::At { stage: Stage::Backup, n: 1, mode: crate::fault::Mode::Corrupt });
+        execute(&db, &fsys, &p, &opts_at(dir.path()), fp).unwrap();
+        assert!(!dir.path().join("bak").join(&p.id).join("files").join("a.txt").exists());
+        let continued = resume(&db, &fsys, &p.id, ResumeChoice::Continue, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        assert!(matches!(continued, ResumeOutcome::Continued(_)));
+        assert_eq!(fs::read(dir.path().join("bak").join(&p.id).join("files").join("a.txt")).unwrap(), b"old-bytes");
+        let back = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+        assert_eq!(back.state, "ROLLED_BACK");
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"old-bytes");
+        assert_eq!(fs::read(dir.path().join("b.txt")).unwrap(), b"other");
+    }
+
+    #[test]
+    #[cfg(feature = "fault-inject")]
+    fn panic_leaves_registered_temp_and_reports_internal() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"old").unwrap();
+        fs::write(dir.path().join(".a.txt.htx-userkeep"), b"user").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let p = plan(vec![ov(1, "a.txt", b"old", b"new", None)]);
+        let mut fp = FaultPlan::default();
+        fp.items.push(crate::fault::Item::At { stage: Stage::VerifyPre, n: 1, mode: crate::fault::Mode::Panic });
+        let err = execute(&db, &fsys, &p, &opts_at(dir.path()), fp).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(err.message.starts_with("panic "), "{}", err.message);
+        assert_ne!(err.code_str(), "E_FAULT");
+        assert_eq!(journal_state(&db, &p.id), "BACKED_UP");
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"old");
+        assert_eq!(fs::read(dir.path().join(".a.txt.htx-userkeep")).unwrap(), b"user");
+        let temps: i64 = db.query_row("SELECT COUNT(*) FROM exec_temps WHERE exec_id=?1", params![p.id], |r| r.get(0)).unwrap();
+        assert_eq!(temps, 1);
+        let offers = recover_on_startup(&db, &fsys).unwrap();
+        assert_eq!(offers[0].pre_recovery_state, "BACKED_UP");
+        assert_eq!(offers[0].state, "BACKED_UP");
+        assert_eq!(journal_state(&db, &p.id), "BACKED_UP");
+        let temps: i64 = db.query_row("SELECT COUNT(*) FROM exec_temps WHERE exec_id=?1", params![p.id], |r| r.get(0)).unwrap();
+        assert_eq!(temps, 0);
+        assert_eq!(fs::read(dir.path().join(".a.txt.htx-userkeep")).unwrap(), b"user");
+        let htx: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".htx-"))
+            .collect();
+        assert_eq!(htx, vec![".a.txt.htx-userkeep".to_string()], "{htx:?}");
+
+        for (stage, mode, code) in [
+            (Stage::Write, crate::fault::Mode::Error, "E_IO"),
+            (Stage::Rename, crate::fault::Mode::Error, "E_IO"),
+            (Stage::Backup, crate::fault::Mode::Error, "E_IO"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("a.txt"), b"old").unwrap();
+            let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+            let fsys = LocalFs::new(dir.path());
+            let p = plan(vec![ov(1, "a.txt", b"old", b"new", None)]);
+            let mut fp = FaultPlan::default();
+            fp.items.push(crate::fault::Item::At { stage, n: 1, mode });
+            let rep = execute(&db, &fsys, &p, &opts_at(dir.path()), fp).unwrap();
+            assert_eq!(rep.state, "STOPPED");
+            assert_eq!(rep.files[0].code.as_deref(), Some(code), "{stage:?}");
+            assert_ne!(rep.files[0].code.as_deref(), Some("E_FAULT"));
+            assert_ne!(rep.files[0].code.as_deref(), Some("E_INTERNAL"));
+            assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"old");
+        }
     }
 }

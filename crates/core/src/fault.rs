@@ -200,7 +200,7 @@ fn parse_mode(s: &str, raw: &str, stage: Stage) -> std::result::Result<Mode, Str
 
 #[cfg(feature = "fault-inject")]
 pub fn load_for_plan(spec: &str, ops: &[OpKind]) -> Result<FaultPlan> {
-    let plan = parse_spec(spec).map_err(|m| Error::new(ErrorCode::Fault, m))?;
+    let plan = parse_spec(spec).map_err(|m| Error::new(ErrorCode::Internal, m))?;
     validate(&plan, ops)?;
     Ok(plan)
 }
@@ -217,7 +217,7 @@ fn validate(plan: &FaultPlan, ops: &[OpKind]) -> Result<()> {
                 let max_logs = 4 + 2 * len;
                 if *n > max_logs {
                     return Err(Error::new(
-                        ErrorCode::Fault,
+                        ErrorCode::Internal,
                         format!("log:{n} 超出本次执行最多 {max_logs} 次日志写入"),
                     ));
                 }
@@ -225,14 +225,14 @@ fn validate(plan: &FaultPlan, ops: &[OpKind]) -> Result<()> {
             Item::At { stage, n, .. } => {
                 if *n > len {
                     return Err(Error::new(
-                        ErrorCode::Fault,
+                        ErrorCode::Internal,
                         format!("{stage:?}:{n} 大于计划长度 {len}（来自序号 {n}）"),
                     ));
                 }
                 let kind = ops[(*n as usize) - 1];
                 if !stage_applies(*stage, kind) {
                     return Err(Error::new(
-                        ErrorCode::Fault,
+                        ErrorCode::Internal,
                         format!("{:?} 不适用于第 {n} 个操作（{:?}）", stage, kind),
                     ));
                 }
@@ -333,9 +333,10 @@ impl FaultRuntime {
 #[cfg(feature = "fault-inject")]
 fn real_fault_code(stage: Stage) -> ErrorCode {
     match stage {
-        Stage::VerifyPre | Stage::VerifyPost | Stage::Backup => ErrorCode::VerifyFailed,
+        Stage::VerifyPre | Stage::VerifyPost => ErrorCode::VerifyFailed,
+        // backup:N:error 模拟读写失败。backup:N:corrupt 不走这里，校验失败时报 E_VERIFY_FAILED。
+        Stage::Backup | Stage::Write | Stage::Rename => ErrorCode::Io,
         Stage::Log => ErrorCode::LogWrite,
-        Stage::Write | Stage::Rename => ErrorCode::Internal,
         Stage::Rollback => ErrorCode::RollbackPartial,
         Stage::SftpDisconnect => ErrorCode::Net,
     }
@@ -348,18 +349,8 @@ fn fire(stage: Stage, n: u32, mode: Mode) -> Result<()> {
         Mode::Drop => Err(Error::new(ErrorCode::Net, format!("injected disconnect at {label}"))),
         Mode::Corrupt => Ok(()),
         Mode::Error => Err(Error::new(real_fault_code(stage), format!("injected {label}"))),
-        Mode::Panic => {
-            let msg = format!("UPG_FAULT panic at {label}");
-            eprintln!("{msg}");
-            #[cfg(test)]
-            {
-                panic!("{msg}");
-            }
-            #[cfg(not(test))]
-            {
-                std::process::abort();
-            }
-        }
+        // 进程缺陷。日志记 E_INTERNAL，不再上报 E_FAULT，也不把 IO 失败记成它。
+        Mode::Panic => Err(Error::new(ErrorCode::Internal, format!("panic {label}"))),
     }
 }
 
@@ -408,8 +399,11 @@ mod tests {
         let ops = vec![OpKind::Create, OpKind::Overwrite];
         let err = load_for_plan("backup:3", &ops).unwrap_err();
         assert!(err.message.contains("大于计划长度"));
+        assert_ne!(err.code_str(), "E_FAULT");
+        assert_eq!(err.code, ErrorCode::Internal);
         assert!(load_for_plan("backup:2", &ops).is_ok());
         let err = load_for_plan("write:1", &[OpKind::Delete]).unwrap_err();
         assert!(err.message.contains("不适用"));
+        assert_ne!(err.code_str(), "E_FAULT");
     }
 }
