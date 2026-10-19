@@ -15,6 +15,8 @@ pub mod prefs;
 pub mod remote;
 pub mod runlock;
 pub mod scan;
+pub mod secrets;
+pub mod sftp;
 pub mod vfs;
 pub mod zipfs;
 
