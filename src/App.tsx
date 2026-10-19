@@ -10,7 +10,6 @@ import { Text } from "./plain";
 import { VERIFY_FAILED_BUTTON, VERIFY_FAILED_TITLE, settleRemoteWrite, type PendingRemoteWrite } from "./remoteWrite";
 import {
   DETAIL_DELETED,
-  DETAIL_MODIFIED,
   OVERWRITE_PENDING,
   OVERWRITE_PENDING_NOTE,
   RESUME_AGAIN,
@@ -96,12 +95,9 @@ const HOSTS: Host[] = [
   },
 ];
 
-const EXTERNAL_FILES: ResumeFile[] = [
-  { path: "src/routes.js", detail: DETAIL_MODIFIED },
-  { path: "public/old-banner.png", detail: DETAIL_DELETED },
-];
+const EXTERNAL_FILES: ResumeFile[] = [];
 
-const PENDING_FILES = ["src/legacy/cache.js", "config/local.env"];
+const PENDING_FILES: ConflictFile[] = [];
 
 export function App() {
   const [page, setPage] = useState<Page>("edit");
@@ -118,7 +114,7 @@ export function App() {
   const [bootError, setBootError] = useState<string | null>(null);
   const [externalFiles, setExternalFiles] = useState<ConflictFile[]>(EXTERNAL_FILES);
   const [externalTitle, setExternalTitle] = useState(resumeConflictTitle(EXTERNAL_FILES));
-  const [pendingFiles, setPendingFiles] = useState<ConflictFile[]>(PENDING_FILES.map((path) => ({ path, detail: DETAIL_MODIFIED })));
+  const [pendingFiles, setPendingFiles] = useState<ConflictFile[]>(PENDING_FILES);
   const [rollbackFiles, setRollbackFiles] = useState<ConflictFile[]>([]);
   const [rollbackAt, setRollbackAt] = useState(0);
   const host = HOSTS.find((h) => h.id === hostId) ?? HOSTS[0];
@@ -202,7 +198,7 @@ export function App() {
             <i /><i /><i />
           </span>
           <div className="titleblock">
-            <strong>{page === "ssh" ? "SSH 连接" : page === "history" ? "历史记录" : ""}</strong>
+            <strong>{page === "ssh" ? "SSH 连接" : page === "history" ? "历史记录" : "合天下"}</strong>
             <span>{page === "ssh" ? `${HOSTS.length} 个连接` : page === "history" ? "保留最近 10 次 · 超过 30 天自动清理" : ""}</span>
           </div>
           <nav className="pages">
