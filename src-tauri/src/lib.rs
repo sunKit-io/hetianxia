@@ -72,6 +72,16 @@ pub fn run() {
             commands::history,
             commands::connections,
             commands::startup_offers,
+            commands::ssh_secret_service,
+            commands::save_ssh_secret,
+            commands::ssh_secret_status,
+            commands::delete_ssh_secret,
+            commands::host_key_status,
+            commands::clear_host_fingerprint,
+            commands::trust_host_fingerprint,
+            commands::remote_backup_path,
+            commands::remote_rename_plan,
+            commands::probe_remote,
         ])
         .build(tauri::generate_context!())
         .expect("合天下启动失败")
@@ -107,6 +117,10 @@ mod tests {
         assert!(source.contains("begin_run"));
         assert!(source.contains("release_clean"));
         assert!(source.contains("startup_offers"));
+        let commands = include_str!("commands.rs");
+        assert!(!commands.contains("load_ssh_secret"));
+        assert!(commands.contains("ssh_secret_status"));
+        assert!(commands.contains("req.secret.clear()"));
     }
 
     #[test]
@@ -184,5 +198,42 @@ mod tests {
         let hosts = commands::connections("Host build-01\n  HostName 10.0.8.15\n  User deploy\n".into()).unwrap();
         assert_eq!(hosts[0].alias, "build-01");
         assert!(hosts[0].available());
+
+        assert_eq!(commands::ssh_secret_service(), "com.hetianxia.app.ssh");
+        assert_eq!(
+            commands::remote_backup_path("/home/tester".into(), "exec-9".into()).unwrap(),
+            "/home/tester/.hetianxia-backups/exec-9"
+        );
+        assert_eq!(
+            commands::remote_rename_plan(false),
+            vec!["rename-backup".to_string(), "rename-replace".into(), "delete-backup".into()]
+        );
+        let known = dir.path().join("known_hosts");
+        std::fs::write(
+            &known,
+            "build-01 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILagOJFgwaMNhBWQINinKOXmqS4Gh5NgxgriXwdOoINJ\n",
+        )
+        .unwrap();
+        let before = std::fs::read(&known).unwrap();
+        let status = commands::host_key_status(
+            db.display().to_string(),
+            known.display().to_string(),
+            "build-01".into(),
+            22,
+            "SHA256:ldyiXa1JQakitNU5tErauu8DvWQ1dZ7aXu+rm7KQuog".into(),
+        )
+        .unwrap();
+        assert_eq!(status, "match");
+        commands::clear_host_fingerprint(db.display().to_string(), "build-01".into(), 22).unwrap();
+        let again = commands::host_key_status(
+            db.display().to_string(),
+            known.display().to_string(),
+            "build-01".into(),
+            22,
+            "SHA256:other".into(),
+        )
+        .unwrap();
+        assert_eq!(again, "new");
+        assert_eq!(std::fs::read(&known).unwrap(), before);
     }
 }

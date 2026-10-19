@@ -87,6 +87,11 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             fingerprint TEXT NOT NULL,
             accepted_at INTEGER,
             PRIMARY KEY (host, port)
+        );
+        CREATE TABLE IF NOT EXISTS known_host_clears (
+            host TEXT NOT NULL,
+            port INTEGER NOT NULL,
+            PRIMARY KEY (host, port)
         );",
     )?;
     Ok(())
@@ -124,14 +129,151 @@ pub fn trust_host_key(conn: &Connection, host: &str, port: u16, fingerprint: &st
          ON CONFLICT(host, port) DO UPDATE SET fingerprint=excluded.fingerprint, accepted_at=excluded.accepted_at",
         params![host, port, fingerprint, now_ms],
     )?;
+    conn.execute("DELETE FROM known_host_clears WHERE host=?1 AND port=?2", params![host, port])?;
     Ok(())
 }
 
 /// 清除后下次连接按首次连接处理，需要重新确认指纹。
+/// 只删应用自己的记录。`~/.ssh/known_hosts` 不写。
 pub fn clear_fingerprint(conn: &Connection, host: &str, port: u16) -> Result<()> {
     ensure_schema(conn)?;
     conn.execute("DELETE FROM known_hosts WHERE host=?1 AND port=?2", params![host, port])?;
+    conn.execute(
+        "INSERT INTO known_host_clears (host, port) VALUES (?1, ?2)
+         ON CONFLICT(host, port) DO NOTHING",
+        params![host, port],
+    )?;
     Ok(())
+}
+
+pub(crate) fn saved_fingerprint(conn: &Connection, host: &str, port: u16) -> Result<Option<String>> {
+    ensure_schema(conn)?;
+    let row = conn
+        .query_row(
+            "SELECT fingerprint FROM known_hosts WHERE host=?1 AND port=?2",
+            params![host, port],
+            |r| r.get(0),
+        )
+        .ok();
+    Ok(row)
+}
+
+pub(crate) fn fingerprint_was_cleared(conn: &Connection, host: &str, port: u16) -> Result<bool> {
+    ensure_schema(conn)?;
+    let hit = conn
+        .query_row(
+            "SELECT 1 FROM known_host_clears WHERE host=?1 AND port=?2",
+            params![host, port],
+            |_| Ok(()),
+        )
+        .is_ok();
+    Ok(hit)
+}
+
+/// 应用记录优先。没有记录时再看文件里的指纹。
+/// 用户点过「清除指纹」之后，在重新确认前不采用文件里的旧指纹。
+pub fn decide_host_key(saved: Option<&str>, cleared: bool, file_fps: &[String], presented: &str) -> HostKeyStatus {
+    if let Some(saved) = saved {
+        return if saved == presented { HostKeyStatus::Match } else { HostKeyStatus::Changed };
+    }
+    if cleared {
+        return HostKeyStatus::New;
+    }
+    if file_fps.iter().any(|fp| fp == presented) {
+        return HostKeyStatus::Match;
+    }
+    if !file_fps.is_empty() {
+        return HostKeyStatus::Changed;
+    }
+    HostKeyStatus::New
+}
+
+/// 探测阶段记下的指纹，和重连时服务器出示的指纹。
+/// 只有 `Accept` 之后才可以送出口令。指纹被换掉时是 `Reject`，口令不会发出去。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PresentedKey {
+    Accept(HostKeyStatus),
+    Reject(String),
+    Confirm(String),
+}
+
+impl PresentedKey {
+    pub fn sends_credentials(&self) -> bool {
+        matches!(self, PresentedKey::Accept(_))
+    }
+}
+
+/// `accept_new` 时必须带上用户确认过的指纹。服务器出示另一把钥匙就拒绝。
+pub fn classify_presented_key(
+    saved: Option<&str>,
+    cleared: bool,
+    file_fps: &[String],
+    presented: &str,
+    accept_new: bool,
+    confirmed: Option<&str>,
+) -> PresentedKey {
+    if accept_new {
+        let want = confirmed.map(str::trim).filter(|value| !value.is_empty());
+        return match want {
+            Some(want) if want == presented => {
+                let status = if saved == Some(presented) {
+                    HostKeyStatus::Match
+                } else {
+                    HostKeyStatus::New
+                };
+                PresentedKey::Accept(status)
+            }
+            Some(_) => PresentedKey::Reject(presented.to_string()),
+            None => PresentedKey::Confirm(presented.to_string()),
+        };
+    }
+    match decide_host_key(saved, cleared, file_fps, presented) {
+        HostKeyStatus::Changed => PresentedKey::Reject(presented.to_string()),
+        HostKeyStatus::New => PresentedKey::Confirm(presented.to_string()),
+        HostKeyStatus::Match => PresentedKey::Accept(HostKeyStatus::Match),
+    }
+}
+
+pub fn remote_write_unsupported() -> Error {
+    Error::new(ErrorCode::InvalidState, "远程写入还没支持")
+}
+
+/// 只读 `known_hosts` 文件，不创建、不追加。
+pub fn fingerprints_in_file(path: &std::path::Path, host: &str, port: u16) -> Result<Vec<String>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let keys = russh::keys::known_hosts::known_host_keys_path(host, port, path).map_err(|err| {
+        Error::new(ErrorCode::Io, format!("读取 known_hosts 失败：{err}"))
+    })?;
+    Ok(keys
+        .into_iter()
+        .map(|(_, key)| format!("{}", key.fingerprint(russh::keys::HashAlg::Sha256)))
+        .collect())
+}
+
+pub fn host_key_with_file(
+    conn: &Connection,
+    path: &std::path::Path,
+    host: &str,
+    port: u16,
+    presented: &str,
+) -> Result<HostKeyStatus> {
+    let saved = saved_fingerprint(conn, host, port)?;
+    let cleared = fingerprint_was_cleared(conn, host, port)?;
+    let file_fps = fingerprints_in_file(path, host, port)?;
+    Ok(decide_host_key(saved.as_deref(), cleared, &file_fps, presented))
+}
+
+pub fn reject_if_host_key_changed(status: HostKeyStatus, fingerprint: &str) -> Result<()> {
+    if status == HostKeyStatus::Changed {
+        Err(Error::new(
+            ErrorCode::HostkeyChanged,
+            format!("主机指纹变了，需要清除指纹后重新确认：{fingerprint}"),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn shell_quote(s: &str) -> String {
@@ -265,6 +407,14 @@ impl RuntimeLog {
         self.lines.push(LogLine {
             category: REMOTE_EXEC_CATEGORY.into(),
             message: redact_remote_command(cmd),
+        });
+    }
+
+    /// SFTP 改名路径。不用 `rename:` 加编号，避免和故障注入阶段串在一起。
+    pub fn record_sftp_rename(&mut self, message: &str) {
+        self.lines.push(LogLine {
+            category: "sftp-rename".into(),
+            message: message.to_string(),
         });
     }
 
@@ -438,5 +588,66 @@ Host intranet-jump\n  HostName 10.1.0.4\n  User ops\n  ProxyJump jump.example\n"
         let via = remote_hash_or_sftp(&mut RuntimeLog::default(), true, &paths).unwrap();
         assert!(via.command.is_some());
         assert_eq!(via.sftp_paths.len(), 3);
+    }
+
+    const SAMPLE_FP: &str = "SHA256:ldyiXa1JQakitNU5tErauu8DvWQ1dZ7aXu+rm7KQuog";
+    const SAMPLE_LINE: &str =
+        "build-01 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILagOJFgwaMNhBWQINinKOXmqS4Gh5NgxgriXwdOoINJ\n";
+
+    #[test]
+    fn known_hosts_file_is_read_and_never_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        std::fs::write(&path, SAMPLE_LINE).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let conn = Connection::open(dir.path().join("k.sqlite")).unwrap();
+
+        let fps = fingerprints_in_file(&path, "build-01", 22).unwrap();
+        assert_eq!(fps, vec![SAMPLE_FP.to_string()]);
+        assert_eq!(
+            host_key_with_file(&conn, &path, "build-01", 22, SAMPLE_FP).unwrap(),
+            HostKeyStatus::Match
+        );
+        let changed = host_key_with_file(&conn, &path, "build-01", 22, "SHA256:other").unwrap();
+        assert_eq!(changed, HostKeyStatus::Changed);
+        assert_eq!(reject_if_host_key_changed(changed, "SHA256:other").unwrap_err().code_str(), "E_HOSTKEY_CHANGED");
+
+        clear_fingerprint(&conn, "build-01", 22).unwrap();
+        assert_eq!(
+            host_key_with_file(&conn, &path, "build-01", 22, "SHA256:other").unwrap(),
+            HostKeyStatus::New
+        );
+        trust_host_key(&conn, "build-01", 22, "SHA256:other", 2).unwrap();
+        assert_eq!(
+            host_key_with_file(&conn, &path, "build-01", 22, "SHA256:other").unwrap(),
+            HostKeyStatus::Match
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        assert_eq!(
+            decide_host_key(Some(SAMPLE_FP), false, &[], "SHA256:nope"),
+            HostKeyStatus::Changed
+        );
+        assert_eq!(decide_host_key(None, false, &[], SAMPLE_FP), HostKeyStatus::New);
+    }
+
+    #[test]
+    fn swapped_fingerprint_between_probe_and_reconnect_is_rejected() {
+        let probed = "SHA256:probe-key";
+        let swapped = "SHA256:mitm-key";
+        let probe = classify_presented_key(None, false, &[], probed, false, None);
+        assert!(!probe.sends_credentials());
+        assert!(matches!(probe, PresentedKey::Confirm(fp) if fp == probed));
+
+        let mitm = classify_presented_key(None, false, &[], swapped, true, Some(probed));
+        assert!(!mitm.sends_credentials(), "指纹被换掉之后不能送出口令");
+        assert!(matches!(mitm, PresentedKey::Reject(fp) if fp == swapped));
+
+        let rebound = classify_presented_key(None, false, &[], probed, true, Some(probed));
+        assert!(matches!(rebound, PresentedKey::Accept(HostKeyStatus::New)));
+        assert!(rebound.sends_credentials());
+
+        let unbound = classify_presented_key(None, false, &[], probed, true, None);
+        assert!(!unbound.sends_credentials());
     }
 }

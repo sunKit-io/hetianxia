@@ -39,6 +39,15 @@ zopfli = "=0.8.1"
 # filetime 在 redox 目标上依赖 libredox。0.9.x 的清单用了 resolver 3，Rust 1.83 读不了。
 libredox = "=0.1.17"
 redox_syscall = "=0.8.1"
+# russh 的 home 0.5.12、rand 0.9 的 getrandom 0.3.4 都要用 edition 2024。钉在还能用 1.83 的版本。
+home = "=0.5.11"
+getrandom = "=0.3.3"
+tokio = { version = "=1.40.0", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync"] }
+# 0.54.6 是最后一版能在 Rust 1.83 上编译的 russh。加密后端用 ring，不拉 aws-lc。
+# ssh-key 不单独依赖：这个版本用的是 internal-russh-forked-ssh-key 0.6.11，经 russh::keys 导出。
+russh = { version = "=0.54.6", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh-sftp = "=2.1.1"
+keyring = { version = "=3.6.3", features = ["apple-native", "windows-native", "linux-native"] }
 
 [dev-dependencies]
 proptest = "=1.5.0"

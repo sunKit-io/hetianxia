@@ -5,6 +5,8 @@ use hetianxia_core::merge::{self, Decision, Rendered};
 use hetianxia_core::pathutil::Ignore;
 use hetianxia_core::remote::{self, ImportedHost};
 use hetianxia_core::scan::{self, ScanOptions, ScanOutput};
+use hetianxia_core::secrets::{self, KeyringStore, SecretStatus, SecretStore};
+use hetianxia_core::sftp::{self, ProbeReport, ProbeRequest};
 use hetianxia_core::vfs::LocalFs;
 use std::path::{Path, PathBuf};
 
@@ -94,4 +96,82 @@ pub fn startup_offers(session: tauri::State<crate::Session>) -> Vec<hetianxia_co
 #[tauri::command]
 pub fn connections(ssh_config: String) -> Result<Vec<ImportedHost>, Error> {
     Ok(remote::parse_ssh_config(&ssh_config))
+}
+
+#[tauri::command]
+pub fn ssh_secret_service() -> String {
+    secrets::KEYRING_SERVICE.to_string()
+}
+
+#[tauri::command]
+pub fn save_ssh_secret(account: String, secret: String) -> Result<SecretStatus, Error> {
+    KeyringStore.set(&account, &secret)?;
+    Ok(SecretStatus { saved: true })
+}
+
+#[tauri::command]
+pub fn ssh_secret_status(account: String) -> Result<SecretStatus, Error> {
+    secrets::status(&KeyringStore, &account)
+}
+
+#[tauri::command]
+pub fn delete_ssh_secret(account: String) -> Result<(), Error> {
+    KeyringStore.delete(&account)
+}
+
+#[tauri::command]
+pub fn host_key_status(
+    db_path: String,
+    known_hosts_path: String,
+    host: String,
+    port: u16,
+    fingerprint: String,
+) -> Result<String, Error> {
+    let db = exec::open_db(Path::new(&db_path))?;
+    let status = remote::host_key_with_file(&db, Path::new(&known_hosts_path), &host, port, &fingerprint)?;
+    remote::reject_if_host_key_changed(status, &fingerprint)?;
+    Ok(match status {
+        remote::HostKeyStatus::New => "new",
+        remote::HostKeyStatus::Match => "match",
+        remote::HostKeyStatus::Changed => "changed",
+    }
+    .to_string())
+}
+
+#[tauri::command]
+pub fn clear_host_fingerprint(db_path: String, host: String, port: u16) -> Result<(), Error> {
+    let db = exec::open_db(Path::new(&db_path))?;
+    remote::clear_fingerprint(&db, &host, port)
+}
+
+#[tauri::command]
+pub fn trust_host_fingerprint(db_path: String, host: String, port: u16, fingerprint: String) -> Result<(), Error> {
+    let db = exec::open_db(Path::new(&db_path))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    remote::trust_host_key(&db, &host, port, &fingerprint, now)
+}
+
+#[tauri::command]
+pub fn remote_backup_path(home: String, exec_id: String) -> Result<String, Error> {
+    sftp::remote_backup_dir(&home, &exec_id)
+}
+
+#[tauri::command]
+pub fn remote_rename_plan(posix_rename: bool) -> Vec<String> {
+    sftp::rename_steps(posix_rename).iter().map(|s| (*s).to_string()).collect()
+}
+
+#[tauri::command]
+pub fn probe_remote(mut req: ProbeRequest) -> Result<ProbeReport, Error> {
+    // 界面带上来的口令一律丢掉。连接时只从钥匙串按连接 id 读取。
+    req.secret.clear();
+    if let Some(account) = req.account.clone() {
+        if let Some(secret) = KeyringStore.get(&account)? {
+            req.secret = secret;
+        }
+    }
+    sftp::probe_connection(&mut req)
 }

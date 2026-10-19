@@ -1,3 +1,8 @@
 [workspace]
 members = ["crates/core", "src-tauri"]
 resolver = "2"
+
+# russh 0.54.6 依赖 libcrux-ml-kem 0.0.3。这个版本已从 crates.io 索引撤下，
+# 安装包仍可下载。放在仓库里，避免为了换 russh 升到 edition 2024 / Rust 1.85。
+[patch.crates-io]
+libcrux-ml-kem = { path = "third_party/libcrux-ml-kem" }
