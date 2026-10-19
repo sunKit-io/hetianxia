@@ -62,8 +62,12 @@ pub fn is_zip_slip(name: &str) -> bool {
 }
 
 pub fn decode_entry_name(bytes: &[u8], utf8: bool) -> Result<String> {
-    if utf8 {
-        String::from_utf8(bytes.to_vec()).map_err(|_| Error::new(ErrorCode::ZipEncoding, "zip 文件名不是合法的 UTF-8"))
+    // 标志打开时只接受 UTF-8。标志关闭时，字节本身是合法 UTF-8 就按 UTF-8
+    // （访达“压缩”经常不置标志），否则再按 GBK。两种都解不开才是 E_ZIP_ENCODING。
+    if utf8 || std::str::from_utf8(bytes).is_ok() {
+        std::str::from_utf8(bytes)
+            .map(|s| s.to_string())
+            .map_err(|_| Error::new(ErrorCode::ZipEncoding, "zip 文件名不是合法的 UTF-8"))
     } else {
         let (cow, _, had_errors) = encoding_rs::GBK.decode(bytes);
         if had_errors {
@@ -400,6 +404,64 @@ mod tests {
         let report = extract(&zip_path, &dest).unwrap();
         assert_eq!(report.files, vec!["说明.txt".to_string()]);
         assert_eq!(fs::read(dest.join("说明.txt")).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn extract_keeps_utf8_names_when_the_flag_is_off() {
+        let name = "说明.txt";
+        let raw = name.as_bytes();
+        let (as_gbk, _, gbk_errors) = encoding_rs::GBK.decode(raw);
+        assert!(!gbk_errors);
+        assert_ne!(as_gbk.as_ref(), name);
+        assert_eq!(decode_entry_name(raw, false).unwrap(), name);
+
+        let placeholder = "n".repeat(raw.len());
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("finder.zip");
+        let mut w = ZipWriter::new(File::create(&zip_path).unwrap());
+        w.start_file(&placeholder, SimpleFileOptions::default()).unwrap();
+        w.write_all(b"hi").unwrap();
+        w.finish().unwrap();
+        let mut bytes = fs::read(&zip_path).unwrap();
+        replace_name(&mut bytes, placeholder.as_bytes(), raw);
+        clear_utf8_name_flag(&mut bytes);
+        fs::write(&zip_path, &bytes).unwrap();
+        assert!(!utf8_flag(&zip_path, 0).unwrap());
+        let dest = dir.path().join("out");
+        let report = extract(&zip_path, &dest).unwrap();
+        assert_eq!(report.files, vec![name.to_string()]);
+        assert_eq!(fs::read(dest.join(name)).unwrap(), b"hi");
+    }
+
+    fn replace_name(bytes: &mut [u8], from: &[u8], to: &[u8]) {
+        assert_eq!(from.len(), to.len());
+        let mut hits = 0;
+        let mut i = 0;
+        while i + from.len() <= bytes.len() {
+            if &bytes[i..i + from.len()] == from {
+                bytes[i..i + to.len()].copy_from_slice(to);
+                hits += 1;
+                i += from.len();
+            } else {
+                i += 1;
+            }
+        }
+        assert!(hits >= 2, "local and central names, got {hits}");
+    }
+
+    fn clear_utf8_name_flag(bytes: &mut [u8]) {
+        let mut i = 0;
+        while i + 10 < bytes.len() {
+            if bytes[i..i + 4] == [0x50, 0x4b, 0x03, 0x04] {
+                let flags = u16::from_le_bytes(bytes[i + 6..i + 8].try_into().unwrap()) & !(1 << 11);
+                bytes[i + 6..i + 8].copy_from_slice(&flags.to_le_bytes());
+            }
+            if bytes[i..i + 4] == [0x50, 0x4b, 0x01, 0x02] {
+                let flags = u16::from_le_bytes(bytes[i + 8..i + 10].try_into().unwrap()) & !(1 << 11);
+                bytes[i + 8..i + 10].copy_from_slice(&flags.to_le_bytes());
+            }
+            i += 1;
+        }
     }
 
     #[test]
