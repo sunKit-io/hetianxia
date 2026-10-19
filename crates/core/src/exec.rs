@@ -1042,7 +1042,7 @@ pub enum RunStart {
     },
 }
 
-/// 占住 run.lock。异常退出时先核对 needs_verify，再做崩溃恢复。锁一直拿到调用方放开为止。
+/// 占住 run.lock。状态是 `running` 时先核对 needs_verify，再做崩溃恢复。锁一直拿到调用方放开为止。
 pub fn begin_run(db: &Connection, fsys: &LocalFs, data_dir: &Path) -> Result<RunStart> {
     match crate::runlock::acquire_run_lock(data_dir)? {
         crate::runlock::RunAcquire::AnotherInstance => Ok(RunStart::AnotherInstance),
@@ -5062,7 +5062,7 @@ mod tests {
         let (db, fsys, id) = needs_verify_after_user_edit(dir.path());
         let data = dir.path().join("data");
         fs::create_dir_all(&data).unwrap();
-        fs::write(data.join("run.lock"), b"pid=1\nstart=1\n").unwrap();
+        fs::write(data.join("run.lock"), b"status=running\npid=1\nstart=1\n").unwrap();
         let started = begin_run(&db, &fsys, &data).unwrap();
         let RunStart::Started { abnormal_exit, offers, lock } = started else { panic!("expected the lock"); };
         assert!(abnormal_exit);
@@ -5072,8 +5072,12 @@ mod tests {
         assert_eq!(offers[0].actions, vec!["继续回滚".to_string(), "稍后处理".to_string()]);
         let state: String = db.query_row("SELECT rollback_state FROM exec_ops WHERE exec_id=?1", params![id], |r| r.get(0)).unwrap();
         assert_eq!(state, "failed");
+        let while_running = fs::read_to_string(data.join("run.lock")).unwrap();
+        assert!(while_running.starts_with("status=running\n"), "{while_running}");
         lock.release_clean().unwrap();
-        assert!(!data.join("run.lock").exists());
+        assert!(data.join("run.lock").is_file());
+        let cleaned = fs::read_to_string(data.join("run.lock")).unwrap();
+        assert!(cleaned.starts_with("status=clean\n"), "{cleaned}");
     }
 
     #[test]
@@ -5081,6 +5085,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (db, fsys, id) = needs_verify_after_user_edit(dir.path());
         let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("run.lock"), b"status=clean\npid=1\nstart=1\n").unwrap();
         let started = begin_run(&db, &fsys, &data).unwrap();
         let RunStart::Started { abnormal_exit, offers, lock } = started else { panic!("expected a new lock"); };
         assert!(!abnormal_exit);
@@ -5093,19 +5099,21 @@ mod tests {
         assert_eq!(listed[0].result, "已回滚");
         let nv: i64 = db.query_row("SELECT needs_verify FROM exec_ops WHERE exec_id=?1", params![id], |r| r.get(0)).unwrap();
         assert_eq!(nv, 1);
+        assert!(fs::read_to_string(data.join("run.lock")).unwrap().starts_with("status=running\n"));
         lock.release_clean().unwrap();
+        assert!(data.join("run.lock").is_file());
+        assert!(fs::read_to_string(data.join("run.lock")).unwrap().starts_with("status=clean\n"));
     }
 
     #[test]
-    fn rec_29_second_instance_does_not_touch_run_lock() {
+    fn rec_29_lock_failure_exits_without_touching_run_lock() {
         let dir = tempfile::tempdir().unwrap();
         let (db, fsys, id) = needs_verify_after_user_edit(dir.path());
         let data = dir.path().join("data");
         let first = crate::runlock::acquire_run_lock(&data).unwrap();
         let crate::runlock::RunAcquire::Held(lock) = first else { panic!("first lock"); };
         let body = fs::read(data.join("run.lock")).unwrap();
-        assert!(body.windows(4).any(|w| w == b"pid="));
-        assert!(body.windows(6).any(|w| w == b"start="));
+        assert!(body.starts_with(b"status=running\n"));
         let second = crate::runlock::acquire_run_lock(&data).unwrap();
         assert!(matches!(second, crate::runlock::RunAcquire::AnotherInstance));
         assert_eq!(fs::read(data.join("run.lock")).unwrap(), body);
@@ -5117,6 +5125,43 @@ mod tests {
         let nv: i64 = db.query_row("SELECT needs_verify FROM exec_ops WHERE exec_id=?1", params![id], |r| r.get(0)).unwrap();
         assert_eq!(nv, 1);
         drop(lock);
+    }
+
+    #[test]
+    fn rec_29_running_status_rechecks_needs_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, fsys, id) = needs_verify_after_user_edit(dir.path());
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("run.lock"), b"status=running\npid=4\nstart=4\n").unwrap();
+        let started = begin_run(&db, &fsys, &data).unwrap();
+        let RunStart::Started { abnormal_exit, lock, .. } = started else { panic!("expected the lock"); };
+        assert!(abnormal_exit);
+        assert_eq!(journal_state(&db, &id), "ROLLBACK_PARTIAL");
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"user-edit");
+        lock.release_clean().unwrap();
+    }
+
+    #[test]
+    fn rec_29_clean_or_empty_lock_skips_reverify() {
+        let check = |prior: &[u8]| {
+            let dir = tempfile::tempdir().unwrap();
+            let (db, fsys, id) = needs_verify_after_user_edit(dir.path());
+            let data = dir.path().join("data");
+            fs::create_dir_all(&data).unwrap();
+            fs::write(data.join("run.lock"), prior).unwrap();
+            let started = begin_run(&db, &fsys, &data).unwrap();
+            let RunStart::Started { abnormal_exit, lock, .. } = started else { panic!("expected the lock"); };
+            assert!(!abnormal_exit);
+            assert_eq!(journal_state(&db, &id), "ROLLED_BACK");
+            assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"user-edit");
+            let nv: i64 = db.query_row("SELECT needs_verify FROM exec_ops WHERE exec_id=?1", params![id], |r| r.get(0)).unwrap();
+            assert_eq!(nv, 1);
+            lock.release_clean().unwrap();
+            assert!(data.join("run.lock").is_file());
+        };
+        check(b"status=clean\npid=1\nstart=1\n");
+        check(b"");
     }
 
     #[test]
@@ -5133,7 +5178,7 @@ mod tests {
         db.execute("UPDATE exec_ops SET needs_verify=1, rollback_state='done' WHERE exec_id=?1", params![p.id]).unwrap();
         let data = dir.path().join("data");
         fs::create_dir_all(&data).unwrap();
-        fs::write(data.join("run.lock"), b"pid=9\nstart=9\n").unwrap();
+        fs::write(data.join("run.lock"), b"status=running\npid=9\nstart=9\n").unwrap();
         let started = begin_run(&db, &fsys, &data).unwrap();
         let RunStart::Started { abnormal_exit, lock, .. } = started else { panic!("lock"); };
         assert!(abnormal_exit);
