@@ -79,25 +79,40 @@ jobs:
           echo "证书已配置。正式 dmg 打包命令见 README。"
 
   package-mac:
-    if: hashFiles('src-tauri/tauri.conf.json') != ''
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+      - id: app
+        name: detect the Tauri app
+        run: |
+          if [ -f src-tauri/tauri.conf.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "这一支还没有桌面壳，跳过 .app 和 dmg 扫描。"
+          fi
       - uses: dtolnay/rust-toolchain@1.83.0
+        if: steps.app.outputs.present == 'true'
       - uses: pnpm/action-setup@v4
+        if: steps.app.outputs.present == 'true'
         with:
           version: 10
       - uses: actions/setup-node@v4
+        if: steps.app.outputs.present == 'true'
         with:
           node-version: 22
           cache: pnpm
       - name: install frontend
+        if: steps.app.outputs.present == 'true'
         run: pnpm install --frozen-lockfile
       - name: build the release app and dmg
+        if: steps.app.outputs.present == 'true'
         run: pnpm exec tauri build --bundles dmg
       - name: scan the built app and the executable inside the dmg
+        if: steps.app.outputs.present == 'true'
         run: python3 scripts/scan_release_strings.py --forbid src-tauri/target/release/bundle
       - name: fault-inject build is caught
+        if: steps.app.outputs.present == 'true'
         run: |
           cargo build --release --locked --manifest-path src-tauri/Cargo.toml --features fault-inject
           python3 scripts/scan_release_strings.py --require-sentinel src-tauri/target/release/hetianxia
