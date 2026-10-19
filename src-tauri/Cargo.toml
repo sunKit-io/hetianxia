@@ -15,9 +15,9 @@ hetianxia-core = { path = "../crates/core" }
 serde = { version = "=1.0.214", features = ["derive"] }
 serde_json = "=1.0.132"
 tauri = "=2.1.1"
-tauri-plugin-single-instance = "=2.0.1"
-# 插件在 Linux 上用 zbus 4。不钉的话会拉到需要 Rust 1.85 的传递依赖。
-zbus = "=4.3.1"
+# 不依赖 tauri-plugin-single-instance。它在 Linux 上依赖 zbus 4，
+# 而 cargo-deny 会把各平台依赖合在一起，macOS 引用这个插件也会带上 zvariant_derive。
+# 单实例见 crates/core/src/instance.rs。
 proc-macro-crate = "=3.1.0"
 async-lock = "=3.4.0"
 tauri-utils = "=2.1.0"

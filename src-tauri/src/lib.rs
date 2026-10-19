@@ -1,7 +1,8 @@
 //! 合天下桌面壳。界面只通过命令层调用核心。
 //! macOS 正式包用 universal-apple-darwin 打出一份双架构二进制。
 //!
-//! 第二个进程由单实例插件把已有窗口拉到前面，然后自己退出，不改 `run.lock`。
+//! 第二个进程把已有窗口拉到前面，然后自己退出，不改 `run.lock`。
+//! 三个平台都用本机 TCP 认主进程，不依赖会带上 zbus 的单实例插件。
 //! `begin_run` 在任何恢复提示之前完成：先核对崩溃那次的 `needs_verify`，再写新的 `run_id`。
 //! 窗口关闭、退出请求和进程退出都会 `release_clean`。
 
@@ -19,8 +20,33 @@ pub struct Session {
     offers: Vec<hetianxia_core::exec::RecoveryOffer>,
 }
 
+fn claim_primary(data: &std::path::Path, app: tauri::AppHandle) -> bool {
+    let path = data.join("single.port");
+    match hetianxia_core::instance::claim_instance(&path) {
+        Ok((hetianxia_core::instance::InstanceRole::Secondary, _)) => false,
+        Ok((hetianxia_core::instance::InstanceRole::Primary, Some(listener))) => {
+            std::thread::spawn(move || {
+                for conn in listener.incoming().flatten() {
+                    drop(conn);
+                    let app = app.clone();
+                    let _ = app.run_on_main_thread(move || {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
+                    });
+                }
+            });
+            true
+        }
+        _ => true,
+    }
+}
+
 fn end_session(session: &Session) {
-    let Ok(mut guard) = session.lock.lock() else { return };
+    let Ok(mut guard) = session.lock.lock() else {
+        return;
+    };
     let Some(lock) = guard.take() else { return };
     if let Ok(db) = hetianxia_core::exec::open_db(&session.db_path) {
         let _ = lock.release_clean(&db);
@@ -30,18 +56,19 @@ fn end_session(session: &Session) {
 pub fn run() {
     hetianxia_core::boot();
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
-                let _ = window.set_focus();
-            }
-        }))
         .setup(|app| {
             let data = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data)?;
+            if !claim_primary(&data, app.handle().clone()) {
+                std::process::exit(0);
+            }
             let db_path = data.join("hetianxia.sqlite");
             let saved = std::fs::read_to_string(data.join("project-root")).unwrap_or_default();
-            let root = if saved.trim().is_empty() { data.clone() } else { PathBuf::from(saved.trim()) };
+            let root = if saved.trim().is_empty() {
+                data.clone()
+            } else {
+                PathBuf::from(saved.trim())
+            };
             let db = hetianxia_core::exec::open_db(&db_path)?;
             let fsys = hetianxia_core::vfs::LocalFs::new(&root);
             let session = match hetianxia_core::exec::begin_run(&db, &fsys, &data)? {
@@ -113,7 +140,8 @@ mod tests {
         assert!(!conf.contains("\"frontendDist\": \"ui\""));
         assert_eq!(MACOS_TARGET, "universal-apple-darwin");
         let source = include_str!("lib.rs");
-        assert!(source.contains("tauri_plugin_single_instance"));
+        assert!(source.contains("claim_instance"));
+        assert!(!source.contains("tauri_plugin_single_instance"));
         assert!(source.contains("begin_run"));
         assert!(source.contains("release_clean"));
         assert!(source.contains("startup_offers"));
@@ -144,9 +172,17 @@ mod tests {
         let right = dir.path().join("right");
         std::fs::create_dir(&right).unwrap();
         std::fs::write(right.join("a.txt"), "new\n").unwrap();
-        let scanned = commands::scan(dir.path().display().to_string(), right.display().to_string()).unwrap();
+        let scanned = commands::scan(
+            dir.path().display().to_string(),
+            right.display().to_string(),
+        )
+        .unwrap();
         assert!(scanned.files.iter().any(|f| f.rel == "a.txt"));
-        let compared = commands::compare(dir.path().display().to_string(), right.display().to_string()).unwrap();
+        let compared = commands::compare(
+            dir.path().display().to_string(),
+            right.display().to_string(),
+        )
+        .unwrap();
         assert_eq!(compared.files.len(), scanned.files.len());
 
         let diff = commands::diff("old\n".into(), "new\n".into()).unwrap();
@@ -172,7 +208,10 @@ mod tests {
                 readonly: false,
                 label: "覆盖".into(),
             }],
-            summary: Summary { overwrite: 1, ..Summary::default() },
+            summary: Summary {
+                overwrite: 1,
+                ..Summary::default()
+            },
         };
         let report = commands::execute(
             db.display().to_string(),
@@ -195,7 +234,9 @@ mod tests {
         .unwrap();
         assert_eq!(rolled.state, "ROLLED_BACK");
 
-        let hosts = commands::connections("Host build-01\n  HostName 10.0.8.15\n  User deploy\n".into()).unwrap();
+        let hosts =
+            commands::connections("Host build-01\n  HostName 10.0.8.15\n  User deploy\n".into())
+                .unwrap();
         assert_eq!(hosts[0].alias, "build-01");
         assert!(hosts[0].available());
 
@@ -206,7 +247,11 @@ mod tests {
         );
         assert_eq!(
             commands::remote_rename_plan(false),
-            vec!["rename-backup".to_string(), "rename-replace".into(), "delete-backup".into()]
+            vec![
+                "rename-backup".to_string(),
+                "rename-replace".into(),
+                "delete-backup".into()
+            ]
         );
         let known = dir.path().join("known_hosts");
         std::fs::write(
