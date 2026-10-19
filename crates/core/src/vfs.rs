@@ -381,6 +381,7 @@ impl LocalFs {
                 continue;
             }
             fs::create_dir(&p)?;
+            fsync_parent(&p)?;
             created.push(acc.clone());
         }
         Ok(created)
@@ -388,7 +389,7 @@ impl LocalFs {
 
     pub fn copy_to(&self, rel: &RelPath, dest: &Path) -> Result<()> {
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
+            create_dir_all_synced(parent)?;
         }
         let src = self.abs(rel)?;
         let meta = fs::symlink_metadata(&src)?;
@@ -402,15 +403,14 @@ impl LocalFs {
     }
 
     /// `register` 在创建临时文件之前调用，把名字写进事务日志。
-    /// 改名成功后先调用 `after_rename`（调用方在这里把文件记成已恢复），再 fsync 父目录。
-    /// 目录同步失败时目标文件留在原地，不删。
-    pub fn copy_in_atomic<R, G, A>(
+    /// 改名成功后先调用 `after_rename`（调用方在这里把文件记成已恢复），再恢复模式和修改时间。
+    /// 这一步不同步父目录。调用方删掉另一侧之后再 fsync。
+    pub fn copy_in_renamed<R, G, A>(
         &self,
         src: &Path,
         dest: &RelPath,
         mode: Option<u32>,
         mtime_ms: Option<i64>,
-        before_dir_fsync: impl FnOnce() -> Result<()>,
         register: R,
         forget: G,
         after_rename: A,
@@ -439,8 +439,34 @@ impl LocalFs {
         forget(&tmp);
         after_rename()?;
         if mtime_ms.is_some() || mode.is_some() {
-            self.set_meta(dest, mode, mtime_ms)?;
+            if let Err(e) = self.set_meta(dest, mode, mtime_ms) {
+                return Err(Error::new(
+                    ErrorCode::Io,
+                    format!("模式或修改时间可能没有恢复：{}", e.message),
+                ));
+            }
         }
+        Ok(())
+    }
+
+    /// 改名并恢复属性之后同步父目录。目录同步失败时目标文件留在原地，不删。
+    pub fn copy_in_atomic<R, G, A>(
+        &self,
+        src: &Path,
+        dest: &RelPath,
+        mode: Option<u32>,
+        mtime_ms: Option<i64>,
+        before_dir_fsync: impl FnOnce() -> Result<()>,
+        register: R,
+        forget: G,
+        after_rename: A,
+    ) -> Result<()>
+    where
+        R: FnOnce(&RelPath) -> Result<()>,
+        G: FnOnce(&RelPath),
+        A: FnOnce() -> Result<()>,
+    {
+        self.copy_in_renamed(src, dest, mode, mtime_ms, register, forget, after_rename)?;
         self.fsync_parent_of(dest, before_dir_fsync)?;
         Ok(())
     }
@@ -597,6 +623,27 @@ fn chflags(path: &Path, flags: u32) -> Result<()> {
     let rc = unsafe { libc::chflags(c.as_ptr(), flags as libc::c_uint) };
     if rc != 0 {
         return Err(Error::new(ErrorCode::Io, "chflags 失败"));
+    }
+    Ok(())
+}
+
+/// 逐层创建还不存在的目录，每新建一层就同步它的父目录。
+pub fn create_dir_all_synced(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() || path.exists() {
+        return Ok(());
+    }
+    let mut missing = Vec::new();
+    let mut cur = path.to_path_buf();
+    while !cur.exists() {
+        missing.push(cur.clone());
+        match cur.parent() {
+            Some(up) if !up.as_os_str().is_empty() => cur = up.to_path_buf(),
+            _ => break,
+        }
+    }
+    for dir in missing.iter().rev() {
+        fs::create_dir(dir)?;
+        fsync_parent(dir)?;
     }
     Ok(())
 }
