@@ -10,6 +10,7 @@ pub mod merge;
 pub mod model;
 pub mod osinfo;
 pub mod pathutil;
+pub mod plans;
 pub mod prefs;
 pub mod remote;
 pub mod runlock;
