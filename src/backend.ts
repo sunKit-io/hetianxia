@@ -17,3 +17,41 @@ export function startupOffers() {
 export function startupFailure() {
   return invoke<string | null>("startup_failure");
 }
+
+export type RemoteWritePrompt = {
+  title: string;
+  body: string;
+  backupDir: string;
+  cancelLabel: string;
+  proceedLabel: string;
+  defaultButton: string;
+  execId: string;
+};
+
+export function appBakDir() {
+  return invoke<string>("app_bak_dir");
+}
+
+export function remoteWritePrompt(host: string, port: number, remotePath: string) {
+  return invoke<RemoteWritePrompt>("remote_write_prompt", { host, port, remotePath });
+}
+
+export type RemoteWriteOutcome = {
+  execId: string;
+  remotePath: string;
+  backupPath: string | null;
+};
+
+export function commitRemoteOverwrite(args: {
+  execId: string;
+  host: string;
+  port: number;
+  user: string;
+  remotePath: string;
+  bytes: number[];
+  auth: string;
+  account: string;
+  keyPath: string;
+}) {
+  return invoke<RemoteWriteOutcome>("commit_remote_overwrite", { req: args });
+}

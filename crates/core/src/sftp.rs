@@ -90,6 +90,8 @@ pub trait RemoteNames {
 }
 
 /// 和线上 SFTP 退回同一套顺序。测试不需要 sshd。
+/// 非 posix 成功时如果留下了 `.htx-bak`，返回 true。目标核对通过之后才能删它。
+/// 第二步失败时先把 `.htx-bak` 改回原名，这一步成功之后才删临时文件。
 pub fn apply_rename(
     ops: &mut dyn RemoteNames,
     log: &mut RuntimeLog,
@@ -97,15 +99,28 @@ pub fn apply_rename(
     temp: &str,
     dest: &str,
     backup: &str,
-) -> Result<()> {
+) -> Result<bool> {
     log_rename_steps(log, posix_rename);
     if posix_rename {
-        return ops.rename(temp, dest);
+        ops.rename(temp, dest)?;
+        return Ok(false);
     }
-    if ops.exists(dest)? {
+    let had_dest = ops.exists(dest)?;
+    if had_dest {
         ops.rename(dest, backup)?;
     }
-    ops.rename(temp, dest)?;
+    if let Err(err) = ops.rename(temp, dest) {
+        if had_dest {
+            ops.rename(backup, dest)?;
+        }
+        ops.remove(temp)?;
+        return Err(err);
+    }
+    Ok(had_dest)
+}
+
+/// 只在目标内容已经核对通过之后调用。
+pub fn discard_verified_backup(ops: &mut dyn RemoteNames, backup: &str) -> Result<()> {
     if ops.exists(backup)? {
         ops.remove(backup)?;
     }
@@ -428,9 +443,7 @@ impl RemoteSession {
         &mut self,
         req: crate::remote_write::RemoteWriteRequest,
     ) -> Result<crate::remote_write::CommitResult> {
-        if !req.confirmed {
-            return Ok(crate::remote_write::CommitResult::Cancelled);
-        }
+        crate::remote_write::authorize_commit(&req.exec_id, &req.host, req.port, &req.remote_path, crate::remote_write::now_ms())?;
         let dest = req.remote_path.clone();
         let original = if self.exists(&dest).await? { Some(self.read_file(&dest).await?) } else { None };
         let staged = crate::remote_write::stage_before_write(&req, original.as_deref())?;
@@ -440,21 +453,32 @@ impl RemoteSession {
             let _ = self.remove_quiet(&temp).await;
             return Err(err);
         }
-        if let Err(err) = self.replace_temp(&temp, &dest, &backup, req.posix_rename).await {
-            let _ = self.remove_quiet(&temp).await;
-            let _ = self.remove_quiet(&backup).await;
-            return Err(err);
+        let held = self.replace_temp(&temp, &dest, &backup, req.posix_rename).await?;
+        let got = self.read_file(&dest).await?;
+        let anchor = staged.backup_file.clone().unwrap_or_else(|| staged.backup_dir.clone());
+        crate::remote_write::verify_after_rename(&got, &req.bytes, &dest, &anchor)?;
+        if held {
+            self.remove_quiet(&backup).await?;
         }
-        let _ = self.remove_quiet(&temp).await;
-        let _ = self.remove_quiet(&backup).await;
         if self.exists(&temp).await? || self.exists(&backup).await? {
             return Err(Error::new(ErrorCode::Io, "远程临时文件还在"));
         }
-        let got = self.read_file(&dest).await?;
-        if hashutil::sha256_hex(&got) != hashutil::sha256_hex(&req.bytes) {
-            return Err(Error::new(ErrorCode::VerifyFailed, format!("{dest} 写入后的哈希和内容不一致")));
-        }
         Ok(crate::remote_write::CommitResult::Written(staged))
+    }
+
+    /// 给壳层用的同步入口。口令在返回前清掉。
+    pub fn commit_overwrite_blocking(
+        req: &mut ProbeRequest,
+        write: crate::remote_write::RemoteWriteRequest,
+    ) -> Result<crate::remote_write::CommitResult> {
+        let result = block_on(async {
+            let mut session = RemoteSession::connect(req).await?;
+            let committed = session.commit_overwrite(write).await?;
+            let _ = session.close().await;
+            Ok(committed)
+        });
+        req.secret.zeroize();
+        result.and_then(|inner| inner)
     }
 
     async fn write_new(&self, path: &str, bytes: &[u8]) -> Result<()> {
@@ -474,25 +498,25 @@ impl RemoteSession {
         Ok(())
     }
 
-    async fn replace_temp(&mut self, temp: &str, dest: &str, backup: &str, posix_rename: bool) -> Result<()> {
+    async fn replace_temp(&mut self, temp: &str, dest: &str, backup: &str, posix_rename: bool) -> Result<bool> {
         let use_posix = posix_rename && self.posix_rename;
         log_rename_steps(&mut self.log, use_posix);
         if use_posix {
-            return self.posix_rename_over(temp, dest).await;
+            self.posix_rename_over(temp, dest).await?;
+            return Ok(false);
         }
-        if self.exists(dest).await? {
+        let had_dest = self.exists(dest).await?;
+        if had_dest {
             self.rename_path(dest, backup).await?;
         }
         if let Err(err) = self.rename_path(temp, dest).await {
-            if self.exists(backup).await? {
-                let _ = self.rename_path(backup, dest).await;
+            if had_dest {
+                self.rename_path(backup, dest).await?;
             }
+            self.remove_quiet(temp).await?;
             return Err(err);
         }
-        if self.exists(backup).await? {
-            self.remove_quiet(backup).await?;
-        }
-        Ok(())
+        Ok(had_dest)
     }
 
     async fn posix_rename_over(&self, from: &str, to: &str) -> Result<()> {
@@ -633,16 +657,18 @@ mod tests {
             ops: Vec::new(),
         };
         let mut log = RuntimeLog::default();
-        apply_rename(&mut mem, &mut log, false, "dir/.a.txt.htx-1", "dir/a.txt", "dir/a.txt.htx-bak").unwrap();
+        let held = apply_rename(&mut mem, &mut log, false, "dir/.a.txt.htx-1", "dir/a.txt", "dir/a.txt.htx-bak").unwrap();
+        assert!(held);
         assert_eq!(
             mem.ops,
             vec![
                 "rename dir/a.txt dir/a.txt.htx-bak".to_string(),
                 "rename dir/.a.txt.htx-1 dir/a.txt".into(),
-                "remove dir/a.txt.htx-bak".into(),
             ]
         );
         assert_eq!(mem.files.get("dir/a.txt").map(Vec::as_slice), Some(b"new".as_slice()));
+        assert_eq!(mem.files.get("dir/a.txt.htx-bak").map(Vec::as_slice), Some(b"old".as_slice()));
+        discard_verified_backup(&mut mem, "dir/a.txt.htx-bak").unwrap();
         assert!(!mem.files.contains_key("dir/a.txt.htx-bak"));
         assert_eq!(log.lines[0].category, "sftp-rename");
         assert_eq!(log.lines[0].message, "rename-backup → rename-replace → delete-backup");
@@ -653,7 +679,7 @@ mod tests {
             files: BTreeMap::from([("t".into(), b"n".to_vec())]),
             ops: Vec::new(),
         };
-        apply_rename(&mut mem, &mut log, true, "t", "a", "b").unwrap();
+        assert!(!apply_rename(&mut mem, &mut log, true, "t", "a", "b").unwrap());
         assert_eq!(log.lines[0].message, "posix-rename");
         assert_eq!(mem.ops, vec!["rename t a".to_string()]);
     }

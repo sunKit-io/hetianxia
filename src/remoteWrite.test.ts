@@ -1,32 +1,53 @@
 import assert from "node:assert/strict";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import test from "node:test";
-import { appDataDir, beginRemoteWrite, settleRemoteWrite, txBackupDir } from "./remoteWrite.ts";
+import { remoteWriteBody, settleRemoteWrite, verifyFailureBody } from "./remoteWrite.ts";
 
-test("dialog names the shell backup directory and cancel writes nothing", () => {
-  const execId = "tx-100";
-  const macData = appDataDir("/Users/me", "macos");
-  assert.equal(macData, "/Users/me/Library/Application Support/com.hetianxia.app");
-  const dir = txBackupDir(macData, execId);
-  assert.equal(dir, "/Users/me/Library/Application Support/com.hetianxia.app/bak/tx-100");
-  const pending = beginRemoteWrite(macData, execId);
-  assert.equal(pending.title, "远程写入暂不支持回滚");
-  assert.equal(pending.body, `写入前会把远端原文件备份到本机（${dir}），出问题可以从这里手工恢复。`);
-  assert.equal(pending.defaultButton, "取消");
-  assert.equal(pending.cancelLabel, "取消");
-  assert.equal(pending.proceedLabel, "仍然写入");
-  assert.equal(pending.body.includes("HeTianXia"), false);
-  assert.equal(pending.body.includes("~/"), false);
-
-  const linux = txBackupDir(appDataDir("/home/ubuntu", "linux"), execId);
-  assert.equal(linux, "/home/ubuntu/.local/share/com.hetianxia.app/bak/tx-100");
+test("dialog copy uses the runtime backup path and cancel writes nothing", () => {
+  const dir = "/var/lib/hetianxia/bak/tx-100";
+  assert.equal(remoteWriteBody(dir), `写入前会把远端原文件备份到本机（${dir}），出问题可以从这里手工恢复。`);
+  const backup = `${dir}/files/opt/gateway/app.conf`;
+  const remote = "/opt/gateway/app.conf";
   assert.equal(
-    txBackupDir(appDataDir("/home/ubuntu", "linux", "/var/data"), execId),
-    "/var/data/com.hetianxia.app/bak/tx-100",
+    verifyFailureBody(remote, backup),
+    `${remote} 写入后的内容和预期不一致。写入前的原文件已备份到本机（${backup}），可以从这里手工恢复。`,
   );
-
   let writes = 0;
   assert.equal(settleRemoteWrite("取消", () => { writes += 1; }), "cancelled");
   assert.equal(writes, 0);
   assert.equal(settleRemoteWrite("仍然写入", () => { writes += 1; }), "wrote");
   assert.equal(writes, 1);
+});
+
+function filesUnder(dir: string): string[] {
+  const out: string[] = [];
+  for (const name of readdirSync(dir)) {
+    const path = join(dir, name);
+    if (statSync(path).isDirectory()) out.push(...filesUnder(path));
+    else if (/\.(tsx?|css|html)$/.test(name)) out.push(path);
+  }
+  return out;
+}
+
+test("the frontend has no baked home or product backup path", () => {
+  const root = new URL(".", import.meta.url);
+  const sources = filesUnder(root.pathname)
+    .filter((path) => !path.endsWith("remoteWrite.test.ts"))
+    .map((path) => readFileSync(path, "utf8"))
+    .join("\n");
+  const vite = readFileSync(new URL("../vite.config.ts", import.meta.url), "utf8");
+  const app = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+  assert.equal(sources.includes("HeTianXia/"), false);
+  assert.equal(sources.includes("Library/Application"), false);
+  assert.equal(sources.includes("previewAppDataDir"), false);
+  assert.equal(sources.includes("__HETIANXIA_APP_DATA_DIR__"), false);
+  assert.equal(vite.includes("process.env.HOME"), false);
+  assert.match(app, /remoteWritePrompt\(/);
+  assert.match(app, /commitRemoteOverwrite\(/);
+  assert.match(app, /appBakDir\(/);
+  assert.match(app, /VERIFY_FAILED_TITLE/);
+  assert.match(app, /VERIFY_FAILED_BUTTON/);
+  assert.match(sources, /远端文件写完后核对不一致/);
+  assert.match(sources, /VERIFY_FAILED_BUTTON = "好"/);
 });

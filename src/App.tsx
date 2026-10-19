@@ -1,12 +1,12 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { Server, ShieldAlert, KeyRound, AlertTriangle } from "lucide-react";
-import { rollbackRun, resumeRun, startupFailure, startupOffers } from "./backend";
+import { appBakDir, commitRemoteOverwrite, remoteWritePrompt, rollbackRun, resumeRun, startupFailure, startupOffers } from "./backend";
 import { externalChoice, keepSource, pendingChoice, rollbackChoice, type ResumeChoice, type RollbackChoice } from "./choices";
 import { DiffEditor } from "./editor";
 import { afterResume, engineCode, formatEngineError, formatOffer, formatReport, type ConflictFile, type RecoveryOffer } from "./engine";
 import { ALPINE, UNKNOWN, UBUNTU, canContinue, connectionSubtitle, systemTypeLabel, warningBanner, type RemoteOs } from "./os";
 import { Text } from "./plain";
-import { beginRemoteWrite, newExecId, previewAppDataDir, settleRemoteWrite, type PendingRemoteWrite } from "./remoteWrite";
+import { VERIFY_FAILED_BUTTON, VERIFY_FAILED_TITLE, settleRemoteWrite, type PendingRemoteWrite } from "./remoteWrite";
 import {
   DETAIL_DELETED,
   DETAIL_MODIFIED,
@@ -154,6 +154,8 @@ export function App() {
   const [allowReadonly, setAllowReadonly] = useState(false);
   const [sheet, setSheet] = useState<Sheet>("startup");
   const [remoteTx, setRemoteTx] = useState<PendingRemoteWrite | null>(null);
+  const [verifyBody, setVerifyBody] = useState<string | null>(null);
+  const [bakDir, setBakDir] = useState<string | null>(null);
   const [cleared, setCleared] = useState<Record<string, boolean>>({});
   const [execId, setExecId] = useState("pending-upgrade");
   const [status, setStatus] = useState<string | null>(null);
@@ -166,6 +168,10 @@ export function App() {
   const host = HOSTS.find((h) => h.id === hostId) ?? HOSTS[0];
 
   useEffect(() => {
+    void appBakDir().then(setBakDir).catch((err) => {
+      const message = formatEngineError(err);
+      if (message.startsWith("E_")) setStatus(message);
+    });
     void startupFailure().then((message) => {
       if (message) setBootError(message);
     }).catch((err) => {
@@ -250,10 +256,27 @@ export function App() {
           <PreviewPage
             allowReadonly={allowReadonly}
             setAllowReadonly={setAllowReadonly}
+            bakDir={bakDir}
             onLog={() => setSheet("log")}
             onRemoteWrite={() => {
-              const pending = beginRemoteWrite(previewAppDataDir(), newExecId());
-              setRemoteTx(pending);
+              const remotePath = "/opt/gateway/app.conf";
+              void remoteWritePrompt(host.host, host.port, remotePath).then((prompt) => {
+                setRemoteTx({
+                  execId: prompt.execId,
+                  backupDir: prompt.backupDir,
+                  title: prompt.title,
+                  body: prompt.body,
+                  cancelLabel: prompt.cancelLabel,
+                  proceedLabel: prompt.proceedLabel,
+                  defaultButton: prompt.defaultButton,
+                  host: host.host,
+                  port: host.port,
+                  user: host.user,
+                  account: host.id,
+                  keyPath: host.key,
+                  remotePath,
+                });
+              }).catch((err) => setStatus(formatEngineError(err)));
             }}
           />
         )}
@@ -321,12 +344,36 @@ export function App() {
               setRemoteTx(null);
             }}
             onProceed={() => {
+              const pending = remoteTx;
               settleRemoteWrite("仍然写入", () => {
                 setRemoteTx(null);
+                const bytes = Array.from(new TextEncoder().encode("gateway-1.8"));
+                void commitRemoteOverwrite({
+                  execId: pending.execId,
+                  host: pending.host,
+                  port: pending.port,
+                  user: pending.user,
+                  remotePath: pending.remotePath,
+                  bytes,
+                  auth: "key",
+                  account: pending.account,
+                  keyPath: pending.keyPath,
+                }).then((outcome) => {
+                  setStatus(`已写入 ${outcome.remotePath}`);
+                }).catch((err) => {
+                  const rec = err && typeof err === "object" ? err as Record<string, unknown> : {};
+                  const code = rec.code != null ? engineCode(String(rec.code)) : "";
+                  if (code === "E_VERIFY_FAILED" && rec.message != null) {
+                    setVerifyBody(String(rec.message));
+                    return;
+                  }
+                  setStatus(formatEngineError(err));
+                });
               });
             }}
           />
         )}
+        {verifyBody && <VerifyFailedSheet body={verifyBody} onClose={() => setVerifyBody(null)} />}
       </div>
     </div>
   );
@@ -405,7 +452,7 @@ function SshPage({ host, cleared, onPick, onClear }: { host: Host; cleared: bool
   );
 }
 
-function PreviewPage({ allowReadonly, setAllowReadonly, onLog, onRemoteWrite }: { allowReadonly: boolean; setAllowReadonly: (v: boolean) => void; onLog: () => void; onRemoteWrite: () => void }) {
+function PreviewPage({ allowReadonly, setAllowReadonly, bakDir, onLog, onRemoteWrite }: { allowReadonly: boolean; setAllowReadonly: (v: boolean) => void; bakDir: string | null; onLog: () => void; onRemoteWrite: () => void }) {
   const [target, setTarget] = useState<"local" | "remote">("local");
   const counts = useMemo(() => {
     const overwrite = allowReadonly ? 13 : 11;
@@ -437,7 +484,7 @@ function PreviewPage({ allowReadonly, setAllowReadonly, onLog, onRemoteWrite }: 
           <label><input type="checkbox" checked={allowReadonly} onChange={(e) => setAllowReadonly(e.target.checked)} /> 覆盖只读文件</label>
           <p>临时去掉只读属性，写入后恢复。</p>
         </div>
-        <label className="bak"><input type="checkbox" defaultChecked /> 执行前备份到 ~/Library/Application Support/HeTianXia/backups</label>
+        <label className="bak"><input type="checkbox" defaultChecked /> 执行前备份到 {bakDir ? <Text value={bakDir} /> : "…"}</label>
         <footer>
           <button className="ghost" onClick={onLog}>日志失败示例</button>
           <button className="primary" onClick={() => { if (target === "remote") onRemoteWrite(); }}>{target === "remote" ? "写入远程" : "备份并执行"}</button>
@@ -512,6 +559,21 @@ function HistoryPage({ onRollback, onContinue, onResumeRollback }: { onRollback:
           })}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function VerifyFailedSheet({ body, onClose }: { body: string; onClose: () => void }) {
+  return (
+    <div className="mask" onClick={onClose} onKeyDown={(event) => { if (event.key === "Escape") onClose(); }}>
+      <div className="sheet small" role="dialog" aria-modal="true" aria-labelledby="verify-failed-title" onClick={(event) => event.stopPropagation()}>
+        <h1 id="verify-failed-title"><AlertTriangle size={18} /> <Text value={VERIFY_FAILED_TITLE} /></h1>
+        <p><Text value={body} /></p>
+        <footer>
+          <span />
+          <button type="button" className="primary" autoFocus onClick={onClose}>{VERIFY_FAILED_BUTTON}</button>
+        </footer>
+      </div>
     </div>
   );
 }

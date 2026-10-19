@@ -1,4 +1,6 @@
 use hetianxia_core::error::{Error, ErrorCode};
+use serde::Deserialize;
+use tauri::Manager;
 use hetianxia_core::exec::{self, ExecOpts, ExecReport, HistoryRow, ResumeChoice, ResumeOutcome, RollbackChoice};
 use hetianxia_core::model::ExecPlan;
 use hetianxia_core::merge::{self, Decision, Rendered};
@@ -231,9 +233,106 @@ pub fn remote_rename_plan(posix_rename: bool) -> Vec<String> {
 }
 
 #[tauri::command]
-pub fn remote_write_prompt(app: tauri::AppHandle, exec_id: String) -> Result<RemoteWritePrompt, Error> {
+pub fn app_bak_dir(session: tauri::State<crate::Session>) -> Result<String, Error> {
+    ready(&session)?;
+    if !session.backup_root.is_absolute() {
+        return Err(Error::new(ErrorCode::InvalidState, "本机备份目录还没准备好"));
+    }
+    Ok(session.backup_root.display().to_string())
+}
+
+#[tauri::command]
+pub fn remote_write_prompt(
+    app: tauri::AppHandle,
+    session: tauri::State<crate::Session>,
+    host: String,
+    port: u16,
+    remote_path: String,
+) -> Result<RemoteWritePrompt, Error> {
+    ready(&session)?;
     let app_data = app.path().app_data_dir().map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
-    remote_write::prompt_for(&app_data, &exec_id)
+    if crate::app_backup_root(&app_data) != session.backup_root {
+        return Err(Error::new(ErrorCode::InvalidState, "备份目录和本次运行不一致"));
+    }
+    remote_write::issue_write_prompt(&app_data, &host, port, &remote_path)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteCommit {
+    pub exec_id: String,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub remote_path: String,
+    pub bytes: Vec<u8>,
+    pub auth: String,
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub key_path: Option<String>,
+    #[serde(default)]
+    pub accept_new: bool,
+    #[serde(default)]
+    pub confirmed_fingerprint: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteWriteOutcome {
+    pub exec_id: String,
+    pub remote_path: String,
+    pub backup_path: Option<String>,
+}
+
+#[tauri::command]
+pub fn commit_remote_overwrite(
+    app: tauri::AppHandle,
+    session: tauri::State<crate::Session>,
+    req: RemoteCommit,
+) -> Result<RemoteWriteOutcome, Error> {
+    ready(&session)?;
+    let app_data = app.path().app_data_dir().map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
+    if crate::app_backup_root(&app_data) != session.backup_root {
+        return Err(Error::new(ErrorCode::InvalidState, "备份目录和本次运行不一致"));
+    }
+    let mut probe = ProbeRequest {
+        host: req.host.clone(),
+        port: req.port,
+        user: req.user,
+        proxy_jump: None,
+        auth: req.auth,
+        secret: String::new(),
+        account: req.account.clone(),
+        key_path: req.key_path,
+        known_hosts_path: app_data.join("known_hosts").display().to_string(),
+        db_path: session.db_path.display().to_string(),
+        accept_new: req.accept_new,
+        confirmed_fingerprint: req.confirmed_fingerprint,
+    };
+    probe.secret.clear();
+    if let Some(account) = probe.account.clone() {
+        if let Some(secret) = KeyringStore.get(&account)? {
+            probe.secret = secret;
+        }
+    }
+    let write = remote_write::RemoteWriteRequest {
+        exec_id: req.exec_id.clone(),
+        host: req.host.clone(),
+        port: req.port,
+        remote_path: req.remote_path.clone(),
+        bytes: req.bytes,
+        app_data_dir: app_data,
+        posix_rename: true,
+        index: 0,
+    };
+    let committed = sftp::RemoteSession::commit_overwrite_blocking(&mut probe, write)?;
+    let remote_write::CommitResult::Written(staged) = committed;
+    Ok(RemoteWriteOutcome {
+        exec_id: req.exec_id,
+        remote_path: req.remote_path,
+        backup_path: staged.backup_file.map(|path| path.display().to_string()),
+    })
 }
 
 #[tauri::command]

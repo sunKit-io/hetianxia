@@ -127,6 +127,8 @@ pub fn run() {
             commands::remote_backup_path,
             commands::remote_rename_plan,
             commands::remote_write_prompt,
+            commands::commit_remote_overwrite,
+            commands::app_bak_dir,
             commands::probe_remote,
         ])
         .build(tauri::generate_context!())

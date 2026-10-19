@@ -25,6 +25,9 @@
     "allow-trust-host-fingerprint",
     "allow-remote-backup-path",
     "allow-remote-rename-plan",
+    "allow-remote-write-prompt",
+    "allow-commit-remote-overwrite",
+    "allow-app-bak-dir",
     "allow-probe-remote"
   ]
 }
