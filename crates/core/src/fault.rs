@@ -5,6 +5,12 @@ use crate::error::Result;
 #[cfg(feature = "fault-inject")]
 use crate::error::{Error, ErrorCode};
 use crate::model::OpKind;
+#[cfg(feature = "fault-inject")]
+use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(all(test, feature = "fault-inject"))]
+use std::cell::{Cell, RefCell};
+#[cfg(all(test, feature = "fault-inject"))]
+use std::sync::{Mutex, MutexGuard};
 
 #[cfg(feature = "fault-inject")]
 #[path = "fault_marker.rs"]
@@ -39,6 +45,8 @@ pub enum Item {
     At { stage: Stage, n: u32, mode: Mode },
     LogBegin { mode: Mode },
     LogCommit { mode: Mode },
+    /// `log:probe` 或 `log:probe:N`。不占用 `log:N` 计数。`n == None` 表示每次试写都失败。
+    LogProbe { n: Option<u32> },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -134,6 +142,19 @@ fn parse_item(raw: &str) -> std::result::Result<Item, String> {
     {
         return Err(format!("未知阶段「{}」（来自「{raw}」）。没有单独的 verify，请用 verify-pre 或 verify-post", parts[0]));
     }
+    if parts[0] == "log" && parts.len() >= 2 && parts[1] == "probe" {
+        if parts.len() == 2 {
+            return Ok(Item::LogProbe { n: None });
+        }
+        if parts.len() == 3 && parts[2].chars().all(|c| c.is_ascii_digit()) {
+            let n: u32 = parts[2].parse().map_err(|_| format!("「{raw}」：log:probe 的序号不是正整数"))?;
+            if n == 0 {
+                return Err(format!("「{raw}」的序号不能为 0（从 1 开始）"));
+            }
+            return Ok(Item::LogProbe { n: Some(n) });
+        }
+        return Err(format!("「{raw}」：log:probe 不接受模式"));
+    }
     if parts[0] == "log" && parts.len() >= 2 && (parts[1] == "begin" || parts[1] == "commit") {
         let which = parts[1];
         let mode = if parts.len() == 2 {
@@ -210,7 +231,7 @@ fn validate(plan: &FaultPlan, ops: &[OpKind]) -> Result<()> {
     let len = ops.len() as u32;
     for item in &plan.items {
         match item {
-            Item::LogBegin { .. } | Item::LogCommit { .. } => {}
+            Item::LogBegin { .. } | Item::LogCommit { .. } | Item::LogProbe { .. } => {}
             Item::At { stage: Stage::Log, n, .. } => {
                 // 日志写入次数 = prepared + backed_up + 每个文件 doing/done + verifying + committed。
                 // 大于这个上限的 log:N 无法命中，按非法处理，避免静默忽略。
@@ -343,6 +364,97 @@ fn real_fault_code(stage: Stage) -> ErrorCode {
     }
 }
 
+/// 进程内第几次 LOG_FAILED 试写。不计入 `hit_log` 的 `log:N`。
+#[cfg(feature = "fault-inject")]
+static PROBE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(all(test, feature = "fault-inject"))]
+static PROBE_MU: Mutex<()> = Mutex::new(());
+
+#[cfg(all(test, feature = "fault-inject"))]
+thread_local! {
+    static PROBE_HELD: Cell<bool> = const { Cell::new(false) };
+    static PLAN_OVERRIDE: RefCell<Option<FaultPlan>> = const { RefCell::new(None) };
+}
+
+/// 挡住其他测试里的试写，并把进程内计数清零。本线程里的试写不会再次加锁。
+#[cfg(all(test, feature = "fault-inject"))]
+pub struct ProbeSection {
+    _guard: MutexGuard<'static, ()>,
+}
+
+#[cfg(all(test, feature = "fault-inject"))]
+impl Drop for ProbeSection {
+    fn drop(&mut self) {
+        PROBE_HELD.with(|held| held.set(false));
+    }
+}
+
+#[cfg(all(test, feature = "fault-inject"))]
+pub fn probe_section() -> ProbeSection {
+    let guard = PROBE_MU.lock().unwrap_or_else(|err| err.into_inner());
+    PROBE_HELD.with(|held| held.set(true));
+    PROBE_COUNT.store(0, Ordering::SeqCst);
+    ProbeSection { _guard: guard }
+}
+
+#[cfg(all(test, feature = "fault-inject"))]
+pub fn reset_probe_count() {
+    PROBE_COUNT.store(0, Ordering::SeqCst);
+}
+
+#[cfg(all(test, feature = "fault-inject"))]
+pub struct PlanOverride;
+
+#[cfg(all(test, feature = "fault-inject"))]
+impl Drop for PlanOverride {
+    fn drop(&mut self) {
+        PLAN_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(all(test, feature = "fault-inject"))]
+pub fn override_plan(plan: FaultPlan) -> PlanOverride {
+    PLAN_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(plan));
+    PlanOverride
+}
+
+#[cfg(feature = "fault-inject")]
+pub fn active_plan() -> FaultPlan {
+    #[cfg(test)]
+    if let Some(plan) = PLAN_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return plan;
+    }
+    match std::env::var("UPG_FAULT") {
+        Ok(spec) if !spec.trim().is_empty() => parse_spec(spec.trim()).unwrap_or_default(),
+        _ => FaultPlan::default(),
+    }
+}
+
+/// 只让 LOG_FAILED 的试写失败。其他日志和数据库写入不看这一项。
+#[cfg(feature = "fault-inject")]
+pub fn check_probe(plan: &FaultPlan) -> Result<()> {
+    #[cfg(test)]
+    let _guard = if PROBE_HELD.with(|held| held.get()) {
+        None
+    } else {
+        Some(PROBE_MU.lock().unwrap_or_else(|err| err.into_inner()))
+    };
+    let n = PROBE_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+    for item in &plan.items {
+        if let Item::LogProbe { n: want } = item {
+            let hit = match want {
+                None => true,
+                Some(k) => *k == n,
+            };
+            if hit {
+                return Err(Error::new(ErrorCode::LogWrite, format!("试写日志失败（log:probe {n}）")));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "fault-inject")]
 fn fire(stage: Stage, n: u32, mode: Mode) -> Result<()> {
     let label = format!("{stage:?}:{n}");
@@ -403,6 +515,13 @@ mod tests {
         assert_ne!(err.code_str(), "E_FAULT");
         assert_eq!(err.code, ErrorCode::Internal);
         assert!(load_for_plan("backup:2", &ops).is_ok());
+        assert!(parse_spec("log:probe").unwrap().items.iter().any(|item| matches!(item, Item::LogProbe { n: None })));
+        assert!(matches!(parse_spec("log:probe:2").unwrap().items[0], Item::LogProbe { n: Some(2) }));
+        assert!(parse_spec("log:probe:panic").unwrap_err().contains("不接受模式"));
+        assert!(parse_spec("log:probe:error").unwrap_err().contains("不接受模式"));
+        assert!(parse_spec("log:probe:1:panic").unwrap_err().contains("不接受模式"));
+        assert!(parse_spec("log:probe:0").unwrap_err().contains("0"));
+        assert!(load_for_plan("log:probe:1", &ops).is_ok());
         let err = load_for_plan("write:1", &[OpKind::Delete]).unwrap_err();
         assert!(err.message.contains("不适用"));
         assert_ne!(err.code_str(), "E_FAULT");
