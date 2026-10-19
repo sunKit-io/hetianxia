@@ -306,12 +306,7 @@ impl LocalFs {
         Ok(())
     }
 
-    pub fn rename_over_counted(
-        &self,
-        tmp: &RelPath,
-        dest: &RelPath,
-        before_dir_fsync: impl FnOnce() -> Result<()>,
-    ) -> Result<()> {
+    fn prepare_rename(&self, tmp: &RelPath, dest: &RelPath) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
         self.ensure_writable_tree(dest)?;
         let from = self.abs(tmp)?;
         let to = self.abs(dest)?;
@@ -322,8 +317,45 @@ impl LocalFs {
                 return Err(Error::new(ErrorCode::SymlinkRefused, format!("拒绝用普通文件覆盖符号链接 {dest}")));
             }
         }
-        atomic_rename_counted(&from, &to, before_dir_fsync)?;
+        Ok((from, to))
+    }
+
+    /// 只把临时文件改到目标路径，不同步父目录。调用方应立刻记下“已经落地”，再 fsync。
+    pub fn rename_over_placed(&self, tmp: &RelPath, dest: &RelPath) -> Result<()> {
+        let (from, to) = self.prepare_rename(tmp, dest)?;
+        atomic_rename_nosync(&from, &to)
+    }
+
+    pub fn fsync_parent_of(&self, rel: &RelPath, before_dir_fsync: impl FnOnce() -> Result<()>) -> Result<()> {
+        let to = self.abs(rel)?;
+        before_dir_fsync()?;
+        fsync_parent(&to)
+    }
+
+    /// 把项目里的一个文件改到另一个相对路径，不同步父目录。
+    pub fn rename_rel(&self, from: &RelPath, to: &RelPath) -> Result<()> {
+        self.ensure_writable_tree(from)?;
+        self.ensure_writable_tree(to)?;
+        if let Some(parent) = to.parent() {
+            self.mkdir_p(&parent)?;
+        }
+        let src = self.abs(from)?;
+        let dst = self.abs(to)?;
+        if fs::symlink_metadata(&dst).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+            return Err(Error::new(ErrorCode::SymlinkRefused, format!("拒绝把文件改到符号链接 {to}")));
+        }
+        fs::rename(&src, &dst)?;
         Ok(())
+    }
+
+    pub fn rename_over_counted(
+        &self,
+        tmp: &RelPath,
+        dest: &RelPath,
+        before_dir_fsync: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        self.rename_over_placed(tmp, dest)?;
+        self.fsync_parent_of(dest, before_dir_fsync)
     }
 
     pub fn mkdir_p(&self, rel: &RelPath) -> Result<Vec<String>> {
@@ -369,8 +401,10 @@ impl LocalFs {
         Ok(())
     }
 
-    /// `register` 在创建临时文件之前调用，把名字写进事务日志。失败时删掉临时文件并调用 `forget`。
-    pub fn copy_in_atomic<R, G>(
+    /// `register` 在创建临时文件之前调用，把名字写进事务日志。
+    /// 改名成功后先调用 `after_rename`（调用方在这里把文件记成已恢复），再 fsync 父目录。
+    /// 目录同步失败时目标文件留在原地，不删。
+    pub fn copy_in_atomic<R, G, A>(
         &self,
         src: &Path,
         dest: &RelPath,
@@ -379,10 +413,12 @@ impl LocalFs {
         before_dir_fsync: impl FnOnce() -> Result<()>,
         register: R,
         forget: G,
+        after_rename: A,
     ) -> Result<()>
     where
         R: FnOnce(&RelPath) -> Result<()>,
         G: FnOnce(&RelPath),
+        A: FnOnce() -> Result<()>,
     {
         let data = fs::read(src)?;
         let tmp = self.allocate_temp(dest)?;
@@ -392,10 +428,7 @@ impl LocalFs {
             if let Some(mode) = mode {
                 set_mode(&self.abs(&tmp)?, mode)?;
             }
-            self.rename_over_counted(&tmp, dest, before_dir_fsync)?;
-            if mtime_ms.is_some() || mode.is_some() {
-                self.set_meta(dest, mode, mtime_ms)?;
-            }
+            self.rename_over_placed(&tmp, dest)?;
             Ok(())
         })();
         if let Err(e) = step {
@@ -404,6 +437,11 @@ impl LocalFs {
             return Err(e);
         }
         forget(&tmp);
+        after_rename()?;
+        if mtime_ms.is_some() || mode.is_some() {
+            self.set_meta(dest, mode, mtime_ms)?;
+        }
+        self.fsync_parent_of(dest, before_dir_fsync)?;
         Ok(())
     }
 
@@ -577,7 +615,7 @@ pub fn atomic_rename(from: &Path, to: &Path) -> Result<()> {
     atomic_rename_counted(from, to, || Ok(()))
 }
 
-pub fn atomic_rename_counted(from: &Path, to: &Path, before_dir_fsync: impl FnOnce() -> Result<()>) -> Result<()> {
+fn atomic_rename_nosync(from: &Path, to: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -594,17 +632,20 @@ pub fn atomic_rename_counted(from: &Path, to: &Path, before_dir_fsync: impl FnOn
         if ok == 0 {
             return Err(Error::new(ErrorCode::Io, "MoveFileExW 失败"));
         }
-        before_dir_fsync()?;
-        fsync_parent(to)?;
         return Ok(());
     }
     #[cfg(not(windows))]
     {
         fs::rename(from, to)?;
-        before_dir_fsync()?;
-        fsync_parent(to)?;
         Ok(())
     }
+}
+
+pub fn atomic_rename_counted(from: &Path, to: &Path, before_dir_fsync: impl FnOnce() -> Result<()>) -> Result<()> {
+    atomic_rename_nosync(from, to)?;
+    before_dir_fsync()?;
+    fsync_parent(to)?;
+    Ok(())
 }
 
 fn long_path(p: &Path) -> PathBuf {
