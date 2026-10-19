@@ -30,6 +30,9 @@ allow = [
     "CC0-1.0",
     # Boost 是宽松许可。xxhash-rust 和 zopfli 的对象池使用它。
     "BSL-1.0",
+    # Tauri 的 HTML 解析（cssparser / kuchikiki）是 MPL-2.0，文件级 copyleft。
+    # 不是 GPL / AGPL / LGPL。这些文件不改。
+    "MPL-2.0",
 ]
 exceptions = []
 
