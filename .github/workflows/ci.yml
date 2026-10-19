@@ -85,7 +85,7 @@ jobs:
       - id: app
         name: detect the Tauri app
         run: |
-          if [ -f src-tauri/tauri.conf.json ]; then
+          if [ -f src-tauri/Cargo.toml ] && [ -f src-tauri/src/main.rs ]; then
             echo "present=true" >> "$GITHUB_OUTPUT"
           else
             echo "present=false" >> "$GITHUB_OUTPUT"
