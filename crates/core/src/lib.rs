@@ -6,6 +6,7 @@ pub mod exec;
 pub mod fault;
 pub mod hashutil;
 pub mod limits;
+pub mod merge;
 pub mod model;
 pub mod pathutil;
 pub mod prefs;
