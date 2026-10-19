@@ -1,0 +1,27 @@
+{
+  "name": "file-upgrade-cm6-spike",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 4178 --host 127.0.0.1",
+    "build": "vite build",
+    "preview": "vite preview --port 4178 --host 127.0.0.1",
+    "spike": "vite build && node run-spike.mjs"
+  },
+  "dependencies": {
+    "@codemirror/commands": "^6.8.1",
+    "@codemirror/language": "^6.11.2",
+    "@codemirror/lang-javascript": "^6.2.4",
+    "@codemirror/state": "^6.5.2",
+    "@codemirror/view": "^6.38.1"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^24.15.0",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  }
+}

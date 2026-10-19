@@ -1,0 +1,166 @@
+{
+  "withSyntax": {
+    "generatedAt": "2026-10-19T04:49:55.156Z",
+    "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/154.0.0.0 Safari/537.36",
+    "doc": {
+      "leftLines": 100001,
+      "rightLines": 99713,
+      "leftBytes": 6270398,
+      "rightBytes": 6255488,
+      "hunks": 260,
+      "pureInserts": 23
+    },
+    "open": {
+      "buildMs": 40.1,
+      "stateMs": 33.3,
+      "viewMs": 25,
+      "firstContentMs": 49.6,
+      "highlightClassMs": 0,
+      "withSyntax": true
+    },
+    "scrollHandler": {
+      "p95Ms": 0.1,
+      "maxMs": 0.2,
+      "n": 552
+    },
+    "foldMs": 246.7,
+    "scenarios": [
+      {
+        "name": "scroll",
+        "maxRibbonPx": 0,
+        "maxSyncPx": 0.5,
+        "samples": 32
+      },
+      {
+        "name": "fold",
+        "maxRibbonPx": 0,
+        "maxSyncPx": 0.5,
+        "samples": 32
+      },
+      {
+        "name": "font-16",
+        "maxRibbonPx": 0,
+        "maxSyncPx": 0.375,
+        "samples": 32
+      },
+      {
+        "name": "font-20",
+        "maxRibbonPx": 0,
+        "maxSyncPx": 0,
+        "samples": 32
+      },
+      {
+        "name": "resize-narrow",
+        "maxRibbonPx": 0,
+        "maxSyncPx": 0,
+        "samples": 32
+      },
+      {
+        "name": "zoom-125",
+        "maxRibbonPx": 0,
+        "maxSyncPx": 0.5,
+        "samples": 31
+      },
+      {
+        "name": "zoom-150",
+        "maxRibbonPx": 0,
+        "maxSyncPx": 0.5,
+        "samples": 32
+      },
+      {
+        "name": "zoom-200",
+        "maxRibbonPx": 0,
+        "maxSyncPx": 0,
+        "samples": 32
+      }
+    ],
+    "maxErrorPx": 0.5,
+    "pass": true,
+    "notes": [
+      "contentHeight L=1887523 R=1882087 scrollHeight=1887523",
+      "openLoopMaxPx {\"fold\":56.375,\"font-16\":69.125}"
+    ]
+  },
+  "noSyntax": {
+    "generatedAt": "2026-10-19T04:50:19.656Z",
+    "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/154.0.0.0 Safari/537.36",
+    "doc": {
+      "leftLines": 100001,
+      "rightLines": 99713,
+      "leftBytes": 6270398,
+      "rightBytes": 6255488,
+      "hunks": 260,
+      "pureInserts": 23
+    },
+    "open": {
+      "buildMs": 32.6,
+      "stateMs": 22.2,
+      "viewMs": 14.4,
+      "firstContentMs": 41.6,
+      "highlightClassMs": null,
+      "withSyntax": false
+    },
+    "scrollHandler": {
+      "p95Ms": 0.1,
+      "maxMs": 0.2,
+      "n": 552
+    },
+    "foldMs": 82.2,
+    "scenarios": [
+      {
+        "name": "scroll",
+        "maxRibbonPx": 0,
+        "maxSyncPx": 0.5,
+        "samples": 32
+      },
+      {
+        "name": "fold",
+        "maxRibbonPx": 0,
+        "maxSyncPx": 0.5,
+        "samples": 32
+      },
+      {
+        "name": "font-16",
+        "maxRibbonPx": 0,
+        "maxSyncPx": 0.375,
+        "samples": 32
+      },
+      {
+        "name": "font-20",
+        "maxRibbonPx": 0,
+        "maxSyncPx": 0,
+        "samples": 32
+      },
+      {
+        "name": "resize-narrow",
+        "maxRibbonPx": 0,
+        "maxSyncPx": 0,
+        "samples": 32
+      },
+      {
+        "name": "zoom-125",
+        "maxRibbonPx": 0,
+        "maxSyncPx": 0.5,
+        "samples": 31
+      },
+      {
+        "name": "zoom-150",
+        "maxRibbonPx": 0,
+        "maxSyncPx": 0.5,
+        "samples": 32
+      },
+      {
+        "name": "zoom-200",
+        "maxRibbonPx": 0,
+        "maxSyncPx": 0,
+        "samples": 32
+      }
+    ],
+    "maxErrorPx": 0.5,
+    "pass": true,
+    "notes": [
+      "contentHeight L=1887523 R=1882087 scrollHeight=1887523",
+      "openLoopMaxPx {\"fold\":56.375,\"font-16\":69.125}"
+    ]
+  }
+}

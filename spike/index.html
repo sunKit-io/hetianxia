@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>CM6 预研 · 大文件与工具条对齐</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #f5f5f7; color: #1d1d1f; }
+      body { font-family: -apple-system, "Segoe UI", sans-serif; }
+      #root { height: 100%; display: flex; flex-direction: column; }
+      header { padding: 8px 12px; font-size: 12px; }
+      #compare { flex: 1; display: flex; min-height: 0; }
+      .pane { flex: 1; min-width: 0; height: 100%; }
+      #gutter { width: 72px; position: relative; flex: none; background: #fafafa; border-left: 1px solid #e5e5ea; border-right: 1px solid #e5e5ea; }
+      #gutter svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+      .tick { position: absolute; left: 0; right: 0; height: 0; }
+      #probe { position: absolute; left: 0; top: 0; width: 100px; height: 100px; pointer-events: none; opacity: 0; }
+      #log { display: none; }
+    </style>
+  </head>
+  <body>
+    <div id="probe"></div>
+    <div id="root">
+      <header id="status">准备文档…</header>
+      <div id="compare">
+        <div id="left" class="pane"></div>
+        <div id="gutter"><svg id="ribbon"></svg></div>
+        <div id="right" class="pane"></div>
+      </div>
+    </div>
+    <pre id="log"></pre>
+    <script type="module" src="/src/bench.ts"></script>
+  </body>
+</html>
