@@ -188,6 +188,56 @@ pub fn decide_host_key(saved: Option<&str>, cleared: bool, file_fps: &[String], 
     HostKeyStatus::New
 }
 
+/// 探测阶段记下的指纹，和重连时服务器出示的指纹。
+/// 只有 `Accept` 之后才可以送出口令。指纹被换掉时是 `Reject`，口令不会发出去。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PresentedKey {
+    Accept(HostKeyStatus),
+    Reject(String),
+    Confirm(String),
+}
+
+impl PresentedKey {
+    pub fn sends_credentials(&self) -> bool {
+        matches!(self, PresentedKey::Accept(_))
+    }
+}
+
+/// `accept_new` 时必须带上用户确认过的指纹。服务器出示另一把钥匙就拒绝。
+pub fn classify_presented_key(
+    saved: Option<&str>,
+    cleared: bool,
+    file_fps: &[String],
+    presented: &str,
+    accept_new: bool,
+    confirmed: Option<&str>,
+) -> PresentedKey {
+    if accept_new {
+        let want = confirmed.map(str::trim).filter(|value| !value.is_empty());
+        return match want {
+            Some(want) if want == presented => {
+                let status = if saved == Some(presented) {
+                    HostKeyStatus::Match
+                } else {
+                    HostKeyStatus::New
+                };
+                PresentedKey::Accept(status)
+            }
+            Some(_) => PresentedKey::Reject(presented.to_string()),
+            None => PresentedKey::Confirm(presented.to_string()),
+        };
+    }
+    match decide_host_key(saved, cleared, file_fps, presented) {
+        HostKeyStatus::Changed => PresentedKey::Reject(presented.to_string()),
+        HostKeyStatus::New => PresentedKey::Confirm(presented.to_string()),
+        HostKeyStatus::Match => PresentedKey::Accept(HostKeyStatus::Match),
+    }
+}
+
+pub fn remote_write_unsupported() -> Error {
+    Error::new(ErrorCode::InvalidState, "远程写入还没支持")
+}
+
 /// 只读 `known_hosts` 文件，不创建、不追加。
 pub fn fingerprints_in_file(path: &std::path::Path, host: &str, port: u16) -> Result<Vec<String>> {
     if !path.exists() {
@@ -579,5 +629,25 @@ Host intranet-jump\n  HostName 10.1.0.4\n  User ops\n  ProxyJump jump.example\n"
             HostKeyStatus::Changed
         );
         assert_eq!(decide_host_key(None, false, &[], SAMPLE_FP), HostKeyStatus::New);
+    }
+
+    #[test]
+    fn swapped_fingerprint_between_probe_and_reconnect_is_rejected() {
+        let probed = "SHA256:probe-key";
+        let swapped = "SHA256:mitm-key";
+        let probe = classify_presented_key(None, false, &[], probed, false, None);
+        assert!(!probe.sends_credentials());
+        assert!(matches!(probe, PresentedKey::Confirm(fp) if fp == probed));
+
+        let mitm = classify_presented_key(None, false, &[], swapped, true, Some(probed));
+        assert!(!mitm.sends_credentials(), "指纹被换掉之后不能送出口令");
+        assert!(matches!(mitm, PresentedKey::Reject(fp) if fp == swapped));
+
+        let rebound = classify_presented_key(None, false, &[], probed, true, Some(probed));
+        assert!(matches!(rebound, PresentedKey::Accept(HostKeyStatus::New)));
+        assert!(rebound.sends_credentials());
+
+        let unbound = classify_presented_key(None, false, &[], probed, true, None);
+        assert!(!unbound.sends_credentials());
     }
 }

@@ -8,7 +8,7 @@ use std::time::Duration;
 use russh::client::Handler;
 use russh::keys::PrivateKeyWithHashAlg;
 use russh_sftp::client::RawSftpSession;
-use russh_sftp::protocol::{FileAttributes, OpenFlags, Packet, StatusCode};
+use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
@@ -16,8 +16,8 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::exec;
 use crate::hashutil;
 use crate::remote::{
-    self, decide_host_key, fingerprints_in_file, fingerprint_was_cleared, saved_fingerprint, HostKeyStatus,
-    RuntimeLog, PROXY_REASON,
+    self, classify_presented_key, fingerprints_in_file, fingerprint_was_cleared, saved_fingerprint, HostKeyStatus,
+    PresentedKey, RuntimeLog, PROXY_REASON,
 };
 
 const POSIX_RENAME: &str = "posix-rename@openssh.com";
@@ -53,6 +53,9 @@ pub struct ProbeRequest {
     pub db_path: String,
     #[serde(default)]
     pub accept_new: bool,
+    /// 用户在探测之后确认的指纹。`accept_new` 重连时必须带上，并且要和服务器出示的一致。
+    #[serde(default)]
+    pub confirmed_fingerprint: Option<String>,
 }
 
 pub fn remote_backup_dir(home: &str, exec_id: &str) -> Result<String> {
@@ -155,6 +158,7 @@ struct KeyHandler {
     cleared: bool,
     file_fps: Vec<String>,
     accept_new: bool,
+    confirmed: Option<String>,
     seen: Arc<Mutex<Option<Observed>>>,
 }
 
@@ -163,14 +167,27 @@ impl Handler for KeyHandler {
 
     async fn check_server_key(&mut self, server_public_key: &russh::keys::PublicKey) -> std::result::Result<bool, Self::Error> {
         let fingerprint = format!("{}", server_public_key.fingerprint(russh::keys::HashAlg::Sha256));
-        let status = decide_host_key(self.saved.as_deref(), self.cleared, &self.file_fps, &fingerprint);
+        let decision = classify_presented_key(
+            self.saved.as_deref(),
+            self.cleared,
+            &self.file_fps,
+            &fingerprint,
+            self.accept_new,
+            self.confirmed.as_deref(),
+        );
+        let status = match &decision {
+            PresentedKey::Accept(status) => *status,
+            PresentedKey::Reject(_) => HostKeyStatus::Changed,
+            PresentedKey::Confirm(_) => HostKeyStatus::New,
+        };
         if let Ok(mut slot) = self.seen.lock() {
             *slot = Some(Observed { fingerprint: fingerprint.clone(), status });
         }
-        match status {
-            HostKeyStatus::Changed => Err(SessFail::Changed(fingerprint)),
-            HostKeyStatus::New if !self.accept_new => Err(SessFail::Confirm(fingerprint)),
-            HostKeyStatus::New | HostKeyStatus::Match => Ok(true),
+        // 拒绝和待确认都在这里返回。`authenticate` 只在连接成功之后调用，所以口令不会发出去。
+        match decision {
+            PresentedKey::Accept(_) => Ok(true),
+            PresentedKey::Reject(fp) => Err(SessFail::Changed(fp)),
+            PresentedKey::Confirm(fp) => Err(SessFail::Confirm(fp)),
         }
     }
 }
@@ -233,6 +250,7 @@ impl RemoteSession {
             cleared,
             file_fps,
             accept_new: req.accept_new,
+            confirmed: req.confirmed_fingerprint.clone(),
             seen: seen.clone(),
         };
         let config = Arc::new(russh::client::Config {
@@ -316,20 +334,8 @@ impl RemoteSession {
         Ok(out)
     }
 
-    pub async fn write_file(&self, path: &str, bytes: &[u8]) -> Result<()> {
-        let flags = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE;
-        let opened = self.sftp.open(path, flags, FileAttributes::empty()).await.map_err(map_sftp)?;
-        let mut offset = 0usize;
-        while offset < bytes.len() {
-            let end = (offset + 32 * 1024).min(bytes.len());
-            self.sftp
-                .write(&opened.handle, offset as u64, bytes[offset..end].to_vec())
-                .await
-                .map_err(map_sftp)?;
-            offset = end;
-        }
-        self.sftp.close(&opened.handle).await.map_err(map_sftp)?;
-        Ok(())
+    pub async fn write_file(&self, _path: &str, _bytes: &[u8]) -> Result<()> {
+        Err(remote::remote_write_unsupported())
     }
 
     pub async fn exists(&self, path: &str) -> Result<bool> {
@@ -342,44 +348,13 @@ impl RemoteSession {
         }
     }
 
-    /// 备份是 SFTP 读再写，不在服务器上执行 `cp`。
-    pub async fn copy_file(&self, from: &str, to: &str) -> Result<()> {
-        let bytes = self.read_file(from).await?;
-        self.write_file(to, &bytes).await
+    /// 备份是 SFTP 读再写。第一版不写远程文件。
+    pub async fn copy_file(&self, _from: &str, _to: &str) -> Result<()> {
+        Err(remote::remote_write_unsupported())
     }
 
-    pub async fn replace(&mut self, temp: &str, dest: &str, backup: &str) -> Result<()> {
-        log_rename_steps(&mut self.log, self.posix_rename);
-        if self.posix_rename {
-            return self.posix_rename_to(temp, dest).await;
-        }
-        if self.exists(dest).await? {
-            self.sftp.rename(dest, backup).await.map_err(map_sftp)?;
-        }
-        self.sftp.rename(temp, dest).await.map_err(map_sftp)?;
-        if self.exists(backup).await? {
-            self.sftp.remove(backup).await.map_err(map_sftp)?;
-        }
-        Ok(())
-    }
-
-    async fn posix_rename_to(&self, from: &str, to: &str) -> Result<()> {
-        #[derive(Serialize)]
-        struct PosixRenameExt {
-            oldpath: String,
-            newpath: String,
-        }
-        let data = russh_sftp::ser::to_bytes(&PosixRenameExt {
-            oldpath: from.to_string(),
-            newpath: to.to_string(),
-        })
-        .map_err(|_| Error::new(ErrorCode::Io, "无法编码远程改名"))?;
-        match self.sftp.extended(POSIX_RENAME, data.to_vec()).await.map_err(map_sftp)? {
-            Packet::Status(status) if status.status_code == StatusCode::Ok => Ok(()),
-            Packet::Status(_) => Err(Error::new(ErrorCode::Io, "远程改名失败")),
-            Packet::ExtendedReply(_) => Ok(()),
-            _ => Err(Error::new(ErrorCode::Io, "远程改名失败")),
-        }
+    pub async fn replace(&mut self, _temp: &str, _dest: &str, _backup: &str) -> Result<()> {
+        Err(remote::remote_write_unsupported())
     }
 
     /// 只执行已经过白名单的 `sha256sum`。命令不存在时返回 `E_REMOTE_HASH_UNAVAILABLE`。
@@ -597,16 +572,28 @@ mod tests {
             user: "ops".into(),
             proxy_jump: Some("jump.example".into()),
             auth: "password".into(),
-            secret: "nope".into(),
+            secret: "pw-do-not-leak-9f3a".into(),
             account: None,
             key_path: None,
             known_hosts_path: "/tmp/does-not-matter".into(),
             db_path: std::env::temp_dir().join("hetianxia-probe-unused.sqlite").display().to_string(),
             accept_new: false,
+            confirmed_fingerprint: None,
         };
         let err = probe_connection(&mut req).unwrap_err();
         assert_eq!(err.code_str(), "E_UNSUPPORTED");
         assert_eq!(err.message, "需要跳板机，第二版支持");
         assert!(req.secret.is_empty());
+        assert!(!format!("{err}").contains("pw-do-not-leak-9f3a"));
+        let report = ProbeReport {
+            fingerprint: "SHA256:abc".into(),
+            host_key: "new".into(),
+            auth_ok: false,
+            sftp_ok: false,
+            sha256sum_ok: false,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("pw-do-not-leak-9f3a"));
+        assert_eq!(remote::remote_write_unsupported().code_str(), "E_INVALID_STATE");
     }
 }

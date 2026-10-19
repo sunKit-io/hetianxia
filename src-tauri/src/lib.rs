@@ -74,7 +74,7 @@ pub fn run() {
             commands::startup_offers,
             commands::ssh_secret_service,
             commands::save_ssh_secret,
-            commands::load_ssh_secret,
+            commands::ssh_secret_status,
             commands::delete_ssh_secret,
             commands::host_key_status,
             commands::clear_host_fingerprint,
@@ -117,6 +117,10 @@ mod tests {
         assert!(source.contains("begin_run"));
         assert!(source.contains("release_clean"));
         assert!(source.contains("startup_offers"));
+        let commands = include_str!("commands.rs");
+        assert!(!commands.contains("load_ssh_secret"));
+        assert!(commands.contains("ssh_secret_status"));
+        assert!(commands.contains("req.secret.clear()"));
     }
 
     #[test]

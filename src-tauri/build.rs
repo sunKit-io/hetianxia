@@ -11,7 +11,7 @@ fn main() {
         "startup_offers",
         "ssh_secret_service",
         "save_ssh_secret",
-        "load_ssh_secret",
+        "ssh_secret_status",
         "delete_ssh_secret",
         "host_key_status",
         "clear_host_fingerprint",

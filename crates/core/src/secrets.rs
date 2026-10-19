@@ -3,9 +3,22 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use serde::Serialize;
+
 use crate::error::{Error, ErrorCode, Result};
 
 pub const KEYRING_SERVICE: &str = "com.hetianxia.app.ssh";
+
+/// 交给界面的只有有没有保存。密码本身留在钥匙串里。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretStatus {
+    pub saved: bool,
+}
+
+pub fn status(store: &impl SecretStore, account: &str) -> Result<SecretStatus> {
+    Ok(SecretStatus { saved: store.get(account)?.is_some() })
+}
 
 pub trait SecretStore {
     fn get(&self, account: &str) -> Result<Option<String>>;
@@ -83,5 +96,22 @@ mod tests {
         store.delete("build-01").unwrap();
         assert_eq!(store.get("build-01").unwrap(), None);
         assert_eq!(KEYRING_SERVICE, "com.hetianxia.app.ssh");
+    }
+
+    #[test]
+    fn status_tells_the_frontend_saved_and_not_the_secret() {
+        let store = MemoryStore::default();
+        let secret = "pw-do-not-leak-9f3a";
+        store.set("build-01", secret).unwrap();
+        let saved = status(&store, "build-01").unwrap();
+        assert!(saved.saved);
+        let json = serde_json::to_string(&saved).unwrap();
+        assert_eq!(json, r#"{"saved":true}"#);
+        assert!(!json.contains(secret));
+        let missing = status(&store, "other").unwrap();
+        assert!(!missing.saved);
+        let err = Error::new(ErrorCode::Io, "钥匙串读取失败");
+        assert!(!err.to_string().contains(secret));
+        assert!(!serde_json::to_string(&err).unwrap().contains(secret));
     }
 }

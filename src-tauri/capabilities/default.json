@@ -15,7 +15,7 @@
     "allow-startup-offers",
     "allow-ssh-secret-service",
     "allow-save-ssh-secret",
-    "allow-load-ssh-secret",
+    "allow-ssh-secret-status",
     "allow-delete-ssh-secret",
     "allow-host-key-status",
     "allow-clear-host-fingerprint",

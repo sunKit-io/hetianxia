@@ -1094,6 +1094,9 @@ pub fn begin_run(db: &Connection, fsys: &LocalFs, data_dir: &Path) -> Result<Run
 }
 
 pub fn execute(db: &Connection, fsys: &LocalFs, plan: &ExecPlan, opts: &ExecOpts, fault: FaultPlan) -> Result<ExecReport> {
+    if opts.remote {
+        return Err(crate::remote::remote_write_unsupported());
+    }
     #[cfg(feature = "fault-inject")]
     if !opts.remote && fault.items.iter().any(|i| matches!(i, crate::fault::Item::At { stage: Stage::SftpDisconnect, .. })) {
         let msg = "本地目标不能使用断开连接这种故障".to_string();
@@ -3066,6 +3069,35 @@ mod tests {
         assert_eq!(wrote, expect);
         assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"NEW");
         assert_eq!(fs::read(dir.path().join("ro.txt")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn remote_overwrite_copy_delete_and_move_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"keep").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let before = fs::read(dir.path().join("a.txt")).unwrap();
+        for kind in [OpKind::Overwrite, OpKind::Create, OpKind::Delete, OpKind::Move] {
+            let mut op = ov(1, "a.txt", b"keep", b"NEW", None);
+            op.kind = kind;
+            if kind == OpKind::Move {
+                op.from = Some("a.txt".into());
+                op.path = "b.txt".into();
+            }
+            let plan = plan(vec![op]);
+            let mut opts = opts_at(dir.path());
+            opts.remote = true;
+            let err = execute(&db, &fsys, &plan, &opts, FaultPlan::default()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidState);
+            assert_eq!(err.code_str(), "E_INVALID_STATE");
+            assert_eq!(err.message, "远程写入还没支持");
+            assert!(!format!("{err}").contains("NEW"));
+        }
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), before);
+        assert!(!dir.path().join("b.txt").exists());
+        let rows: i64 = db.query_row("SELECT COUNT(*) FROM exec_journal", [], |row| row.get(0)).unwrap();
+        assert_eq!(rows, 0);
     }
 
     fn opts_at(dir: &Path) -> ExecOpts {

@@ -5,7 +5,7 @@ use hetianxia_core::merge::{self, Decision, Rendered};
 use hetianxia_core::pathutil::Ignore;
 use hetianxia_core::remote::{self, ImportedHost};
 use hetianxia_core::scan::{self, ScanOptions, ScanOutput};
-use hetianxia_core::secrets::{self, KeyringStore, SecretStore};
+use hetianxia_core::secrets::{self, KeyringStore, SecretStatus, SecretStore};
 use hetianxia_core::sftp::{self, ProbeReport, ProbeRequest};
 use hetianxia_core::vfs::LocalFs;
 use std::path::{Path, PathBuf};
@@ -104,13 +104,14 @@ pub fn ssh_secret_service() -> String {
 }
 
 #[tauri::command]
-pub fn save_ssh_secret(account: String, secret: String) -> Result<(), Error> {
-    KeyringStore.set(&account, &secret)
+pub fn save_ssh_secret(account: String, secret: String) -> Result<SecretStatus, Error> {
+    KeyringStore.set(&account, &secret)?;
+    Ok(SecretStatus { saved: true })
 }
 
 #[tauri::command]
-pub fn load_ssh_secret(account: String) -> Result<Option<String>, Error> {
-    KeyringStore.get(&account)
+pub fn ssh_secret_status(account: String) -> Result<SecretStatus, Error> {
+    secrets::status(&KeyringStore, &account)
 }
 
 #[tauri::command]
@@ -165,11 +166,11 @@ pub fn remote_rename_plan(posix_rename: bool) -> Vec<String> {
 
 #[tauri::command]
 pub fn probe_remote(mut req: ProbeRequest) -> Result<ProbeReport, Error> {
-    if req.secret.is_empty() {
-        if let Some(account) = req.account.clone() {
-            if let Some(secret) = KeyringStore.get(&account)? {
-                req.secret = secret;
-            }
+    // 界面带上来的口令一律丢掉。连接时只从钥匙串按连接 id 读取。
+    req.secret.clear();
+    if let Some(account) = req.account.clone() {
+        if let Some(secret) = KeyringStore.get(&account)? {
+            req.secret = secret;
         }
     }
     sftp::probe_connection(&mut req)

@@ -248,7 +248,15 @@ function HistoryPage({ onRollback }: { onRollback: () => void }) {
               <td>{row.change}</td>
               <td className={row.result === "已回滚" ? "rolled" : "ok"}>{row.result}</td>
               <td>
-                {row.cleaned ? <button disabled>备份已清理</button> : row.rollback ? <button onClick={onRollback}>回滚…</button> : <button disabled>回滚…</button>}
+                {row.where.includes(":/") ? (
+                  <button disabled title="远程写入还没支持">回滚…</button>
+                ) : row.cleaned ? (
+                  <button disabled>备份已清理</button>
+                ) : row.rollback ? (
+                  <button onClick={onRollback}>回滚…</button>
+                ) : (
+                  <button disabled>回滚…</button>
+                )}
               </td>
             </tr>
           ))}
