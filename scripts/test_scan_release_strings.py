@@ -58,6 +58,25 @@ class ExactThirdPartySentenceTest(unittest.TestCase):
         self.assertIn(f"{offset - 64:08x}  ", text)
         self.assertNotIn("00000000  ", text)
 
+    def test_every_hit_in_one_file_is_listed(self):
+        blob = b"Rename\x00" + EXACT + b"\x00Backup\x00Rename"
+        first = 0
+        backup_at = len(b"Rename\x00") + len(EXACT) + 1
+        second = backup_at + len(b"Backup\x00")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            failed = scan.forbid_blobs([("sample", blob)])
+        text = buf.getvalue()
+        self.assertEqual(name_hits(blob), [b"Rename", b"Backup", b"Rename"])
+        self.assertEqual(failed, 3)
+        self.assertEqual(text.count("contains Rename at "), 2)
+        self.assertIn(f"contains Rename at {first}", text)
+        self.assertIn(f"contains Backup at {backup_at}", text)
+        self.assertIn(f"contains Rename at {second}", text)
+        self.assertEqual(text.count("offset "), 3)
+        self.assertIn("52 65 6e 61 6d 65", text)
+        self.assertIn("42 61 63 6b 75 70", text)
+
 
 if __name__ == "__main__":
     unittest.main()

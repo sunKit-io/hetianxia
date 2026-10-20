@@ -26,6 +26,8 @@ jobs:
         run: cargo test -p hetianxia-core
       - name: cargo test fault-inject
         run: cargo test -p hetianxia-core --features fault-inject
+      - name: release string scan unit tests
+        run: python3 scripts/test_scan_release_strings.py
       - name: release strings
         run: |
           cargo build -p hetianxia-core --release --locked --bin hetianxia-linkcheck

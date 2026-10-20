@@ -6,3 +6,7 @@ resolver = "2"
 # 安装包仍可下载。放在仓库里，避免为了换 russh 升到 edition 2024 / Rust 1.85。
 [patch.crates-io]
 libcrux-ml-kem = { path = "third_party/libcrux-ml-kem" }
+
+# tauri build 默认走 release。符号表里的 Rename 等名字不应进入发布二进制。
+[profile.release]
+strip = "symbols"

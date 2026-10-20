@@ -83,7 +83,10 @@ def dmg_executables(dmg: pathlib.Path):
                 check=True,
             )
             try:
-                extracted = [(_member(mount, path), path.read_bytes()) for path in app_executables(mount)]
+                for path in app_executables(mount):
+                    data = path.read_bytes()
+                    print(f"scan {path} ({len(data)} bytes)")
+                    extracted.append((_member(mount, path), data))
             finally:
                 subprocess.run(["hdiutil", "detach", str(mount)], check=False)
             return extracted
@@ -92,12 +95,15 @@ def dmg_executables(dmg: pathlib.Path):
             sys.exit(f"{dmg} is present but neither hdiutil nor 7z can read it")
         subprocess.run([tool, "x", f"-o{dest}", str(dmg)], check=True, capture_output=True)
         for path in app_executables(dest):
-            extracted.append((_member(dest, path), path.read_bytes()))
+            data = path.read_bytes()
+            print(f"scan {path} ({len(data)} bytes)")
+            extracted.append((_member(dest, path), data))
         if not extracted:
             for path in dest.rglob("*"):
                 if path.is_file() and not is_rlib(path) and path.suffix not in {".plist", ".xml", ".txt"}:
                     blob = path.read_bytes()
                     if blob[:4] in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\x7fELF") or blob[:2] == b"MZ":
+                        print(f"scan {path} ({len(blob)} bytes)")
                         extracted.append((_member(dest, path), blob))
     if not extracted:
         sys.exit(f"no executable inside {dmg}")
@@ -153,18 +159,20 @@ def forbid_blobs(blobs):
             failed += 1
             continue
         for needle in NEEDLES:
-            idx = blob.find(needle)
-            if idx >= 0:
+            start = 0
+            while True:
+                idx = blob.find(needle, start)
+                if idx < 0:
+                    break
                 report_hit(label, blob, idx, len(needle), needle.decode())
                 failed += 1
+                start = idx + len(needle)
         for match in STAGE.finditer(blob):
             report_hit(label, blob, match.start(), len(match.group()), repr(match.group()))
             failed += 1
-            break
         for match in STAGE_NAME_RE.finditer(without_exact_third_party(blob)):
             report_hit(label, blob, match.start(), len(match.group()), match.group().decode())
             failed += 1
-            break
     return failed
 
 
