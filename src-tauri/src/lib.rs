@@ -116,6 +116,7 @@ pub fn run() {
             commands::merge,
             commands::read_side,
             commands::prepare_package,
+            commands::confirm_execute,
             commands::execute,
             commands::rollback_run,
             commands::resume_run,
@@ -160,6 +161,49 @@ pub fn run() {
 mod tests {
     use super::*;
     use hetianxia_core::model::{ExecPlan, OpKind, PlanOp, Summary};
+
+    fn execute_ok(
+        db: &std::path::Path,
+        root: &std::path::Path,
+        backup: &std::path::Path,
+        plan: hetianxia_core::model::ExecPlan,
+        allow_readonly: bool,
+    ) -> hetianxia_core::exec::ExecReport {
+        let ticket = commands::confirm_execute_in(db, backup, root, &plan, allow_readonly).expect("confirm");
+        commands::execute_in(db, root, backup, plan, allow_readonly, &ticket.token).expect("execute")
+    }
+
+    #[test]
+    fn execute_without_confirm_writes_nothing_and_confirm_runs_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"old").unwrap();
+        let db = dir.path().join("t.sqlite");
+        let backup = dir.path().join("bak");
+        let plan = overwrite_plan("exec-gate", b"new");
+        let denied = commands::execute_in(&db, dir.path(), &backup, plan.clone(), false, "").unwrap_err();
+        assert_eq!(denied.code, hetianxia_core::error::ErrorCode::InvalidState);
+        assert_eq!(denied.message, hetianxia_core::exec::UNCONFIRMED_EXECUTE);
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"old");
+        assert!(!backup.join("exec-gate").exists());
+
+        let ticket = commands::confirm_execute_in(&db, &backup, dir.path(), &plan, false).unwrap();
+        assert_eq!(ticket.overwrite, 1);
+        assert_eq!(ticket.create, 0);
+        assert_eq!(ticket.move_count, 0);
+        assert_eq!(ticket.backup_path, backup.join("exec-gate").display().to_string());
+        assert!(ticket.body.contains("将覆盖 1 个文件。"));
+        assert!(ticket.body.contains(&ticket.backup_path));
+        assert!(!ticket.body.contains("新增"));
+        assert!(!ticket.body.contains("移动"));
+        assert!(!backup.join("exec-gate").exists());
+
+        let report = commands::execute_in(&db, dir.path(), &backup, plan.clone(), false, &ticket.token).unwrap();
+        assert_eq!(report.history_result, "成功");
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"new");
+        let reused = commands::execute_in(&db, dir.path(), &backup, plan, false, &ticket.token).unwrap_err();
+        assert_eq!(reused.message, hetianxia_core::exec::UNCONFIRMED_EXECUTE);
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"new");
+    }
 
     fn command_header(source: &str, name: &str) -> String {
         let marker = format!("pub fn {name}(");
@@ -307,7 +351,7 @@ mod tests {
             summary: Summary { overwrite: 1, ..Summary::default() },
         };
         let backup = dir.path().join("bak");
-        let report = commands::execute_in(&db, dir.path(), &backup, plan, false).unwrap();
+        let report = execute_ok(&db, dir.path(), &backup, plan, false);
         assert_eq!(report.history_result, "成功");
         let rows = commands::history_in(&db).unwrap();
         assert_eq!(rows.len(), 1);
@@ -409,8 +453,8 @@ mod tests {
         std::fs::write(b.join("a.txt"), b"from-b").unwrap();
         let db = dir.path().join("t.sqlite");
         let backup = dir.path().join("bak");
-        commands::execute_in(&db, &a, &backup, overwrite_plan("exec-a", b"NEW"), false).unwrap();
-        commands::execute_in(&db, &b, &backup, overwrite_plan("exec-b", b"from-b-new"), false).unwrap();
+        execute_ok(&db, &a, &backup, overwrite_plan("exec-a", b"NEW"), false);
+        execute_ok(&db, &b, &backup, overwrite_plan("exec-b", b"from-b-new"), false);
 
         let rolled = commands::rollback_recorded(&db, "exec-a", hetianxia_core::exec::RollbackChoice::ProceedBackupCurrent).unwrap();
         assert_eq!(rolled.state, "ROLLED_BACK");
@@ -454,8 +498,8 @@ mod tests {
         std::fs::write(b.join("a.txt"), b"old-b").unwrap();
         let db = dir.path().join("t.sqlite");
         let backup = dir.path().join("bak");
-        commands::execute_in(&db, &a, &backup, overwrite_plan("exec-a", b"NEW-A"), false).unwrap();
-        commands::execute_in(&db, &b, &backup, overwrite_plan("exec-b", b"NEW-B"), false).unwrap();
+        execute_ok(&db, &a, &backup, overwrite_plan("exec-a", b"NEW-A"), false);
+        execute_ok(&db, &b, &backup, overwrite_plan("exec-b", b"NEW-B"), false);
 
         let canon_a = std::fs::canonicalize(&a).unwrap();
         let canon_b = std::fs::canonicalize(&b).unwrap();

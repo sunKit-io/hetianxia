@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { ResumeChoice, RollbackChoice } from "./choices";
 import { parseResume, type ExecReport, type RecoveryOffer, type ResumeView } from "./engine";
+import type { ExecuteConfirm } from "./confirmExecute";
 import type { ExecPlan, SideText, TextDoc } from "./localPlan";
 
 export function rollbackRun(execId: string, choice: RollbackChoice) {
@@ -172,8 +173,12 @@ export function preparePackage(path: string) {
   return invoke<string>("prepare_package", { path });
 }
 
-export function executeLocal(root: string, plan: ExecPlan, allowReadonly: boolean) {
-  return invoke<ExecReport>("execute", { root, plan, allowReadonly });
+export function confirmExecute(root: string, plan: ExecPlan, allowReadonly: boolean) {
+  return invoke<ExecuteConfirm>("confirm_execute", { root, plan, allowReadonly });
+}
+
+export function executeLocal(root: string, plan: ExecPlan, allowReadonly: boolean, token: string) {
+  return invoke<ExecReport>("execute", { root, plan, allowReadonly, token });
 }
 
 export async function pickProjectDirectory(): Promise<string | null> {

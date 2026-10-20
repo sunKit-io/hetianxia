@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Server, ShieldAlert, KeyRound, AlertTriangle } from "lucide-react";
-import { appBakDir, clearConnectionFingerprint, commitRemoteOverwrite, deleteConnection, deleteSshSecret, executeLocal, journalRuns, listConnections, loadFilePicks, mergeTexts, pickProjectDirectory, pickUpgradeDirectory, pickUpgradeZip, readSide, remoteWritePrompt, rollbackPreview, rollbackRun, resumeRun, saveConnection, saveFilePicks, saveSshSecret, scanPair, sshSecretStatus, startupFailure, startupOffers, testConnection, type JournalRun, type ProbeReport, type SavedConnection } from "./backend";
+import { appBakDir, clearConnectionFingerprint, commitRemoteOverwrite, confirmExecute, deleteConnection, deleteSshSecret, executeLocal, journalRuns, listConnections, loadFilePicks, mergeTexts, pickProjectDirectory, pickUpgradeDirectory, pickUpgradeZip, readSide, remoteWritePrompt, rollbackPreview, rollbackRun, resumeRun, saveConnection, saveFilePicks, saveSshSecret, scanPair, sshSecretStatus, startupFailure, startupOffers, testConnection, type JournalRun, type ProbeReport, type SavedConnection } from "./backend";
 import { invertPicked, pickedFromSkipped, skippedOf } from "./filePicks";
+import { confirmExecuteBody, settleExecuteConfirm, type ExecuteConfirm } from "./confirmExecute";
 import { externalChoice, keepSource, pendingChoice, rollbackChoice, type ResumeChoice, type RollbackChoice } from "./choices";
 import { DiffEditor } from "./editor";
 import { afterResume, engineCode, formatEngineError, formatFileResult, formatOffer, formatReport, type ConflictFile, type ExecReport, type RecoveryOffer } from "./engine";
@@ -24,6 +25,7 @@ import {
   selectedPlan,
   selectionSummary,
   type CheckState,
+  type ExecPlan,
   type LocalPlan,
 } from "./localPlan";
 import { formatFileCounts, formatRunTime, historyContinue, historyRowButtons, historyStatusLabel, REMOTE_ROLLBACK_TITLE, type HistoryContinue } from "./historyRows";
@@ -87,6 +89,7 @@ export function App() {
   const [scanning, setScanning] = useState(false);
   const [running, setRunning] = useState(false);
   const [report, setReport] = useState<ExecReport | null>(null);
+  const [pendingExec, setPendingExec] = useState<{ root: string; plan: ExecPlan; allowReadonly: boolean; preview: ExecuteConfirm } | null>(null);
   const selected = connections.find((item) => item.id === selectedId) ?? null;
 
   useEffect(() => {
@@ -193,14 +196,36 @@ export function App() {
   }
 
   async function backupAndExecute(edits: Record<string, string>) {
-    if (!projectRoot || !plan || running) return;
+    if (!projectRoot || !plan || running || pendingExec) return;
     const chosen = selectedPlan(plan, pickedPaths);
     if (chosen.files.length === 0) return;
+    try {
+      const execPlan = await execPlanFor(chosen, edits, decisionMap(), mergeTexts, newExecId());
+      const preview = await confirmExecute(projectRoot, execPlan, allowReadonly);
+      setPendingExec({ root: projectRoot, plan: execPlan, allowReadonly, preview });
+    } catch (err) {
+      setStatus(formatEngineError(err));
+    }
+  }
+
+  function dismissExecute(action: "cancel" | "escape") {
+    if (action === "escape") settleExecuteConfirm("escape", () => { void runConfirmed(); });
+    else settleExecuteConfirm("cancel", () => { void runConfirmed(); });
+    setPendingExec(null);
+  }
+
+  function acceptExecute() {
+    settleExecuteConfirm("confirm", () => { void runConfirmed(); });
+  }
+
+  async function runConfirmed() {
+    const current = pendingExec;
+    if (!current || running) return;
+    setPendingExec(null);
     setRunning(true);
     setStatus("正在备份并执行…");
     try {
-      const execPlan = await execPlanFor(chosen, edits, decisionMap(), mergeTexts, newExecId());
-      const result = await executeLocal(projectRoot, execPlan, allowReadonly);
+      const result = await executeLocal(current.root, current.plan, current.allowReadonly, current.preview.token);
       setReport(result);
       setStatus(formatReport(result));
     } catch (err) {
@@ -390,6 +415,14 @@ export function App() {
         )}
         {sheet === "rollbackResume" && (
           <RollbackResumeSheet alert={status} offer={offer} onLater={() => offer && void applyResume(offer.execId, "cancel")} onContinue={() => offer && void applyRollback(offer.execId, "proceedBackupCurrent")} />
+        )}
+        {pendingExec && (
+          <ExecuteConfirmSheet
+            preview={pendingExec.preview}
+            onCancel={() => dismissExecute("cancel")}
+            onEscape={() => dismissExecute("escape")}
+            onConfirm={acceptExecute}
+          />
         )}
         {bootError && (
           <div className="mask" role="alertdialog" aria-modal="true" aria-labelledby="boot-error-title">
@@ -781,6 +814,51 @@ function PreviewPage({
         {target === "local" && plan && summary.selected === 0 && <p>至少选一个文件</p>}
         <footer>
           <button className="primary" disabled={target === "local" ? !localReady || summary.selected === 0 : !remoteReady} onClick={() => { if (target === "remote") onRemoteWrite(); else onExecute(); }}>{target === "remote" ? "写入远程" : "备份并执行"}</button>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function ExecuteConfirmSheet({
+  preview,
+  onCancel,
+  onEscape,
+  onConfirm,
+}: {
+  preview: ExecuteConfirm;
+  onCancel: () => void;
+  onEscape: () => void;
+  onConfirm: () => void;
+}) {
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    cancelRef.current?.focus();
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      onEscape();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onEscape]);
+  return (
+    <div className="mask" role="dialog" aria-modal="true" aria-labelledby="confirm-execute-title" onClick={onCancel}>
+      <div className="sheet small" onClick={(event) => event.stopPropagation()}>
+        <h1 id="confirm-execute-title"><ShieldAlert size={18} /> 确认执行升级</h1>
+        <p><Text value={confirmExecuteBody(preview)} /></p>
+        {preview.conflicts.length > 0 && (
+          <ul className="changes">
+            {preview.conflicts.map((file) => (
+              <li key={file.path}>
+                <span><Text value={file.detail} /></span>
+              </li>
+            ))}
+          </ul>
+        )}
+        <footer>
+          <button ref={cancelRef} type="button" className="ghost" autoFocus onClick={onCancel}>取消</button>
+          <button type="button" className="primary" onClick={onConfirm}>确认执行</button>
         </footer>
       </div>
     </div>

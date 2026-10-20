@@ -10,6 +10,7 @@
     "allow-merge",
     "allow-read-side",
     "allow-prepare-package",
+    "allow-confirm-execute",
     "allow-execute",
     "dialog:allow-open",
     "allow-rollback-run",

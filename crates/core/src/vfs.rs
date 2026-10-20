@@ -1,7 +1,7 @@
 //! 本地文件系统。不跟随符号链接；写操作拒绝路径上的符号链接；
 //! 原子替换由执行引擎调用这里的「临时文件 / 读回 / 改名」原语完成。
 
-use crate::error::{Error, ErrorCode, Result};
+use crate::error::{occupied_after_preview, Error, ErrorCode, Result};
 use crate::hashutil::{hash_file_sha256, hash_file_xxh};
 use crate::pathutil::{Ignore, RelPath};
 use serde::Serialize;
@@ -335,6 +335,32 @@ impl LocalFs {
     pub fn rename_over_placed(&self, tmp: &RelPath, dest: &RelPath) -> Result<()> {
         let (from, to) = self.prepare_rename(tmp, dest)?;
         atomic_rename_nosync(&from, &to)
+    }
+
+    /// 目标上任何文件、目录或符号链接都算已占用。不跟随符号链接。
+    pub fn path_occupied(&self, rel: &RelPath) -> Result<bool> {
+        let path = self.abs(rel)?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// 新增和移动只在目标还不存在时落地。临时文件本身用 `create_new` 创建；
+    /// 换到目标前再查一次，已经存在就返回冲突，不改目标上的内容。
+    /// Windows 的改名不带替换标志，竞态里后出现的文件也会失败成冲突。
+    pub fn place_if_absent(&self, tmp: &RelPath, dest: &RelPath) -> Result<()> {
+        self.ensure_writable_tree(dest)?;
+        let from = self.abs(tmp)?;
+        let to = self.abs(dest)?;
+        if let Ok(meta) = fs::symlink_metadata(&to) {
+            if meta.file_type().is_symlink() {
+                return Err(Error::new(ErrorCode::SymlinkRefused, format!("拒绝用普通文件覆盖符号链接 {dest}")));
+            }
+            return Err(occupied_after_preview(dest.as_str()));
+        }
+        rename_noreplace(&from, &to, dest)
     }
 
     pub fn fsync_parent_of(&self, rel: &RelPath, before_dir_fsync: impl FnOnce() -> Result<()>) -> Result<()> {
@@ -672,6 +698,35 @@ fn fsync_parent(path: &Path) -> Result<()> {
 
 pub fn atomic_rename(from: &Path, to: &Path) -> Result<()> {
     atomic_rename_counted(from, to, || Ok(()))
+}
+
+fn rename_noreplace(from: &Path, to: &Path, dest: &crate::pathutil::RelPath) -> Result<()> {
+    if fs::symlink_metadata(to).is_ok() {
+        return Err(occupied_after_preview(dest.as_str()));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let to_w: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+        let from_w: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+        extern "system" {
+            fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+        }
+        const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+        let ok = unsafe { MoveFileExW(from_w.as_ptr(), to_w.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+        if ok == 0 {
+            if fs::symlink_metadata(to).is_ok() {
+                return Err(occupied_after_preview(dest.as_str()));
+            }
+            return Err(Error::new(ErrorCode::Io, "MoveFileExW 失败"));
+        }
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(from, to)?;
+        Ok(())
+    }
 }
 
 fn atomic_rename_nosync(from: &Path, to: &Path) -> Result<()> {

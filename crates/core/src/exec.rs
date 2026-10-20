@@ -24,7 +24,7 @@
 //! 删除开关关闭时，移动变成复制，界面文案是「移动（保留旧文件）」。
 //! 直接覆盖保留升级包的 mtime；合并结果用写入时刻。
 
-use crate::error::{Error, ErrorCode, Result, ATTR_RESTORE_FAILED};
+use crate::error::{occupied_after_preview, Error, ErrorCode, Result, ATTR_RESTORE_FAILED};
 use crate::fault::{FaultPlan, FaultRuntime};
 #[cfg(feature = "fault-inject")]
 use crate::fault::Stage;
@@ -247,6 +247,12 @@ pub fn open_db(path: &Path) -> Result<Connection> {
             exec_id TEXT NOT NULL,
             path TEXT NOT NULL,
             PRIMARY KEY (exec_id, path)
+        );
+        CREATE TABLE IF NOT EXISTS exec_confirm (
+            exec_id TEXT PRIMARY KEY,
+            token TEXT NOT NULL,
+            backup_path TEXT NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0
         );",
     )?;
     Ok(conn)
@@ -1433,6 +1439,9 @@ fn write_one(
     dest: &RelPath,
     bytes: &[u8],
 ) -> Result<()> {
+    if matches!(op.kind, OpKind::Create | OpKind::Move) && fsys.path_occupied(dest)? {
+        return Err(occupied_after_preview(dest.as_str()));
+    }
     if let Err(e) = fault.hit_file(
         #[cfg(feature = "fault-inject")]
         Stage::Write,
@@ -1482,7 +1491,11 @@ fn write_one(
     ) {
         return bail(real_code(e));
     }
-    if let Err(e) = fsys.rename_over_placed(&tmp, dest) {
+    if matches!(op.kind, OpKind::Create | OpKind::Move) {
+        if let Err(e) = fsys.place_if_absent(&tmp, dest) {
+            return bail(e);
+        }
+    } else if let Err(e) = fsys.rename_over_placed(&tmp, dest) {
         return bail(e);
     }
     // 目标内容已经换上。目录 fsync 失败也必须留下 written=1，回滚才知道要恢复。
@@ -1845,6 +1858,106 @@ pub fn skip_readonly_label(n: u32) -> String {
     format!("跳过（只读）{n}")
 }
 
+pub const UNCONFIRMED_EXECUTE: &str = "这次执行还没有确认，没有写入文件";
+
+/// 预演确认。数量只统计这次真正会写入的操作。备份路径是 `backup_root/<exec_id>`，此时目录还不存在。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecuteConfirm {
+    pub exec_id: String,
+    pub token: String,
+    pub create: u32,
+    pub overwrite: u32,
+    pub move_count: u32,
+    pub backup_path: String,
+    pub body: String,
+    /// 确认前再查到的、已经存在的新增或移动目标。执行器仍会拒绝覆盖。
+    pub conflicts: Vec<ConflictFile>,
+}
+
+pub fn confirm_backup_path(backup_root: &Path, exec_id: &str) -> PathBuf {
+    backup_root.join(exec_id)
+}
+
+/// 数量为 0 的类别整句删掉。移动在最后时带「个文件（保留旧文件）」，否则最后一类带「个文件」。
+pub fn confirm_execute_body(create: u32, overwrite: u32, move_count: u32, backup_path: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if create > 0 {
+        parts.push(format!("新增 {create} 个"));
+    }
+    if overwrite > 0 {
+        parts.push(format!("覆盖 {overwrite} 个"));
+    }
+    if move_count > 0 {
+        parts.push(format!("移动 {move_count} 个"));
+    }
+    let lead = if let Some(last) = parts.last_mut() {
+        if move_count > 0 {
+            *last = format!("移动 {move_count} 个文件（保留旧文件）");
+        } else if let Some(stripped) = last.strip_suffix(" 个") {
+            *last = format!("{stripped} 个文件");
+        }
+        format!("将{}。", parts.join("、"))
+    } else {
+        String::new()
+    };
+    format!("{lead}执行前会把原文件备份到 {backup_path}，出问题可以一键回滚。")
+}
+
+/// 新增、移动的目标路径上已经有文件时，确认框要列出来。不创建备份目录，也不写这些文件。
+pub fn occupied_targets(fsys: &LocalFs, ops: &[PlanOp], allow_readonly: bool) -> Result<Vec<ConflictFile>> {
+    let mut out = Vec::new();
+    for op in ops {
+        if !will_apply(op, allow_readonly) || !matches!(op.kind, OpKind::Create | OpKind::Move) {
+            continue;
+        }
+        let rel = RelPath::parse(&op.path)?;
+        if fsys.path_occupied(&rel)? {
+            out.push(ConflictFile { path: op.path.clone(), detail: occupied_after_preview(&op.path).message });
+        }
+    }
+    Ok(out)
+}
+
+/// 记下一次性确认令牌。不创建备份目录，也不写项目文件。
+pub fn issue_execute_confirm(db: &Connection, backup_root: &Path, fsys: &LocalFs, plan: &ExecPlan, allow_readonly: bool) -> Result<ExecuteConfirm> {
+    if plan.id.trim().is_empty() {
+        return Err(Error::new(ErrorCode::InvalidState, "执行编号是空的"));
+    }
+    let counts = preview_counts(&plan.ops, allow_readonly);
+    let backup_path = confirm_backup_path(backup_root, &plan.id).display().to_string();
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let body = confirm_execute_body(counts.create, counts.overwrite, counts.move_count, &backup_path);
+    let conflicts = occupied_targets(fsys, &plan.ops, allow_readonly)?;
+    db.execute(
+        "INSERT INTO exec_confirm (exec_id, token, backup_path, used) VALUES (?1,?2,?3,0)
+         ON CONFLICT(exec_id) DO UPDATE SET token=excluded.token, backup_path=excluded.backup_path, used=0",
+        params![plan.id, token, backup_path],
+    )?;
+    Ok(ExecuteConfirm {
+        exec_id: plan.id.clone(),
+        token,
+        create: counts.create,
+        overwrite: counts.overwrite,
+        move_count: counts.move_count,
+        backup_path,
+        body,
+        conflicts,
+    })
+}
+
+/// 核销令牌。对不上、用过、或根本没确认，都拒绝，调用方不得继续写盘。
+pub fn consume_execute_confirm(db: &Connection, exec_id: &str, token: &str) -> Result<()> {
+    if exec_id.trim().is_empty() || token.trim().is_empty() {
+        return Err(Error::new(ErrorCode::InvalidState, UNCONFIRMED_EXECUTE));
+    }
+    let changed = db.execute("UPDATE exec_confirm SET used=1 WHERE exec_id=?1 AND token=?2 AND used=0", params![exec_id, token])?;
+    if changed != 1 {
+        return Err(Error::new(ErrorCode::InvalidState, UNCONFIRMED_EXECUTE));
+    }
+    Ok(())
+}
+
 pub fn planned_write_paths(ops: &[PlanOp], allow_readonly: bool) -> Vec<String> {
     ops.iter().filter(|op| will_apply(op, allow_readonly)).map(|op| op.path.clone()).collect()
 }
@@ -2181,6 +2294,10 @@ pub fn rollback(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: 
     for op in plan.ops.iter().rev() {
         let Some(row) = states.get(&op.index) else { continue };
         if !op_touched(row) {
+            continue;
+        }
+        // 新增和移动没落地时，目标上的文件是用户的，回滚不能删。
+        if !row.written && matches!(op.kind, OpKind::Create | OpKind::Move) {
             continue;
         }
         if row.rollback_state.as_deref() == Some("done") && !move_other_side_present(fsys, op)? {
@@ -3417,6 +3534,94 @@ mod tests {
         assert!(!dir.path().join("b.txt").exists());
         let rows: i64 = db.query_row("SELECT COUNT(*) FROM exec_journal", [], |row| row.get(0)).unwrap();
         assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn confirm_counts_follow_the_ops_that_will_run_and_the_token_is_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let backup = dir.path().join("bak");
+        let mut readonly = ov(3, "ro.txt", b"old", b"new", None);
+        readonly.readonly = true;
+        let mut moved = ov(4, "new.ts", b"body", b"body", None);
+        moved.kind = OpKind::Move;
+        moved.from = Some("old.ts".into());
+        moved.keep_source = true;
+        let mut recorded = plan(vec![create_op(1, "added.txt", b"new"), ov(2, "keep.txt", b"old", b"new", None), readonly, moved, del(5, "gone.txt", b"x")]);
+        recorded.id = "exec-confirm".into();
+        let fsys = LocalFs::new(dir.path());
+        let ticket = issue_execute_confirm(&db, &backup, &fsys, &recorded, false).unwrap();
+        assert!(ticket.conflicts.is_empty(), "{:?}", ticket.conflicts);
+        assert_eq!(ticket.create, 1);
+        assert_eq!(ticket.overwrite, 1);
+        assert_eq!(ticket.move_count, 1);
+        assert_eq!(ticket.backup_path, backup.join("exec-confirm").display().to_string());
+        assert!(!backup.join("exec-confirm").exists());
+        assert_eq!(ticket.body, confirm_execute_body(1, 1, 1, &ticket.backup_path));
+        let allowed = issue_execute_confirm(&db, &backup, &fsys, &recorded, true).unwrap();
+        assert_eq!(allowed.overwrite, 2);
+        assert!(consume_execute_confirm(&db, "exec-confirm", "nope").is_err());
+        consume_execute_confirm(&db, "exec-confirm", &allowed.token).unwrap();
+        let again = consume_execute_confirm(&db, "exec-confirm", &allowed.token).unwrap_err();
+        assert_eq!(again.message, UNCONFIRMED_EXECUTE);
+        assert!(consume_execute_confirm(&db, "missing", &allowed.token).is_err());
+        let journal: i64 = db.query_row("SELECT COUNT(*) FROM exec_journal", [], |row| row.get(0)).unwrap();
+        assert_eq!(journal, 0);
+        fs::write(dir.path().join("added.txt"), b"user").unwrap();
+        fs::write(dir.path().join("new.ts"), b"user-move").unwrap();
+        let listed = issue_execute_confirm(&db, &backup, &fsys, &recorded, false).unwrap();
+        let paths: Vec<_> = listed.conflicts.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, vec!["added.txt", "new.ts"]);
+        assert!(listed.conflicts.iter().all(|c| c.detail == occupied_after_preview(&c.path).message));
+        assert_eq!(fs::read(dir.path().join("added.txt")).unwrap(), b"user");
+        assert!(!backup.join("exec-confirm").exists());
+    }
+
+    #[test]
+    fn create_and_move_leave_an_existing_target_and_rollback_does_not_delete_it() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("new.txt"), b"user-new").unwrap();
+        fs::write(dir.path().join("old.ts"), b"body").unwrap();
+        fs::write(dir.path().join("moved.ts"), b"user-moved").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let created = plan(vec![create_op(1, "new.txt", b"from-package")]);
+        let rep = execute(&db, &fsys, &created, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        assert_eq!(rep.state, "STOPPED", "{:?}", rep.files);
+        assert_eq!(rep.files[0].code.as_deref(), Some("E_CONFLICT"));
+        assert_eq!(rep.files[0].error.as_deref(), Some(occupied_after_preview("new.txt").message.as_str()));
+        assert_eq!(fs::read(dir.path().join("new.txt")).unwrap(), b"user-new");
+        let back = rollback(&db, &fsys, &created.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+        assert_eq!(back.state, "ROLLED_BACK", "{:?}", back.files);
+        assert_eq!(fs::read(dir.path().join("new.txt")).unwrap(), b"user-new");
+
+        let mut moved = keep_move_op();
+        moved.path = "moved.ts".into();
+        let moved_plan = plan(vec![moved]);
+        let rep = execute(&db, &fsys, &moved_plan, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        assert_eq!(rep.state, "STOPPED", "{:?}", rep.files);
+        assert_eq!(rep.files[0].path, "moved.ts");
+        assert_eq!(rep.files[0].code.as_deref(), Some("E_CONFLICT"));
+        assert_eq!(rep.files[0].error.as_deref(), Some(occupied_after_preview("moved.ts").message.as_str()));
+        assert_eq!(fs::read(dir.path().join("moved.ts")).unwrap(), b"user-moved");
+        assert_eq!(fs::read(dir.path().join("old.ts")).unwrap(), b"body");
+        let back = rollback(&db, &fsys, &moved_plan.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+        assert_eq!(back.state, "ROLLED_BACK", "{:?}", back.files);
+        assert_eq!(fs::read(dir.path().join("moved.ts")).unwrap(), b"user-moved");
+        assert_eq!(fs::read(dir.path().join("old.ts")).unwrap(), b"body");
+    }
+
+    #[test]
+    fn confirm_body_drops_zero_counts() {
+        let path = "/data/bak/exec-1";
+        assert_eq!(confirm_execute_body(2, 1, 3, path), "将新增 2 个、覆盖 1 个、移动 3 个文件（保留旧文件）。执行前会把原文件备份到 /data/bak/exec-1，出问题可以一键回滚。");
+        assert_eq!(confirm_execute_body(2, 1, 0, path), "将新增 2 个、覆盖 1 个文件。执行前会把原文件备份到 /data/bak/exec-1，出问题可以一键回滚。");
+        assert_eq!(confirm_execute_body(2, 0, 3, path), "将新增 2 个、移动 3 个文件（保留旧文件）。执行前会把原文件备份到 /data/bak/exec-1，出问题可以一键回滚。");
+        assert_eq!(confirm_execute_body(0, 1, 3, path), "将覆盖 1 个、移动 3 个文件（保留旧文件）。执行前会把原文件备份到 /data/bak/exec-1，出问题可以一键回滚。");
+        assert_eq!(confirm_execute_body(4, 0, 0, path), "将新增 4 个文件。执行前会把原文件备份到 /data/bak/exec-1，出问题可以一键回滚。");
+        assert_eq!(confirm_execute_body(0, 5, 0, path), "将覆盖 5 个文件。执行前会把原文件备份到 /data/bak/exec-1，出问题可以一键回滚。");
+        assert_eq!(confirm_execute_body(0, 0, 6, path), "将移动 6 个文件（保留旧文件）。执行前会把原文件备份到 /data/bak/exec-1，出问题可以一键回滚。");
+        assert_eq!(confirm_execute_body(0, 0, 0, path), "执行前会把原文件备份到 /data/bak/exec-1，出问题可以一键回滚。");
     }
 
     fn opts_at(dir: &Path) -> ExecOpts {

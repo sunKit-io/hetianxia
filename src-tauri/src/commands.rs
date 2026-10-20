@@ -143,7 +143,31 @@ pub fn prepare_package(path: String) -> Result<String, Error> {
     Err(Error::new(ErrorCode::NotFound, "升级包需要是目录或 zip 文件"))
 }
 
-pub fn execute_in(db_path: &Path, root: &Path, backup_root: &Path, mut plan: ExecPlan, allow_readonly: bool) -> Result<ExecReport, Error> {
+pub fn confirm_execute_in(
+    db_path: &Path,
+    backup_root: &Path,
+    root: &Path,
+    plan: &ExecPlan,
+    allow_readonly: bool,
+) -> Result<exec::ExecuteConfirm, Error> {
+    let db = exec::open_db(db_path)?;
+    let fsys = LocalFs::new(root);
+    exec::issue_execute_confirm(&db, backup_root, &fsys, plan, allow_readonly)
+}
+
+/// 先核销一次性确认令牌。没确认就返回，不记项目目录，也不调用执行。
+pub fn execute_in(
+    db_path: &Path,
+    root: &Path,
+    backup_root: &Path,
+    mut plan: ExecPlan,
+    allow_readonly: bool,
+    token: &str,
+) -> Result<ExecReport, Error> {
+    {
+        let db = exec::open_db(db_path)?;
+        exec::consume_execute_confirm(&db, &plan.id, token)?;
+    }
     remember_project_root(db_path, root);
     plan.project_root = root.display().to_string();
     let db = exec::open_db(db_path)?;
@@ -154,11 +178,26 @@ pub fn execute_in(db_path: &Path, root: &Path, backup_root: &Path, mut plan: Exe
 }
 
 #[tauri::command]
+pub fn confirm_execute(
+    session: tauri::State<crate::Session>,
+    root: String,
+    plan: ExecPlan,
+    allow_readonly: bool,
+) -> Result<exec::ExecuteConfirm, Error> {
+    ready(&session)?;
+    if !session.backup_root.is_absolute() {
+        return Err(Error::new(ErrorCode::InvalidState, "本机备份目录还没准备好"));
+    }
+    confirm_execute_in(&session.db_path, &session.backup_root, Path::new(&root), &plan, allow_readonly)
+}
+
+#[tauri::command]
 pub fn execute(
     session: tauri::State<crate::Session>,
     root: String,
     plan: ExecPlan,
     allow_readonly: bool,
+    token: String,
 ) -> Result<ExecReport, Error> {
     ready(&session)?;
     let project = PathBuf::from(&root);
@@ -166,7 +205,7 @@ pub fn execute(
         let mut saved = session.project_root.lock().map_err(|_| Error::new(ErrorCode::Internal, "项目目录锁被占用"))?;
         *saved = project.clone();
     }
-    execute_in(&session.db_path, &project, &session.backup_root, plan, allow_readonly)
+    execute_in(&session.db_path, &project, &session.backup_root, plan, allow_readonly, &token)
 }
 
 pub fn rollback_in(db_path: &Path, root: &Path, exec_id: &str, choice: RollbackChoice) -> Result<ExecReport, Error> {

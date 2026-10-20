@@ -6,6 +6,7 @@ fn main() {
         "merge",
         "read_side",
         "prepare_package",
+        "confirm_execute",
         "execute",
         "rollback_run",
         "resume_run",
