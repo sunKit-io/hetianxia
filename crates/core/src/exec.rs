@@ -2320,6 +2320,15 @@ enum UnwrittenTarget {
     UserFile,
 }
 
+/// 计划里要写入的大小和内容哈希。测试计划直接带字节；界面计划只带 content_hash 和 size。
+fn planned_content(op: &PlanOp) -> Option<(u64, String)> {
+    if let Some(bytes) = op.bytes.as_ref() {
+        return Some((bytes.len() as u64, sha256_hex(bytes)));
+    }
+    let hash = op.content_hash.clone().filter(|hash| !hash.is_empty())?;
+    Some((op.size?, hash))
+}
+
 fn unwritten_placed_file(fsys: &LocalFs, op: &PlanOp) -> Result<UnwrittenTarget> {
     let rel = RelPath::parse(&op.path)?;
     let st = match fsys.stat(&rel) {
@@ -2327,14 +2336,14 @@ fn unwritten_placed_file(fsys: &LocalFs, op: &PlanOp) -> Result<UnwrittenTarget>
         Err(err) if err.code == ErrorCode::NotFound => return Ok(UnwrittenTarget::Missing),
         Err(err) => return Err(err),
     };
-    let Some(bytes) = op.bytes.as_ref() else {
+    let Some((size, hash)) = planned_content(op) else {
         return Ok(UnwrittenTarget::UserFile);
     };
-    if st.kind != crate::vfs::EntryKind::File || st.size != bytes.len() as u64 {
+    if st.kind != crate::vfs::EntryKind::File || st.size != size {
         return Ok(UnwrittenTarget::UserFile);
     }
-    let hash = fsys.hash(&rel, true)?;
-    if hash == sha256_hex(bytes) {
+    let got = fsys.hash(&rel, true)?;
+    if got == hash {
         Ok(UnwrittenTarget::Ours)
     } else {
         Ok(UnwrittenTarget::UserFile)
@@ -6722,70 +6731,93 @@ mod tests {
         fs::write(path, body).unwrap();
     }
 
+    /// 界面计划不内嵌字节，只留下要写入的大小和内容哈希。
+    fn as_streamed(mut op: PlanOp) -> PlanOp {
+        let bytes = op.bytes.take().unwrap();
+        op.size = Some(bytes.len() as u64);
+        op.content_hash = Some(sha256_hex(&bytes));
+        op
+    }
+
     /// 改名已经落地、written 还没记下：内容和计划一致就当成我们的文件，备份后删掉，回滚结束。
     #[test]
     fn rollback_removes_create_and_keep_source_move_placed_before_written_flag() {
-        let dir = tempfile::tempdir().unwrap();
-        let proj = dir.path().join("proj");
-        fs::create_dir(&proj).unwrap();
-        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
-        let fsys = LocalFs::new(&proj);
-        let created = plan(vec![create_op(1, "pkg/new.ts", b"body")]);
-        execute(&db, &fsys, &created, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
-        place_after_crash(&proj, "pkg/new.ts", b"body");
-        let back = rollback(&db, &fsys, &created.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
-        assert_eq!(back.state, "ROLLED_BACK", "{:?}", back.files);
-        assert_eq!(journal_state(&db, &created.id), "ROLLED_BACK");
-        assert!(!proj.join("pkg/new.ts").exists());
-        let saved = dir.path().join("bak").join(&created.id).join("conflict-current").join("pkg/new.ts");
-        assert_eq!(fs::read(saved).unwrap(), b"body");
+        for streamed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let proj = dir.path().join("proj");
+            fs::create_dir(&proj).unwrap();
+            let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+            let fsys = LocalFs::new(&proj);
+            let mut created_op = create_op(1, "pkg/new.ts", b"body");
+            if streamed {
+                created_op = as_streamed(created_op);
+            }
+            let created = plan(vec![created_op]);
+            execute(&db, &fsys, &created, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
+            place_after_crash(&proj, "pkg/new.ts", b"body");
+            let back = rollback(&db, &fsys, &created.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+            assert_eq!(back.state, "ROLLED_BACK", "streamed={streamed} {:?}", back.files);
+            assert_eq!(journal_state(&db, &created.id), "ROLLED_BACK");
+            assert!(!proj.join("pkg/new.ts").exists());
+            let saved = dir.path().join("bak").join(&created.id).join("conflict-current").join("pkg/new.ts");
+            assert_eq!(fs::read(saved).unwrap(), b"body");
 
-        let proj = dir.path().join("proj-move");
-        fs::create_dir_all(proj.join("src")).unwrap();
-        fs::write(proj.join("src/a.ts"), b"AAA").unwrap();
-        let fsys = LocalFs::new(&proj);
-        let moved = plan(vec![keep_into("src/a.ts", "pkg/c.ts", b"AAA")]);
-        execute(&db, &fsys, &moved, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
-        place_after_crash(&proj, "pkg/c.ts", b"AAA");
-        let back = rollback(&db, &fsys, &moved.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
-        assert_eq!(back.state, "ROLLED_BACK", "{:?}", back.files);
-        assert_eq!(journal_state(&db, &moved.id), "ROLLED_BACK");
-        assert!(!proj.join("pkg/c.ts").exists());
-        assert_eq!(fs::read(proj.join("src/a.ts")).unwrap(), b"AAA");
-        let saved = dir.path().join("bak").join(&moved.id).join("conflict-current").join("pkg/c.ts");
-        assert_eq!(fs::read(saved).unwrap(), b"AAA");
+            let proj = dir.path().join("proj-move");
+            fs::create_dir_all(proj.join("src")).unwrap();
+            fs::write(proj.join("src/a.ts"), b"AAA").unwrap();
+            let fsys = LocalFs::new(&proj);
+            let mut moved_op = keep_into("src/a.ts", "pkg/c.ts", b"AAA");
+            if streamed {
+                moved_op = as_streamed(moved_op);
+            }
+            let moved = plan(vec![moved_op]);
+            execute(&db, &fsys, &moved, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
+            place_after_crash(&proj, "pkg/c.ts", b"AAA");
+            let back = rollback(&db, &fsys, &moved.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+            assert_eq!(back.state, "ROLLED_BACK", "streamed={streamed} {:?}", back.files);
+            assert_eq!(journal_state(&db, &moved.id), "ROLLED_BACK");
+            assert!(!proj.join("pkg/c.ts").exists());
+            assert_eq!(fs::read(proj.join("src/a.ts")).unwrap(), b"AAA");
+            let saved = dir.path().join("bak").join(&moved.id).join("conflict-current").join("pkg/c.ts");
+            assert_eq!(fs::read(saved).unwrap(), b"AAA");
+        }
     }
 
     /// 崩溃后用户把别的文件放在还没由我们写过的目标上：文件留下，回滚给出冲突说明并结束。
     #[test]
     fn rollback_keeps_user_file_at_unwritten_target_and_names_the_conflict() {
-        for (label, op) in [
-            ("create", create_op(1, "pkg/new.ts", b"body")),
-            ("move", keep_into("src/a.ts", "pkg/c.ts", b"AAA")),
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let proj = dir.path().join("proj");
-            fs::create_dir_all(proj.join("src")).unwrap();
-            fs::write(proj.join("src/a.ts"), b"AAA").unwrap();
-            let db = open_db(&dir.path().join("t.sqlite")).unwrap();
-            let fsys = LocalFs::new(&proj);
-            let p = plan(vec![op]);
-            execute(&db, &fsys, &p, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
-            let rel = if label == "create" { "pkg/new.ts" } else { "pkg/c.ts" };
-            place_after_crash(&proj, rel, b"xxxx");
-            let back = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
-            assert_eq!(back.state, "ROLLBACK_PARTIAL", "{label} {:?}", back.files);
-            assert_eq!(back.history_result, "部分回滚");
-            let hit = back.files.iter().find(|f| f.path == rel).unwrap_or_else(|| panic!("{label} 结果清单是空的: {:?}", back.files));
-            assert_eq!(hit.error.as_deref(), Some(DETAIL_KEPT_USER_FILE));
-            assert_eq!(fs::read(proj.join(rel)).unwrap(), b"xxxx");
-            let again = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
-            assert_eq!(again.state, "ROLLBACK_PARTIAL", "{label} retry {:?}", again.files);
-            let hit = again.files.iter().find(|f| f.path == rel).unwrap_or_else(|| panic!("{label} 重试清单是空的: {:?}", again.files));
-            assert_eq!(hit.error.as_deref(), Some(DETAIL_KEPT_USER_FILE));
-            assert_eq!(fs::read(proj.join(rel)).unwrap(), b"xxxx");
-            if label == "move" {
-                assert_eq!(fs::read(proj.join("src/a.ts")).unwrap(), b"AAA");
+        for streamed in [false, true] {
+            for (label, mut op) in [
+                ("create", create_op(1, "pkg/new.ts", b"body")),
+                ("move", keep_into("src/a.ts", "pkg/c.ts", b"AAA")),
+            ] {
+                if streamed {
+                    op = as_streamed(op);
+                }
+                let dir = tempfile::tempdir().unwrap();
+                let proj = dir.path().join("proj");
+                fs::create_dir_all(proj.join("src")).unwrap();
+                fs::write(proj.join("src/a.ts"), b"AAA").unwrap();
+                let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+                let fsys = LocalFs::new(&proj);
+                let p = plan(vec![op]);
+                execute(&db, &fsys, &p, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
+                let rel = if label == "create" { "pkg/new.ts" } else { "pkg/c.ts" };
+                place_after_crash(&proj, rel, b"xxxx");
+                let back = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+                assert_eq!(back.state, "ROLLBACK_PARTIAL", "{label} streamed={streamed} {:?}", back.files);
+                assert_eq!(back.history_result, "部分回滚");
+                let hit = back.files.iter().find(|f| f.path == rel).unwrap_or_else(|| panic!("{label} 结果清单是空的: {:?}", back.files));
+                assert_eq!(hit.error.as_deref(), Some(DETAIL_KEPT_USER_FILE));
+                assert_eq!(fs::read(proj.join(rel)).unwrap(), b"xxxx");
+                let again = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+                assert_eq!(again.state, "ROLLBACK_PARTIAL", "{label} streamed={streamed} retry {:?}", again.files);
+                let hit = again.files.iter().find(|f| f.path == rel).unwrap_or_else(|| panic!("{label} 重试清单是空的: {:?}", again.files));
+                assert_eq!(hit.error.as_deref(), Some(DETAIL_KEPT_USER_FILE));
+                assert_eq!(fs::read(proj.join(rel)).unwrap(), b"xxxx");
+                if label == "move" {
+                    assert_eq!(fs::read(proj.join("src/a.ts")).unwrap(), b"AAA");
+                }
             }
         }
     }
