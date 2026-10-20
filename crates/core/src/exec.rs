@@ -2443,19 +2443,15 @@ pub fn rollback(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: 
         if !op_touched(row) {
             continue;
         }
-        // 普通移动还没记下 written：源文件还在说明改名没落地。目标上的文件是用户的，
-        // 不论内容和计划一不一样，都不搬走、不删除，记「冲突，已保留你的文件」。
-        // 源文件不在、目标内容和计划的大小与哈希一致：这是我们落地的改名，交给 undo_move 改回去。
-        // 源文件不在、目标对不上：不搬这个文件；用备份把原路径写回来，并记下同一条冲突。
+        // 普通移动还没记下 written。
+        // 目标对不上计划：用户的文件，留在原地并记「冲突，已保留你的文件」。源文件已经不在时，用备份把原路径写回来，仍然不动目标。
+        // 源文件还在、目标的大小和哈希与计划一致：place_if_absent 已经把我们的副本放到目标上，written 还没记下。
+        // 和新增一样，先备份到 conflict-current，再删掉目标。原路径不动。
+        // 源文件不在、目标一致：改名已经把原文件搬走，交给 undo_move 改回去。
         if !row.written && op.kind == OpKind::Move && !op.keep_source {
             let class = unwritten_placed_file(fsys, op)?;
             let source_here = move_source_present(fsys, op)?;
-            let keep_target = match class {
-                UnwrittenTarget::Missing => false,
-                UnwrittenTarget::UserFile => true,
-                UnwrittenTarget::Ours => source_here,
-            };
-            if keep_target {
+            if matches!(class, UnwrittenTarget::UserFile) {
                 if !source_here {
                     if let Err(err) = restore_move_source_only(db, exec_id, fsys, &backup, op, &mut fault) {
                         any_fail = true;
@@ -2465,6 +2461,10 @@ pub fn rollback(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: 
                     }
                 }
                 record_kept_user_file(db, exec_id, op, &mut files)?;
+                continue;
+            }
+            if matches!(class, UnwrittenTarget::Ours) && source_here {
+                backup_and_remove_our_target(db, exec_id, fsys, &backup, op, &mut fault, &mut files, &mut any_fail)?;
                 continue;
             }
         }
@@ -2480,27 +2480,7 @@ pub fn rollback(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: 
                     files.push(fr(op, "rolled-back", None, None));
                 }
                 UnwrittenTarget::Ours => {
-                    let rel = RelPath::parse(&op.path)?;
-                    if let Err(err) = save_conflict_current(fsys, &backup, &rel) {
-                        any_fail = true;
-                        mark_rollback_unrestored(db, exec_id, op.index, &err)?;
-                        files.push(fr(op, "rollback-failed", Some(err.code_str()), Some(&err.message)));
-                    } else if let Err(err) = fsys.remove_path(&rel) {
-                        any_fail = true;
-                        mark_rollback_unrestored(db, exec_id, op.index, &err)?;
-                        files.push(fr(op, "rollback-failed", Some(err.code_str()), Some(&err.message)));
-                    } else {
-                        if target_parent_is_dir(fsys, &rel)? {
-                            if let Err(err) = fsys.fsync_parent_of(&rel, || fault.hit_fsync_dir()) {
-                                any_fail = true;
-                                mark_rollback_unrestored(db, exec_id, op.index, &err)?;
-                                files.push(fr(op, "rollback-failed", Some(err.code_str()), Some(&err.message)));
-                                continue;
-                            }
-                        }
-                        mark_rollback_done(db, exec_id, op.index)?;
-                        files.push(fr(op, "rolled-back", None, None));
-                    }
+                    backup_and_remove_our_target(db, exec_id, fsys, &backup, op, &mut fault, &mut files, &mut any_fail)?;
                 }
                 UnwrittenTarget::UserFile => record_kept_user_file(db, exec_id, op, &mut files)?,
             }
@@ -2776,6 +2756,43 @@ fn move_source_present(fsys: &LocalFs, op: &PlanOp) -> Result<bool> {
         Err(err) if err.code == ErrorCode::NotFound => Ok(false),
         Err(err) => Err(err),
     }
+}
+
+/// 目标和计划一致。先备份到 conflict-current，再删除。备份或删除失败就不删，并返回 false 表示调用方应停在这一项。
+fn backup_and_remove_our_target(
+    db: &Connection,
+    exec_id: &str,
+    fsys: &LocalFs,
+    backup: &Path,
+    op: &PlanOp,
+    fault: &mut FaultRuntime,
+    files: &mut Vec<FileResult>,
+    any_fail: &mut bool,
+) -> Result<bool> {
+    let rel = RelPath::parse(&op.path)?;
+    if let Err(err) = save_conflict_current(fsys, backup, &rel) {
+        *any_fail = true;
+        mark_rollback_unrestored(db, exec_id, op.index, &err)?;
+        files.push(fr(op, "rollback-failed", Some(err.code_str()), Some(&err.message)));
+        return Ok(false);
+    }
+    if let Err(err) = fsys.remove_path(&rel) {
+        *any_fail = true;
+        mark_rollback_unrestored(db, exec_id, op.index, &err)?;
+        files.push(fr(op, "rollback-failed", Some(err.code_str()), Some(&err.message)));
+        return Ok(false);
+    }
+    if target_parent_is_dir(fsys, &rel)? {
+        if let Err(err) = fsys.fsync_parent_of(&rel, || fault.hit_fsync_dir()) {
+            *any_fail = true;
+            mark_rollback_unrestored(db, exec_id, op.index, &err)?;
+            files.push(fr(op, "rollback-failed", Some(err.code_str()), Some(&err.message)));
+            return Ok(false);
+        }
+    }
+    mark_rollback_done(db, exec_id, op.index)?;
+    files.push(fr(op, "rolled-back", None, None));
+    Ok(true)
 }
 
 fn record_kept_user_file(db: &Connection, exec_id: &str, op: &PlanOp, files: &mut Vec<FileResult>) -> Result<()> {
@@ -7091,7 +7108,7 @@ mod tests {
         }
     }
 
-    /// 普通移动还没改名，目标上即使放着和计划一样的内容，也是用户的文件，不能删。
+    /// 普通移动的副本已经放到目标上、written 还没记下，原路径也还在：备份后删掉目标，原文件留下，回滚结束。
     #[test]
     fn plain_move_keeps_matching_target_while_source_is_still_present() {
         for streamed in [false, true] {
@@ -7109,9 +7126,12 @@ mod tests {
             execute(&db, &fsys, &p, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
             place_after_crash(&proj, "pkg/c.ts", b"AAA");
             let back = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
-            assert_kept_user_conflict(&back, "pkg/c.ts");
-            assert_eq!(fs::read(proj.join("pkg/c.ts")).unwrap(), b"AAA");
+            assert_eq!(back.state, "ROLLED_BACK", "streamed={streamed} {:?}", back.files);
+            assert_eq!(journal_state(&db, &p.id), "ROLLED_BACK");
+            assert!(!proj.join("pkg/c.ts").exists());
             assert_eq!(fs::read(proj.join("src/a.ts")).unwrap(), b"AAA");
+            let saved = dir.path().join("bak").join(&p.id).join("conflict-current").join("pkg/c.ts");
+            assert_eq!(fs::read(&saved).unwrap(), b"AAA");
         }
     }
 
