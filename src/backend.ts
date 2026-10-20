@@ -4,6 +4,7 @@ import type { ResumeChoice, RollbackChoice } from "./choices";
 import { parseResume, type ExecReport, type RecoveryOffer, type ResumeView } from "./engine";
 import type { ExecuteConfirm } from "./confirmExecute";
 import type { ExecPlan, SideText, TextDoc } from "./localPlan";
+import type { RemoteBatchReport } from "./remoteWrite";
 
 export function rollbackRun(execId: string, choice: RollbackChoice) {
   return invoke<ExecReport>("rollback_run", { execId, choice });
@@ -101,18 +102,12 @@ export function deleteSshSecret(account: string) {
   return invoke<void>("delete_ssh_secret", { account });
 }
 
-export function remoteWritePrompt(connectionId: string, remotePath: string, content: number[], contentSha256?: string) {
-  return invoke<RemoteWritePrompt>("remote_write_prompt", { connectionId, remotePath, content, contentSha256 });
+export function remoteWritePrompt(connectionId: string, files: { remotePath: string; content: number[] }[]) {
+  return invoke<RemoteWritePrompt>("remote_write_prompt", { connectionId, files });
 }
 
-export type RemoteWriteOutcome = {
-  execId: string;
-  remotePath: string;
-  backupPath: string | null;
-};
-
 export function commitRemoteOverwrite(execId: string) {
-  return invoke<RemoteWriteOutcome>("commit_remote_overwrite", { execId });
+  return invoke<RemoteBatchReport>("commit_remote_overwrite", { execId });
 }
 
 export type JournalRun = {

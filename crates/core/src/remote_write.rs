@@ -280,6 +280,262 @@ pub fn grant_binds(connection: &StoredConnection, host: &str, port: u16, user: &
     connection.host == host && connection.port == port && connection.user == user && connection.remote_path == remote_path
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteFileOutcome {
+    pub remote_path: String,
+    pub state: String,
+    pub code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteBatchReport {
+    pub backup_dir: String,
+    pub total: u32,
+    pub failed_index: Option<u32>,
+    pub failed_path: Option<String>,
+    pub code: Option<String>,
+    pub files: Vec<RemoteFileOutcome>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchFileInput<'a> {
+    pub remote_path: &'a str,
+    pub content: &'a [u8],
+    pub content_sha256: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchPromptInput<'a> {
+    pub host: &'a str,
+    pub port: u16,
+    pub user: &'a str,
+    pub auth: &'a str,
+    pub fingerprint: &'a str,
+    pub account: Option<&'a str>,
+    pub key_path: Option<&'a str>,
+    pub files: &'a [BatchFileInput<'a>],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredBatchFile {
+    pub remote_path: String,
+    pub bytes: Vec<u8>,
+    pub content_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredBatch {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub auth: String,
+    pub fingerprint: String,
+    pub account: Option<String>,
+    pub key_path: Option<String>,
+    pub files: Vec<StoredBatchFile>,
+}
+
+struct BatchGrant {
+    host: String,
+    port: u16,
+    user: String,
+    auth: String,
+    fingerprint: String,
+    account: Option<String>,
+    key_path: Option<String>,
+    files: Vec<StoredBatchFile>,
+    expires_at_ms: i64,
+}
+
+fn batch_grants() -> &'static Mutex<HashMap<String, BatchGrant>> {
+    static GRANTS: std::sync::LazyLock<Mutex<HashMap<String, BatchGrant>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    &GRANTS
+}
+
+/// 一次确认写计划里的每一个文件。备份目录仍是这一次的 `bak/<id>/`。
+pub fn issue_batch_prompt(app_data_dir: &Path, input: &BatchPromptInput<'_>) -> Result<RemoteWritePrompt> {
+    let exec_id = uuid::Uuid::new_v4().simple().to_string();
+    issue_batch_for(app_data_dir, &exec_id, input, now_ms())
+}
+
+pub fn issue_batch_for(app_data_dir: &Path, exec_id: &str, input: &BatchPromptInput<'_>, now: i64) -> Result<RemoteWritePrompt> {
+    let prompt = prompt_for(app_data_dir, exec_id)?;
+    let grant = batch_from(input, now)?;
+    let mut map = batch_grants().lock().map_err(|_| Error::new(ErrorCode::Internal, "写入确认锁被占用"))?;
+    map.insert(exec_id.to_string(), grant);
+    Ok(prompt)
+}
+
+fn batch_from(input: &BatchPromptInput<'_>, now: i64) -> Result<BatchGrant> {
+    if input.host.is_empty() || input.user.is_empty() || input.auth.is_empty() {
+        return Err(Error::new(ErrorCode::InvalidLocation, "远程主机、用户或认证方式为空"));
+    }
+    if input.fingerprint.trim().is_empty() {
+        return Err(Error::new(ErrorCode::InvalidState, "请先测试连接并确认指纹"));
+    }
+    if input.files.is_empty() {
+        return Err(Error::new(ErrorCode::InvalidState, "至少选一个文件"));
+    }
+    let mut files = Vec::new();
+    for file in input.files {
+        split_remote(file.remote_path)?;
+        let content_sha256 = sha256_hex(file.content);
+        if let Some(given) = file.content_sha256 {
+            if given != content_sha256 {
+                return Err(Error::new(ErrorCode::VerifyFailed, "暂存的新内容和 sha256 不一致"));
+            }
+        }
+        files.push(StoredBatchFile {
+            remote_path: file.remote_path.to_string(),
+            bytes: file.content.to_vec(),
+            content_sha256,
+        });
+    }
+    Ok(BatchGrant {
+        host: input.host.to_string(),
+        port: input.port,
+        user: input.user.to_string(),
+        auth: input.auth.to_string(),
+        fingerprint: input.fingerprint.to_string(),
+        account: input.account.map(str::to_string),
+        key_path: input.key_path.map(str::to_string),
+        files,
+        expires_at_ms: now.saturating_add(GRANT_TTL_MS),
+    })
+}
+
+pub fn borrow_batch(exec_id: &str, now: i64) -> Result<StoredBatch> {
+    let mut map = batch_grants().lock().map_err(|_| Error::new(ErrorCode::Internal, "写入确认锁被占用"))?;
+    let Some(grant) = map.get(exec_id) else {
+        return Err(Error::new(ErrorCode::InvalidState, "没有这次写入的确认"));
+    };
+    if now > grant.expires_at_ms {
+        map.remove(exec_id);
+        return Err(Error::new(ErrorCode::InvalidState, "写入确认已过期"));
+    }
+    Ok(stored_from(grant))
+}
+
+fn stored_from(grant: &BatchGrant) -> StoredBatch {
+    StoredBatch {
+        host: grant.host.clone(),
+        port: grant.port,
+        user: grant.user.clone(),
+        auth: grant.auth.clone(),
+        fingerprint: grant.fingerprint.clone(),
+        account: grant.account.clone(),
+        key_path: grant.key_path.clone(),
+        files: grant.files.clone(),
+    }
+}
+
+pub fn take_batch(exec_id: &str, now: i64) -> Result<StoredBatch> {
+    let mut map = batch_grants().lock().map_err(|_| Error::new(ErrorCode::Internal, "写入确认锁被占用"))?;
+    let Some(grant) = map.remove(exec_id) else {
+        return Err(Error::new(ErrorCode::InvalidState, "没有这次写入的确认"));
+    };
+    if now > grant.expires_at_ms {
+        return Err(Error::new(ErrorCode::InvalidState, "写入确认已过期"));
+    }
+    for file in &grant.files {
+        if sha256_hex(&file.bytes) != file.content_sha256 {
+            return Err(Error::new(ErrorCode::VerifyFailed, "暂存的新内容和 sha256 不一致"));
+        }
+    }
+    Ok(stored_from(&grant))
+}
+
+pub fn request_from_stored(
+    exec_id: &str,
+    app_data_dir: &Path,
+    posix_rename: bool,
+    index: u32,
+    host: &str,
+    port: u16,
+    user: &str,
+    file: StoredBatchFile,
+) -> Result<RemoteWriteRequest> {
+    if sha256_hex(&file.bytes) != file.content_sha256 {
+        return Err(Error::new(ErrorCode::VerifyFailed, "暂存的新内容和 sha256 不一致"));
+    }
+    Ok(RemoteWriteRequest {
+        exec_id: exec_id.to_string(),
+        host: host.to_string(),
+        port,
+        user: user.to_string(),
+        remote_path: file.remote_path,
+        bytes: file.bytes,
+        content_sha256: file.content_sha256,
+        app_data_dir: app_data_dir.to_path_buf(),
+        posix_rename,
+        index,
+    })
+}
+
+pub fn assemble_report(backup_dir: &str, paths: &[String], failed_at: Option<(usize, String)>) -> RemoteBatchReport {
+    let files = paths
+        .iter()
+        .enumerate()
+        .map(|(index, remote_path)| {
+            let (state, code) = match &failed_at {
+                Some((failed, code)) if index == *failed => ("failed", Some(code.clone())),
+                Some((failed, _)) if index > *failed => ("pending", None),
+                _ => ("written", None),
+            };
+            RemoteFileOutcome { remote_path: remote_path.clone(), state: state.to_string(), code }
+        })
+        .collect();
+    let (failed_index, failed_path, code) = match failed_at {
+        Some((index, code)) => (Some(index as u32 + 1), paths.get(index).cloned(), Some(code)),
+        None => (None, None, None),
+    };
+    RemoteBatchReport {
+        backup_dir: backup_dir.to_string(),
+        total: paths.len() as u32,
+        failed_index,
+        failed_path,
+        code,
+        files,
+    }
+}
+
+/// 按顺序写。某一项失败后不再碰后面的文件。
+pub fn run_batch(backup_dir: &str, paths: &[String], mut write_at: impl FnMut(usize) -> Result<()>) -> RemoteBatchReport {
+    let mut failed_at = None;
+    for index in 0..paths.len() {
+        if let Err(err) = write_at(index) {
+            failed_at = Some((index, err.code_str().to_string()));
+            break;
+        }
+    }
+    assemble_report(backup_dir, paths, failed_at)
+}
+
+pub fn commit_stored_batch(
+    store: &mut dyn RemoteBytes,
+    log: &mut RuntimeLog,
+    exec_id: &str,
+    app_data_dir: &Path,
+    posix_rename: bool,
+) -> Result<RemoteBatchReport> {
+    let granted = take_batch(exec_id, now_ms())?;
+    let backup_dir = tx_backup_dir(app_data_dir, exec_id)?.display().to_string();
+    let paths: Vec<String> = granted.files.iter().map(|file| file.remote_path.clone()).collect();
+    let host = granted.host.clone();
+    let port = granted.port;
+    let user = granted.user.clone();
+    let mut files = granted.files.into_iter();
+    let report = run_batch(&backup_dir, &paths, |index| {
+        let file = files.next().ok_or_else(|| Error::new(ErrorCode::Internal, "写入项丢失"))?;
+        let req = request_from_stored(exec_id, app_data_dir, posix_rename, index as u32, &host, port, &user, file)?;
+        write_one(store, log, &req)?;
+        Ok(())
+    });
+    Ok(report)
+}
+
 /// 写入请求只能从已消耗的许可组装。主机、路径和内容都来自这一份。
 pub fn request_from_grant(
     exec_id: &str,
@@ -395,19 +651,10 @@ pub fn remote_backup_name(remote_path: &str) -> Result<String> {
     Ok(join_remote(dir, &bak))
 }
 
-pub fn commit_remote_write(
-    store: &mut dyn RemoteBytes,
-    log: &mut RuntimeLog,
-    exec_id: &str,
-    app_data_dir: &Path,
-    posix_rename: bool,
-    index: u32,
-) -> Result<CommitResult> {
-    let granted = take_granted_write(exec_id, now_ms())?;
-    let req = request_from_grant(exec_id, app_data_dir, posix_rename, index, granted)?;
+fn write_one(store: &mut dyn RemoteBytes, log: &mut RuntimeLog, req: &RemoteWriteRequest) -> Result<StagedBackup> {
     let dest = req.remote_path.clone();
     let original = if store.exists(&dest)? { Some(store.read(&dest)?) } else { None };
-    let staged = stage_before_write(&req, original.as_deref())?;
+    let staged = stage_before_write(req, original.as_deref())?;
     let temp = remote_temp_path(&dest)?;
     let backup = remote_backup_name(&dest)?;
     if let Err(err) = store.write_new(&temp, &req.bytes) {
@@ -428,6 +675,20 @@ pub fn commit_remote_write(
     if store.paths().iter().any(|path| path.contains(TEMP_TAG)) {
         return Err(Error::new(ErrorCode::Io, "远程临时文件还在"));
     }
+    Ok(staged)
+}
+
+pub fn commit_remote_write(
+    store: &mut dyn RemoteBytes,
+    log: &mut RuntimeLog,
+    exec_id: &str,
+    app_data_dir: &Path,
+    posix_rename: bool,
+    index: u32,
+) -> Result<CommitResult> {
+    let granted = take_granted_write(exec_id, now_ms())?;
+    let req = request_from_grant(exec_id, app_data_dir, posix_rename, index, granted)?;
+    let staged = write_one(store, log, &req)?;
     Ok(CommitResult::Written(staged))
 }
 
@@ -527,6 +788,8 @@ mod tests {
         files: BTreeMap<String, Vec<u8>>,
         calls: u32,
         fail_write: bool,
+        fail_after_writes: Option<u32>,
+        writes_done: u32,
         tamper_verify: bool,
         fail_replace: bool,
         fail_restore: bool,
@@ -538,6 +801,8 @@ mod tests {
                 files,
                 calls: 0,
                 fail_write: false,
+                fail_after_writes: None,
+                writes_done: 0,
                 tamper_verify: false,
                 fail_replace: false,
                 fail_restore: false,
@@ -560,9 +825,10 @@ mod tests {
         }
         fn write_new(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
             self.calls += 1;
-            if self.fail_write {
+            if self.fail_write || self.fail_after_writes.is_some_and(|limit| self.writes_done >= limit) {
                 return Err(Error::new(ErrorCode::Io, "写入中途失败"));
             }
+            self.writes_done += 1;
             if self.files.contains_key(path) {
                 return Err(Error::new(ErrorCode::Io, "临时文件已存在"));
             }
@@ -875,5 +1141,82 @@ mod tests {
         void_granted_write(exec_id).unwrap();
         assert!(borrow_granted_connection(exec_id, now_ms()).is_err());
         assert!(take_granted_write(exec_id, now_ms()).is_err());
+    }
+
+    fn batch_input<'a>(files: &'a [BatchFileInput<'a>]) -> BatchPromptInput<'a> {
+        BatchPromptInput {
+            host: "build-01",
+            port: 22,
+            user: "deploy",
+            auth: "key",
+            fingerprint: "SHA256:stored",
+            account: None,
+            key_path: None,
+            files,
+        }
+    }
+
+    #[test]
+    fn batch_writes_every_file_then_stops_when_one_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let app_data = home.path().join("app-data");
+        let files = [
+            BatchFileInput { remote_path: "/opt/site/a.txt", content: b"A", content_sha256: None },
+            BatchFileInput { remote_path: "/opt/site/b.txt", content: b"B", content_sha256: None },
+            BatchFileInput { remote_path: "/opt/site/c.txt", content: b"C", content_sha256: None },
+        ];
+        issue_batch_for(&app_data, "tx-all", &batch_input(&files), now_ms()).unwrap();
+        let mut mem = Mem::new(BTreeMap::from([
+            ("/opt/site/a.txt".into(), b"old-a".to_vec()),
+            ("/opt/site/b.txt".into(), b"old-b".to_vec()),
+            ("/opt/site/c.txt".into(), b"old-c".to_vec()),
+        ]));
+        let mut log = RuntimeLog::default();
+        let done = commit_stored_batch(&mut mem, &mut log, "tx-all", &app_data, true).unwrap();
+        assert_eq!(done.failed_index, None);
+        assert_eq!(done.files.iter().map(|file| file.state.as_str()).collect::<Vec<_>>(), ["written", "written", "written"]);
+        assert_eq!(mem.files.get("/opt/site/a.txt").map(Vec::as_slice), Some(b"A".as_slice()));
+        assert_eq!(mem.files.get("/opt/site/b.txt").map(Vec::as_slice), Some(b"B".as_slice()));
+        assert_eq!(mem.files.get("/opt/site/c.txt").map(Vec::as_slice), Some(b"C".as_slice()));
+        let dir = tx_backup_dir(&app_data, "tx-all").unwrap();
+        assert_eq!(fs::read(dir.join("files/opt/site/a.txt")).unwrap(), b"old-a");
+        assert_eq!(fs::read(dir.join("files/opt/site/b.txt")).unwrap(), b"old-b");
+        assert_eq!(fs::read(dir.join("files/opt/site/c.txt")).unwrap(), b"old-c");
+        assert!(mem.paths().iter().all(|path| !path.contains(TEMP_TAG)));
+
+        issue_batch_for(&app_data, "tx-mid", &batch_input(&files), now_ms()).unwrap();
+        let mut again = Mem::new(BTreeMap::from([
+            ("/opt/site/a.txt".into(), b"old-a".to_vec()),
+            ("/opt/site/b.txt".into(), b"old-b".to_vec()),
+            ("/opt/site/c.txt".into(), b"old-c".to_vec()),
+        ]));
+        again.fail_after_writes = Some(1);
+        let stopped = commit_stored_batch(&mut again, &mut log, "tx-mid", &app_data, true).unwrap();
+        assert_eq!(stopped.total, 3);
+        assert_eq!(stopped.failed_index, Some(2));
+        assert_eq!(stopped.failed_path.as_deref(), Some("/opt/site/b.txt"));
+        assert_eq!(stopped.code.as_deref(), Some("E_IO"));
+        assert_eq!(
+            stopped.files.iter().map(|file| (file.state.as_str(), file.code.as_deref())).collect::<Vec<_>>(),
+            [("written", None), ("failed", Some("E_IO")), ("pending", None)]
+        );
+        assert_eq!(again.files.get("/opt/site/a.txt").map(Vec::as_slice), Some(b"A".as_slice()));
+        assert_eq!(again.files.get("/opt/site/b.txt").map(Vec::as_slice), Some(b"old-b".as_slice()));
+        assert_eq!(again.files.get("/opt/site/c.txt").map(Vec::as_slice), Some(b"old-c".as_slice()));
+        let mid = tx_backup_dir(&app_data, "tx-mid").unwrap();
+        assert_eq!(fs::read(mid.join("files/opt/site/a.txt")).unwrap(), b"old-a");
+        assert_eq!(stopped.backup_dir, mid.display().to_string());
+        let calls = std::cell::Cell::new(0u32);
+        let partial = run_batch("/bak/tx", &["/a".into(), "/b".into(), "/c".into()], |_| {
+            let seen = calls.get();
+            calls.set(seen + 1);
+            if seen == 1 {
+                return Err(Error::new(ErrorCode::Permission, "不能写"));
+            }
+            Ok(())
+        });
+        assert_eq!(calls.get(), 2);
+        assert_eq!(partial.failed_index, Some(2));
+        assert_eq!(partial.files[2].state, "pending");
     }
 }

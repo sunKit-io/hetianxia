@@ -10,7 +10,7 @@ use hetianxia_core::remote::{self, ImportedHost};
 use hetianxia_core::scan::{self, ScanOptions, ScanOutput};
 use hetianxia_core::secrets::{self, KeyringStore, SecretStatus, SecretStore};
 use hetianxia_core::connections::{self, SavedConnection};
-use hetianxia_core::remote_write::{self, RemoteWritePrompt, WritePromptInput};
+use hetianxia_core::remote_write::{self, BatchFileInput, BatchPromptInput, RemoteBatchReport, RemoteWritePrompt};
 use hetianxia_core::sftp::{self, ProbeReport, ProbeRequest};
 use hetianxia_core::vfs::LocalFs;
 use std::path::{Path, PathBuf};
@@ -573,14 +573,19 @@ pub fn read_ssh_config() -> Result<Vec<ImportedHost>, Error> {
     Ok(hosts)
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemotePromptFile {
+    pub remote_path: String,
+    pub content: Vec<u8>,
+}
+
 #[tauri::command]
 pub fn remote_write_prompt(
     app: tauri::AppHandle,
     session: tauri::State<crate::Session>,
     connection_id: String,
-    remote_path: String,
-    content: Vec<u8>,
-    content_sha256: Option<String>,
+    files: Vec<RemotePromptFile>,
 ) -> Result<RemoteWritePrompt, Error> {
     ready(&session)?;
     let app_data = app.path().app_data_dir().map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
@@ -593,28 +598,29 @@ pub fn remote_write_prompt(
         return Err(Error::new(ErrorCode::Unsupported, "ssh-agent 这一版还不能用来连接"));
     }
     let key_path = if saved.key_path.is_empty() { None } else { Some(saved.key_path.clone()) };
-    let remote_path = connections::path_inside_remote_root(saved.remote_root.as_deref(), &remote_path)?;
-    let input = WritePromptInput {
+    if files.is_empty() {
+        return Err(Error::new(ErrorCode::InvalidState, "至少选一个文件"));
+    }
+    let mut normalized = Vec::new();
+    for file in &files {
+        let remote_path = connections::path_inside_remote_root(saved.remote_root.as_deref(), &file.remote_path)?;
+        normalized.push((remote_path, file.content.clone()));
+    }
+    let batch: Vec<BatchFileInput<'_>> = normalized
+        .iter()
+        .map(|(remote_path, content)| BatchFileInput { remote_path, content, content_sha256: None })
+        .collect();
+    let input = BatchPromptInput {
         host: &saved.host,
         port: saved.port,
         user: &saved.user,
         auth: &saved.auth,
         fingerprint: &saved.fingerprint,
-        remote_path: &remote_path,
-        content: &content,
-        content_sha256: content_sha256.as_deref(),
         account: Some(saved.id.as_str()),
         key_path: key_path.as_deref(),
+        files: &batch,
     };
-    remote_write::issue_write_prompt(&app_data, &input)
-}
-
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RemoteWriteOutcome {
-    pub exec_id: String,
-    pub remote_path: String,
-    pub backup_path: Option<String>,
+    remote_write::issue_batch_prompt(&app_data, &input)
 }
 
 #[tauri::command]
@@ -622,13 +628,13 @@ pub fn commit_remote_overwrite(
     app: tauri::AppHandle,
     session: tauri::State<crate::Session>,
     exec_id: String,
-) -> Result<RemoteWriteOutcome, Error> {
+) -> Result<RemoteBatchReport, Error> {
     ready(&session)?;
     let app_data = app.path().app_data_dir().map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
     if crate::app_backup_root(&app_data) != session.backup_root {
         return Err(Error::new(ErrorCode::InvalidState, "备份目录和本次运行不一致"));
     }
-    let stored = remote_write::borrow_granted_connection(&exec_id, remote_write::now_ms())?;
+    let stored = remote_write::borrow_batch(&exec_id, remote_write::now_ms())?;
     let mut probe = ProbeRequest {
         host: stored.host.clone(),
         port: stored.port,
@@ -641,7 +647,7 @@ pub fn commit_remote_overwrite(
         known_hosts_path: app_data.join("known_hosts").display().to_string(),
         db_path: session.db_path.display().to_string(),
         accept_new: !stored.fingerprint.is_empty(),
-        confirmed_fingerprint: if stored.fingerprint.is_empty() { None } else { Some(stored.fingerprint) },
+        confirmed_fingerprint: if stored.fingerprint.is_empty() { None } else { Some(stored.fingerprint.clone()) },
         strict_fingerprint: None,
     };
     probe.secret.clear();
@@ -652,13 +658,6 @@ pub fn commit_remote_overwrite(
             }
         }
     }
-    let remote_path = stored.remote_path.clone();
-    let committed = sftp::RemoteSession::commit_overwrite_blocking(&mut probe, &exec_id, app_data)?;
-    let remote_write::CommitResult::Written(staged) = committed;
-    Ok(RemoteWriteOutcome {
-        exec_id,
-        remote_path,
-        backup_path: staged.backup_file.map(|path| path.display().to_string()),
-    })
+    sftp::RemoteSession::commit_batch_blocking(&mut probe, &exec_id, app_data)
 }
 

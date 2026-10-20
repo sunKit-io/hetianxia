@@ -31,7 +31,7 @@ import {
 import { formatFileCounts, formatRunTime, historyContinue, historyRowButtons, historyStatusLabel, REMOTE_ROLLBACK_TITLE, type HistoryContinue } from "./historyRows";
 import { Text } from "./plain";
 import { remoteRootFieldError } from "./remoteRoot";
-import { VERIFY_FAILED_BUTTON, VERIFY_FAILED_TITLE, connectionRemoteRoot, currentRemotePlan, isAbsoluteRemoteRoot, isFilesystemRemoteRoot, noteRemoteRoot, settleRemoteWrite, type PendingRemoteWrite } from "./remoteWrite";
+import { VERIFY_FAILED_BUTTON, VERIFY_FAILED_TITLE, connectionRemoteRoot, currentRemotePlan, isAbsoluteRemoteRoot, isFilesystemRemoteRoot, noteRemoteRoot, remoteBatchFailure, remoteFileMark, remotePlanFiles, settleRemoteWrite, type PendingRemoteWrite, type RemoteBatchReport } from "./remoteWrite";
 import {
   DETAIL_DELETED,
   OVERWRITE_PENDING,
@@ -69,6 +69,7 @@ export function App() {
   const [sheet, setSheet] = useState<Sheet>(null);
   const [historyToken, setHistoryToken] = useState(0);
   const [remoteTx, setRemoteTx] = useState<PendingRemoteWrite | null>(null);
+  const [remoteBatch, setRemoteBatch] = useState<RemoteBatchReport | null>(null);
   const [verifyBody, setVerifyBody] = useState<string | null>(null);
   const [bakDir, setBakDir] = useState<string | null>(null);
   const [flowId, setFlowId] = useState("");
@@ -134,6 +135,7 @@ export function App() {
   async function refreshPlan(project: string, prepared: string, source: string) {
     setScanning(true);
     setReport(null);
+    setRemoteBatch(null);
     clearFileNotes();
     try {
       const scanned = await scanPair(project, prepared);
@@ -309,7 +311,7 @@ export function App() {
             </>
           )}
         </header>
-        {status && !sheet && <p className={status.includes("E_") ? "status err" : "status"} role="status">{status}</p>}
+        {status && !sheet && <p className={status.includes("E_") || status.startsWith("写到第") ? "status err" : "status"} role="status">{status}</p>}
         {page === "edit" && (
           <DiffEditor
             projectRoot={plan ? projectRoot : null}
@@ -340,6 +342,7 @@ export function App() {
             scanning={scanning}
             running={running}
             report={report}
+            remoteBatch={remoteBatch}
             onPickProject={() => { void onPickProject(); }}
             onPickDirectory={() => { void onPickPackage(pickUpgradeDirectory); }}
             onPickZip={() => { void onPickPackage(pickUpgradeZip); }}
@@ -349,17 +352,20 @@ export function App() {
             remoteRootReady={isAbsoluteRemoteRoot(connectionRemoteRoot(selected))}
             remoteRootIsSlash={isFilesystemRemoteRoot(selected?.remoteRoot ?? "")}
             onRemoteWrite={() => {
-              const plan = currentRemotePlan();
+              const pickedFiles = remotePlanFiles(plan, pickedPaths);
               if (!selected) {
                 setStatus("先保存并选择一个连接");
                 return;
               }
-              if (!plan || plan.remotePath === "") {
+              if (pickedFiles.error) {
+                setStatus(pickedFiles.error);
+                return;
+              }
+              if (pickedFiles.files.length === 0) {
                 setStatus("还没有选中的计划文件");
                 return;
               }
-              const content = Array.from(new TextEncoder().encode(plan.content));
-              void remoteWritePrompt(selected.id, plan.remotePath, content).then((prompt) => {
+              void remoteWritePrompt(selected.id, pickedFiles.files).then((prompt) => {
                 setRemoteTx({
                   execId: prompt.execId,
                   backupDir: prompt.backupDir,
@@ -449,8 +455,10 @@ export function App() {
               const pending = remoteTx;
               settleRemoteWrite("仍然写入", () => {
                 setRemoteTx(null);
-                void commitRemoteOverwrite(pending.execId).then((outcome) => {
-                  setStatus(`已写入 ${outcome.remotePath}`);
+                void commitRemoteOverwrite(pending.execId).then((report) => {
+                  setRemoteBatch(report);
+                  const failure = remoteBatchFailure(report);
+                  setStatus(failure ?? `已写入 ${report.total} 个文件`);
                 }).catch((err) => {
                   const rec = err && typeof err === "object" ? err as Record<string, unknown> : {};
                   const code = rec.code != null ? engineCode(String(rec.code)) : "";
@@ -673,6 +681,7 @@ function PreviewPage({
   scanning,
   running,
   report,
+  remoteBatch,
   onPickProject,
   onPickDirectory,
   onPickZip,
@@ -694,6 +703,7 @@ function PreviewPage({
   scanning: boolean;
   running: boolean;
   report: ExecReport | null;
+  remoteBatch: RemoteBatchReport | null;
   onPickProject: () => void;
   onPickDirectory: () => void;
   onPickZip: () => void;
@@ -803,6 +813,16 @@ function PreviewPage({
               <li key={`${file.index}-${file.path}`}>
                 <span><Text value={file.path} /></span>
                 <em>{formatFileResult(file)}</em>
+              </li>
+            ))}
+          </ul>
+        )}
+        {remoteBatch && (
+          <ul className="changes">
+            {remoteBatch.files.map((file) => (
+              <li key={file.remotePath}>
+                <span><Text value={file.remotePath} /></span>
+                <em>{remoteFileMark(file)}</em>
               </li>
             ))}
           </ul>

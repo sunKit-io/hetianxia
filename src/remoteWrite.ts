@@ -1,4 +1,4 @@
-import { shownFilePayload } from "./localPlan.ts";
+import { editedContents, shownFilePayload, type LocalPlan } from "./localPlan.ts";
 
 export const DIALOG_TITLE = "远程写入暂不支持回滚";
 export const CANCEL_LABEL = "取消";
@@ -128,6 +128,57 @@ export function currentRemotePlan(): RemotePlanFile | null {
   const remotePath = joinRemote(remoteRoot, file.path);
   if (!remotePath) return null;
   return { remotePath, content: file.content };
+}
+
+export type RemoteBatchFile = {
+  remotePath: string;
+  content: number[];
+};
+
+export type RemoteFileOutcome = {
+  remotePath: string;
+  state: string;
+  code: string | null;
+};
+
+export type RemoteBatchReport = {
+  backupDir: string;
+  total: number;
+  failedIndex: number | null;
+  failedPath: string | null;
+  code: string | null;
+  files: RemoteFileOutcome[];
+};
+
+/** 勾选的计划文件全部送去写。打开中的那一个文件不再代表整份计划。 */
+export function remotePlanFiles(plan: LocalPlan | null, picked: ReadonlySet<string>): { files: RemoteBatchFile[]; error: string | null } {
+  if (!plan) return { files: [], error: null };
+  const edited = editedContents();
+  const files: RemoteBatchFile[] = [];
+  for (const file of plan.files) {
+    const rel = file.path.replace(/\\/g, "/");
+    if (!picked.has(rel)) continue;
+    if (file.kind === "delete") return { files: [], error: `远程写入还不能删除：${rel}` };
+    const remotePath = joinRemote(remoteRoot, rel);
+    if (!remotePath) return { files: [], error: `远程路径越出了远程目录：${rel}` };
+    const content = Object.prototype.hasOwnProperty.call(edited, file.path)
+      ? Array.from(new TextEncoder().encode(edited[file.path]))
+      : file.bytes.slice();
+    files.push({ remotePath, content });
+  }
+  return { files, error: null };
+}
+
+export function remoteFileMark(file: { state: string; code?: string | null }): string {
+  if (file.state === "written") return "已写入";
+  if (file.state === "pending") return "未开始";
+  return `失败 · ${file.code || "E_IO"}`;
+}
+
+export function remoteBatchFailure(report: RemoteBatchReport): string | null {
+  if (report.failedIndex == null || !report.failedPath) return null;
+  const n = report.failedIndex;
+  return `写到第 ${n}/共 ${report.total} 个文件时失败：${report.failedPath}。已写入的 ${n - 1} 个文件的原文件已备份到本机（${report.backupDir}），可以从这里手工恢复。`;
 }
 
 /** 只有「仍然写入」会调用 write。取消什么都不写。 */

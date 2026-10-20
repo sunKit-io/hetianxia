@@ -524,6 +524,68 @@ impl RemoteSession {
         result.and_then(|inner| inner)
     }
 
+    /// 同一个连接里按顺序写。某一项失败就停，后面的文件保持原样。
+    pub fn commit_batch_blocking(
+        req: &mut ProbeRequest,
+        exec_id: &str,
+        app_data_dir: PathBuf,
+    ) -> Result<crate::remote_write::RemoteBatchReport> {
+        let granted = match crate::remote_write::take_batch(exec_id, crate::remote_write::now_ms()) {
+            Ok(granted) => granted,
+            Err(err) => {
+                req.secret.zeroize();
+                return Err(err);
+            }
+        };
+        if granted.host != req.host || granted.port != req.port || granted.user != req.user {
+            req.secret.zeroize();
+            return Err(Error::new(ErrorCode::InvalidState, "写入确认和主机不一致"));
+        }
+        lock_commit_fingerprint(req, &granted.fingerprint);
+        let host = granted.host.clone();
+        let user = granted.user.clone();
+        let port = granted.port;
+        let paths: Vec<String> = granted.files.iter().map(|file| file.remote_path.clone()).collect();
+        let backup_dir = crate::remote_write::tx_backup_dir(&app_data_dir, exec_id)?.display().to_string();
+        let result = block_on(async {
+            let connected = RemoteSession::connect(req).await;
+            let mut session = match connected {
+                Ok(session) => session,
+                Err(err) => {
+                    let failed = if paths.is_empty() { None } else { Some((0, err.code_str().to_string())) };
+                    return Ok(crate::remote_write::assemble_report(&backup_dir, &paths, failed));
+                }
+            };
+            let mut failed = None;
+            for (index, file) in granted.files.into_iter().enumerate() {
+                let write = match crate::remote_write::request_from_stored(
+                    exec_id,
+                    &app_data_dir,
+                    true,
+                    index as u32,
+                    &host,
+                    port,
+                    &user,
+                    file,
+                ) {
+                    Ok(write) => write,
+                    Err(err) => {
+                        failed = Some((index, err.code_str().to_string()));
+                        break;
+                    }
+                };
+                if let Err(err) = session.commit_overwrite(write).await {
+                    failed = Some((index, err.code_str().to_string()));
+                    break;
+                }
+            }
+            let _ = session.close().await;
+            Ok(crate::remote_write::assemble_report(&backup_dir, &paths, failed))
+        });
+        req.secret.zeroize();
+        result.and_then(|inner| inner)
+    }
+
     async fn write_new(&self, path: &str, bytes: &[u8]) -> Result<()> {
         let flags = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE;
         let opened = self.sftp.open(path, flags, FileAttributes::empty()).await.map_err(map_sftp)?;
