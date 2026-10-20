@@ -42,6 +42,9 @@ STAGE_NAMES = (
     b"FsyncDir",
 )
 STAGE_NAME_RE = re.compile(rb"(?<![A-Za-z0-9_])(?:" + b"|".join(STAGE_NAMES) + rb")(?![A-Za-z0-9_])")
+# 第三方库 russh_sftp 反序列化报错的整句。扫描名单前只剔除这一句的完整出现。
+# 不做子串宽松匹配，也不放宽大小写。其他位置的 Rename、Backup、Rollback 仍要报。
+EXACT_THIRD_PARTY_STRINGS = (b"struct Rename with 3 elements",)
 SENTINEL = b"HTX_FAULT_INJECT_ENABLED"
 LINKCHECK = "hetianxia-linkcheck"
 
@@ -105,6 +108,14 @@ def linkcheck_bins(root: pathlib.Path):
     return found
 
 
+def without_exact_third_party(blob: bytes) -> bytes:
+    """用等长空字节盖住白名单整句，后面的偏移仍对得上原文件。"""
+    skipped = blob
+    for phrase in EXACT_THIRD_PARTY_STRINGS:
+        skipped = skipped.replace(phrase, b"\x00" * len(phrase))
+    return skipped
+
+
 def forbid_blobs(blobs):
     failed = 0
     for label, blob in blobs:
@@ -121,7 +132,7 @@ def forbid_blobs(blobs):
             print(f"{label} contains {match.group()!r} at {match.start()}")
             failed += 1
             break
-        for match in STAGE_NAME_RE.finditer(blob):
+        for match in STAGE_NAME_RE.finditer(without_exact_third_party(blob)):
             print(f"{label} contains {match.group().decode()} at {match.start()}")
             failed += 1
             break

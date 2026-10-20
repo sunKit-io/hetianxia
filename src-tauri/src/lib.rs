@@ -197,6 +197,9 @@ mod tests {
         assert!(source.contains("failed_session"));
         assert!(source.contains("app_data_dir"));
         assert!(source.contains("run_in_flight"));
+        assert!(source.contains("join(\"bak\")"));
+        let hardcoded = format!("local_{}dir", "data_");
+        assert!(!source.contains(&hardcoded));
         assert_eq!(app_db_path(std::path::Path::new("/data")), std::path::PathBuf::from("/data/hetianxia.sqlite"));
         assert_eq!(app_backup_root(std::path::Path::new("/data")), std::path::PathBuf::from("/data/bak"));
         let commands = include_str!("commands.rs");
