@@ -303,6 +303,10 @@ pub fn detect_changes(fsys: &LocalFs, ops: &[PlanOp]) -> Result<Vec<ChangeHit>> 
                 if op.kind == OpKind::Move && op.keep_source {
                     continue;
                 }
+                // 普通移动还没复制：目标不在，原文件还在且内容和计划一致。不是扫描后被删。
+                if op.kind == OpKind::Move && !op.keep_source && source_matches_plan(fsys, op)? {
+                    continue;
+                }
                 hits.push(ChangeHit {
                     path: op.path.clone(),
                     hash_changed: true,
@@ -963,6 +967,10 @@ fn guess_written(fsys: &LocalFs, backup: &Path, op: &PlanOp) -> Result<WriteGues
     // 创建，以及「移动（保留旧文件）」：目标不在就是还没写。
     // 这类移动的新路径在写入前可以连父目录都没有，不能当成「升级后被删除」。
     if current.is_none() && (matches!(op.kind, OpKind::Create) || (op.kind == OpKind::Move && op.keep_source)) {
+        return Ok(WriteGuess::NotWritten);
+    }
+    // 普通移动复制前崩溃：目标不在，原文件还在，且大小和哈希等于计划要写入的内容。
+    if current.is_none() && op.kind == OpKind::Move && !op.keep_source && source_matches_plan(fsys, op)? {
         return Ok(WriteGuess::NotWritten);
     }
     // 日志里已经有这条删除的 doing 记录，目标也确实不在了：算做完，不报「升级后被删除」。
@@ -2424,6 +2432,26 @@ fn planned_content(op: &PlanOp) -> Option<(u64, String)> {
     Some((op.size?, hash))
 }
 
+/// 普通移动的原文件还在，并且大小和内容哈希等于计划要写入的字节。
+fn source_matches_plan(fsys: &LocalFs, op: &PlanOp) -> Result<bool> {
+    let Some(from) = op.from.as_deref() else {
+        return Ok(false);
+    };
+    let Some((size, hash)) = planned_content(op) else {
+        return Ok(false);
+    };
+    let rel = RelPath::parse(from)?;
+    let st = match fsys.stat(&rel) {
+        Ok(st) => st,
+        Err(err) if err.code == ErrorCode::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    if st.kind != crate::vfs::EntryKind::File || st.size != size {
+        return Ok(false);
+    }
+    Ok(fsys.hash(&rel, true)? == hash)
+}
+
 fn unwritten_placed_file(fsys: &LocalFs, op: &PlanOp) -> Result<UnwrittenTarget> {
     let rel = RelPath::parse(&op.path)?;
     let st = match fsys.stat(&rel) {
@@ -2504,6 +2532,12 @@ pub fn rollback(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: 
             }
             if matches!(class, UnwrittenTarget::Ours) && source_here {
                 backup_and_remove_our_target(db, exec_id, fsys, &backup, op, &mut fault, &mut files, &mut any_fail)?;
+                continue;
+            }
+            // 目标还没出现，原文件仍与计划一致：复制还没发生。跳过冲突也不能把它留成未恢复。
+            if matches!(class, UnwrittenTarget::Missing) && source_matches_plan(fsys, op)? {
+                mark_rollback_done(db, exec_id, op.index)?;
+                files.push(fr(op, "rolled-back", None, None));
                 continue;
             }
         }
@@ -7260,6 +7294,98 @@ mod tests {
             assert_eq!(fs::read(proj.join("pkg/c.ts")).unwrap(), b"xxxx", "streamed={streamed}");
             assert_eq!(fs::read(proj.join("src/a.ts")).unwrap(), b"AAA");
             assert!(recover_on_startup(&db, &fsys).unwrap().iter().all(|offer| offer.exec_id != p.id));
+        }
+    }
+
+    /// 无字节的普通移动：升级包里的新路径对上项目里的旧文件。
+    fn plain_move_without_bytes(db: &Connection, proj: &Path, package: &Path) -> ExecPlan {
+        let scan = crate::pkg::scan_recorded(db, proj, package).unwrap();
+        let file = scan
+            .files
+            .iter()
+            .find(|file| file.status == crate::scan::FileStatus::Moved && file.message.as_deref() != Some("move-source"))
+            .expect("扫描应配出一次移动");
+        let op = PlanOp {
+            index: 1,
+            kind: OpKind::Move,
+            path: file.rel.clone(),
+            from: file.moved_from.clone(),
+            bytes: None,
+            content_hash: file.content_sha256.clone(),
+            size: file.right_size,
+            source: Some(crate::model::ContentSource {
+                scan_id: scan.scan_id.clone(),
+                kind: scan.package_kind.clone(),
+                entry: file.entry_name.clone().unwrap_or_else(|| file.rel.clone()),
+                path: String::new(),
+            }),
+            expect: file.left_sha256.as_ref().map(|hash| Snapshot {
+                size: file.left_size.unwrap_or(0),
+                mtime_ms: file.left_mtime_ms,
+                hash: hash.clone(),
+            }),
+            mode: None,
+            source_mtime_ms: file.right_mtime_ms,
+            merged: false,
+            keep_source: false,
+            readonly: false,
+            label: "移动".into(),
+        };
+        assert!(op.bytes.is_none());
+        assert!(op.content_hash.as_ref().is_some_and(|hash| !hash.is_empty()));
+        plan(vec![op])
+    }
+
+    /// 普通移动在复制前崩溃：继续能把文件移完。
+    #[test]
+    fn plain_move_crash_before_copy_can_continue() {
+        for bytes_none in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let proj = dir.path().join("proj");
+            fs::create_dir_all(proj.join("src")).unwrap();
+            fs::write(proj.join("src/a.ts"), b"AAA").unwrap();
+            let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+            let fsys = LocalFs::new(&proj);
+            let p = if bytes_none {
+                let package = dir.path().join("package");
+                fs::create_dir_all(package.join("pkg")).unwrap();
+                fs::write(package.join("pkg/c.ts"), b"AAA").unwrap();
+                plain_move_without_bytes(&db, &proj, &package)
+            } else {
+                plan(vec![move_op("src/a.ts", "pkg/c.ts", b"AAA")])
+            };
+            execute(&db, &fsys, &p, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
+            assert!(proj.join("src/a.ts").is_file());
+            assert!(!proj.join("pkg/c.ts").exists());
+            let continued = resume(&db, &fsys, &p.id, ResumeChoice::Continue, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+            let ResumeOutcome::Continued(rep) = continued else { panic!("bytes_none={bytes_none} 继续被拒绝: {continued:?}"); };
+            assert_eq!(rep.state, "COMMITTED", "bytes_none={bytes_none} {:?}", rep.files);
+            assert_eq!(fs::read(proj.join("pkg/c.ts")).unwrap(), b"AAA");
+            assert!(!proj.join("src/a.ts").exists());
+        }
+    }
+
+    /// 普通移动在复制前崩溃：跳过冲突的回滚结束，原文件还在，目标不出现。
+    #[test]
+    fn plain_move_crash_before_copy_skip_conflicts_rolls_back() {
+        for bytes_none in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let proj = dir.path().join("proj");
+            fs::create_dir_all(proj.join("src")).unwrap();
+            fs::write(proj.join("src/a.ts"), b"AAA").unwrap();
+            let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+            let fsys = LocalFs::new(&proj);
+            let mut op = move_op("src/a.ts", "pkg/c.ts", b"AAA");
+            if bytes_none {
+                op = as_streamed(op);
+            }
+            let p = plan(vec![op]);
+            execute(&db, &fsys, &p, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
+            let back = rollback(&db, &fsys, &p.id, RollbackChoice::SkipConflicts, FaultPlan::default()).unwrap();
+            assert_eq!(back.state, "ROLLED_BACK", "bytes_none={bytes_none} {:?}", back.files);
+            assert_eq!(journal_state(&db, &p.id), "ROLLED_BACK");
+            assert_eq!(fs::read(proj.join("src/a.ts")).unwrap(), b"AAA");
+            assert!(!proj.join("pkg/c.ts").exists());
         }
     }
 }
