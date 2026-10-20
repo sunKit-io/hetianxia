@@ -43,7 +43,7 @@ fn ready(session: &crate::Session) -> Result<(), Error> {
 pub fn scan(left: String, right: String) -> Result<ScanOutput, Error> {
     let left = LocalFs::new(left);
     let right = LocalFs::new(right);
-    scan::scan_local(&left, &right, &Ignore::defaults(), &ScanOptions::default())
+    scan::run_scan(&left, &right, &Ignore::defaults(), &ScanOptions::default())
 }
 
 #[tauri::command]

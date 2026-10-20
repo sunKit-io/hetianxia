@@ -265,6 +265,18 @@ mod tests {
         assert!(scanned.files.iter().any(|f| f.rel == "a.txt"));
         let compared = commands::compare(dir.path().display().to_string(), right.display().to_string()).unwrap();
         assert_eq!(compared.files.len(), scanned.files.len());
+        let mv_left = dir.path().join("mv-left");
+        let mv_right = dir.path().join("mv-right");
+        std::fs::create_dir(&mv_left).unwrap();
+        std::fs::create_dir(&mv_right).unwrap();
+        std::fs::write(mv_left.join("old.ts"), b"body").unwrap();
+        std::fs::write(mv_right.join("new.ts"), b"body").unwrap();
+        let moved = commands::scan(mv_left.display().to_string(), mv_right.display().to_string()).unwrap();
+        let dest = moved.files.iter().find(|f| f.rel == "new.ts").unwrap();
+        assert_eq!(dest.status, hetianxia_core::scan::FileStatus::Moved);
+        assert_eq!(dest.moved_from.as_deref(), Some("old.ts"));
+        let src = moved.files.iter().find(|f| f.rel == "old.ts").unwrap();
+        assert_eq!(src.message.as_deref(), Some("move-source"));
 
         let diff = commands::diff("old\n".into(), "new\n".into()).unwrap();
         assert!(!diff.hunks.is_empty());

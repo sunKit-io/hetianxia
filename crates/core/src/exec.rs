@@ -3163,6 +3163,29 @@ mod tests {
     }
 
     #[test]
+    fn keep_source_move_rollback_removes_only_the_new_path() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/old.ts"), b"body").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let mut op = keep_move_op();
+        op.path = "dir/new.ts".into();
+        op.from = Some("src/old.ts".into());
+        let p = plan(vec![op]);
+        let rep = execute(&db, &fsys, &p, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        assert_eq!(rep.state, "COMMITTED", "{:?}", rep.files);
+        let backup = dir.path().join("bak").join(&p.id);
+        assert!(backup.is_dir(), "保留旧文件的移动也要留下这一笔的备份目录");
+        assert_eq!(fs::read(dir.path().join("dir/new.ts")).unwrap(), b"body");
+        assert_eq!(fs::read(dir.path().join("src/old.ts")).unwrap(), b"body");
+        let back = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+        assert_eq!(back.state, "ROLLED_BACK", "{:?}", back.files);
+        assert!(!dir.path().join("dir/new.ts").exists());
+        assert_eq!(fs::read(dir.path().join("src/old.ts")).unwrap(), b"body");
+    }
+
+    #[test]
     fn crash_after_doing_can_continue_or_rollback() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), b"old").unwrap();
