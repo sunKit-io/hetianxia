@@ -6,6 +6,7 @@ import { DiffEditor } from "./editor";
 import { afterResume, engineCode, formatEngineError, formatOffer, formatReport, type ConflictFile, type RecoveryOffer } from "./engine";
 import { formatFileCounts, formatRunTime, historyContinue, historyRowButtons, historyStatusLabel, REMOTE_ROLLBACK_TITLE, type HistoryContinue } from "./historyRows";
 import { Text } from "./plain";
+import { remoteRootFieldError } from "./remoteRoot";
 import { VERIFY_FAILED_BUTTON, VERIFY_FAILED_TITLE, currentRemotePlan, settleRemoteWrite, type PendingRemoteWrite } from "./remoteWrite";
 import {
   DETAIL_DELETED,
@@ -399,6 +400,8 @@ function SshPage({
     }
   }
 
+  const remoteRootError = remoteRootFieldError(draft.remoteRoot);
+
   return (
     <div className="ssh">
       <aside>
@@ -430,7 +433,8 @@ function SshPage({
           <label>端口<input value={draft.port} onChange={(event) => setDraft({ ...draft, port: Number(event.target.value) || 0 })} /></label>
           <label>用户名<input value={draft.user} onChange={(event) => setDraft({ ...draft, user: event.target.value })} /></label>
         </div>
-        <label>远程目录<input value={draft.remoteRoot ?? ""} placeholder="/srv/app" onChange={(event) => setDraft({ ...draft, remoteRoot: event.target.value === "" ? null : event.target.value })} /></label>
+        <label>远程目录（绝对路径）<span className="req" aria-hidden="true">*</span><input value={draft.remoteRoot ?? ""} placeholder="/srv/app" aria-required="true" aria-invalid={remoteRootError !== null} onChange={(event) => setDraft({ ...draft, remoteRoot: event.target.value === "" ? null : event.target.value })} /></label>
+        {remoteRootError && <p className="warn fielderr">{remoteRootError}</p>}
         <div className="auth">认证方式
           <span className={draft.auth === "password" ? "on" : ""} onClick={() => setDraft({ ...draft, auth: "password" })}>密码</span>
           <span className={draft.auth === "key" ? "on" : ""} onClick={() => setDraft({ ...draft, auth: "key" })}>私钥文件</span>
@@ -465,7 +469,7 @@ function SshPage({
           <button className="danger" type="button" onClick={() => void remove()} disabled={!draft.id}>删除连接</button>
           <span />
           <button className="ghost" type="button" onClick={() => load(selectedId)}>取消</button>
-          <button className="primary" type="button" onClick={() => void save()}>保存</button>
+          <button className="primary" type="button" onClick={() => void save()} disabled={remoteRootError !== null}>保存</button>
         </footer>
       </section>
     </div>

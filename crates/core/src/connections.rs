@@ -51,8 +51,10 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// 空字符串表示还没填。填了就必须是绝对 POSIX 路径：以 `/` 开头，不含 `..`，
-/// 去掉 `.` 和重复斜杠，除了根目录 `/` 以外不保留结尾斜杠。
+const ROOT_DIR_FORBIDDEN: &str = "远程目录不能是根目录 /";
+
+/// 空字符串表示还没填。先规范化（折叠空段和 `.`），再拒绝结果为 `/` 的目录。
+/// `..` 仍按绝对路径规则拒绝。
 pub fn normalize_remote_root(raw: &str) -> Result<Option<String>> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -72,7 +74,7 @@ pub fn normalize_remote_root(raw: &str) -> Result<Option<String>> {
         parts.push(part);
     }
     if parts.is_empty() {
-        return Ok(Some("/".to_string()));
+        return Err(Error::new(ErrorCode::InvalidLocation, ROOT_DIR_FORBIDDEN));
     }
     Ok(Some(format!("/{}", parts.join("/"))))
 }
@@ -354,7 +356,7 @@ mod tests {
         assert_eq!(normalize_remote_root("/opt/app").unwrap().as_deref(), Some("/opt/app"));
         assert_eq!(normalize_remote_root("/opt/app/").unwrap().as_deref(), Some("/opt/app"));
         assert_eq!(normalize_remote_root("/opt//./app").unwrap().as_deref(), Some("/opt/app"));
-        assert_eq!(normalize_remote_root("/").unwrap().as_deref(), Some("/"));
+        assert_eq!(normalize_remote_root("/").unwrap_err().message, "远程目录不能是根目录 /");
         for bad in ["opt/app", "opt", "/opt/../etc", "/opt/foo/../../etc", "C:/opt", "\\opt"] {
             let err = normalize_remote_root(bad).unwrap_err();
             assert_eq!(err.message, "远程目录必须是绝对路径", "{bad}");
@@ -441,5 +443,61 @@ mod tests {
             path_inside_remote_root(Some("  "), "/srv/app/conf/app.conf").unwrap_err().message,
             "先在连接里填远程目录"
         );
+    }
+
+    #[test]
+    fn root_remote_directory_is_rejected_on_save_and_on_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = exec::open_db(&dir.path().join("hetianxia.sqlite")).unwrap();
+        let base = save(
+            &db,
+            &SavedConnection {
+                id: String::new(),
+                name: "build".into(),
+                host: "db.example".into(),
+                port: 22,
+                user: "deploy".into(),
+                auth: "key".into(),
+                key_path: String::new(),
+                fingerprint: String::new(),
+                remote_root: Some("/srv/app".into()),
+            },
+        )
+        .unwrap();
+        for raw in ["/", "//", "/.", "/./", "///"] {
+            let err = save(
+                &db,
+                &SavedConnection {
+                    remote_root: Some(raw.into()),
+                    ..base.clone()
+                },
+            )
+            .unwrap_err();
+            assert_eq!(err.message, "远程目录不能是根目录 /", "save {raw}");
+            let write = path_inside_remote_root(Some(raw), "/srv/app/conf/app.conf").unwrap_err();
+            assert_eq!(write.message, "远程目录不能是根目录 /", "write {raw}");
+        }
+        for raw in ["/srv/..", "/srv/../"] {
+            let saved = save(
+                &db,
+                &SavedConnection {
+                    remote_root: Some(raw.into()),
+                    ..base.clone()
+                },
+            )
+            .unwrap_err();
+            assert!(
+                saved.message == "远程目录不能是根目录 /" || saved.message == "远程目录必须是绝对路径",
+                "save {raw}: {}",
+                saved.message
+            );
+            let write = path_inside_remote_root(Some(raw), "/srv/app/conf/app.conf").unwrap_err();
+            assert!(
+                write.message == "远程目录不能是根目录 /" || write.message == "远程目录必须是绝对路径",
+                "write {raw}: {}",
+                write.message
+            );
+        }
+        assert_eq!(get(&db, &base.id).unwrap().remote_root.as_deref(), Some("/srv/app"));
     }
 }
