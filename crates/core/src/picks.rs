@@ -108,6 +108,56 @@ mod tests {
     }
 
     #[test]
+    fn rescan_restores_unchecked_rels_and_checks_new_files() {
+        let conn = db();
+        save_skipped(
+            &conn,
+            "/work/app",
+            "/pkg/a.zip",
+            &["src/new.ts".into(), "gone.ts".into()],
+        )
+        .unwrap();
+        let scanned = ["readme.txt", "src/new.ts", "src/util/c.ts", "extra.txt"];
+        let skipped = load_skipped(&conn, "/work/app", "/pkg/a.zip").unwrap();
+        let picked: Vec<_> = scanned
+            .iter()
+            .copied()
+            .filter(|path| !skipped.iter().any(|rel| rel == path))
+            .collect();
+        assert_eq!(picked, vec!["readme.txt", "src/util/c.ts", "extra.txt"]);
+        assert!(skipped.iter().any(|rel| rel == "gone.ts"));
+    }
+
+    #[test]
+    fn reopened_database_keeps_unchecked_rels_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("picks.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            save_skipped(
+                &conn,
+                "/work/app",
+                "/pkg/a.zip",
+                &["src/new.ts".into(), "src/util/c.ts".into()],
+            )
+            .unwrap();
+        }
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(
+            load_skipped(&conn, "/work/app", "/pkg/a.zip").unwrap(),
+            vec!["src/new.ts", "src/util/c.ts"]
+        );
+        let scanned = ["readme.txt", "src/new.ts", "extra.txt"];
+        let skipped = load_skipped(&conn, "/work/app", "/pkg/a.zip").unwrap();
+        let picked: Vec<_> = scanned
+            .iter()
+            .copied()
+            .filter(|path| !skipped.iter().any(|rel| rel == path))
+            .collect();
+        assert_eq!(picked, vec!["readme.txt", "extra.txt"]);
+    }
+
+    #[test]
     fn dotdot_and_absolute_rels_are_rejected() {
         let conn = db();
         assert!(normalize_rel("../x").is_none());
