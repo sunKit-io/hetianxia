@@ -123,6 +123,8 @@ pub struct ConflictFile {
 pub const DETAIL_MODIFIED: &str = "升级后被修改";
 /// 已写完的文件后来被删掉。
 pub const DETAIL_DELETED: &str = "升级后被删除";
+/// 回滚时目标上是用户自己的文件，没有删除。
+pub const DETAIL_KEPT_USER_FILE: &str = "冲突，已保留你的文件";
 /// 撤销移动时，原路径被外部重新创建，而且内容和备份不同。
 pub const DETAIL_RECREATED: &str = "原位置被重新创建，和备份不同";
 /// 记在原事务日志里的“当时是删除”状态。不是文件哈希。
@@ -2310,6 +2312,35 @@ pub fn pending(db: &Connection) -> Result<Vec<PendingTx>> {
     Ok(out)
 }
 
+enum UnwrittenTarget {
+    Missing,
+    /// 大小和内容哈希都等于计划里要写入的字节。改名已经落地，只是 written 还没记下。
+    Ours,
+    /// 目标上有别的内容，不能删。
+    UserFile,
+}
+
+fn unwritten_placed_file(fsys: &LocalFs, op: &PlanOp) -> Result<UnwrittenTarget> {
+    let rel = RelPath::parse(&op.path)?;
+    let st = match fsys.stat(&rel) {
+        Ok(st) => st,
+        Err(err) if err.code == ErrorCode::NotFound => return Ok(UnwrittenTarget::Missing),
+        Err(err) => return Err(err),
+    };
+    let Some(bytes) = op.bytes.as_ref() else {
+        return Ok(UnwrittenTarget::UserFile);
+    };
+    if st.kind != crate::vfs::EntryKind::File || st.size != bytes.len() as u64 {
+        return Ok(UnwrittenTarget::UserFile);
+    }
+    let hash = fsys.hash(&rel, true)?;
+    if hash == sha256_hex(bytes) {
+        Ok(UnwrittenTarget::Ours)
+    } else {
+        Ok(UnwrittenTarget::UserFile)
+    }
+}
+
 pub fn rollback(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: RollbackChoice, fault: FaultPlan) -> Result<ExecReport> {
     if choice == RollbackChoice::Cancel {
         return Err(Error::new(ErrorCode::Cancelled, "已取消回滚"));
@@ -2346,21 +2377,47 @@ pub fn rollback(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: 
         if !op_touched(row) {
             continue;
         }
-        // 新增和移动没落地时，目标上的文件是用户的，回滚不能删。
-        // 目标本来就不在（写入前崩溃，父目录也可能没建出来）：没有我们写过的文件，
-        // 记成已回滚。漏记的话，这条 doing 会被当成「未恢复」，回滚永远停在部分回滚。
+        // 新增和移动的 written 还没记下时，不能一律跳过。
+        // 目标不在：这次没写出来，记成已回滚。
+        // 目标和计划的大小、哈希一致：改名已经落地、只是还没来得及记 written。先备份到
+        // conflict-current，再删掉，回滚才能结束。备份失败就不删。
+        // 目标对不上：那是用户的文件，绝不删除，并在结果里写明保留原因。
         if !row.written && matches!(op.kind, OpKind::Create | OpKind::Move) {
-            let target_missing = match RelPath::parse(&op.path) {
-                Ok(rel) => match fsys.stat(&rel) {
-                    Err(err) if err.code == ErrorCode::NotFound => true,
-                    Err(err) => return Err(err),
-                    Ok(_) => false,
-                },
-                Err(err) => return Err(err),
-            };
-            if target_missing {
-                mark_rollback_done(db, exec_id, op.index)?;
-                files.push(fr(op, "rolled-back", None, None));
+            match unwritten_placed_file(fsys, op)? {
+                UnwrittenTarget::Missing => {
+                    mark_rollback_done(db, exec_id, op.index)?;
+                    files.push(fr(op, "rolled-back", None, None));
+                }
+                UnwrittenTarget::Ours => {
+                    let rel = RelPath::parse(&op.path)?;
+                    if let Err(err) = save_conflict_current(fsys, &backup, &rel) {
+                        any_fail = true;
+                        mark_rollback_unrestored(db, exec_id, op.index, &err)?;
+                        files.push(fr(op, "rollback-failed", Some(err.code_str()), Some(&err.message)));
+                    } else if let Err(err) = fsys.remove_path(&rel) {
+                        any_fail = true;
+                        mark_rollback_unrestored(db, exec_id, op.index, &err)?;
+                        files.push(fr(op, "rollback-failed", Some(err.code_str()), Some(&err.message)));
+                    } else {
+                        if target_parent_is_dir(fsys, &rel)? {
+                            if let Err(err) = fsys.fsync_parent_of(&rel, || fault.hit_fsync_dir()) {
+                                any_fail = true;
+                                mark_rollback_unrestored(db, exec_id, op.index, &err)?;
+                                files.push(fr(op, "rollback-failed", Some(err.code_str()), Some(&err.message)));
+                                continue;
+                            }
+                        }
+                        mark_rollback_done(db, exec_id, op.index)?;
+                        files.push(fr(op, "rolled-back", None, None));
+                    }
+                }
+                UnwrittenTarget::UserFile => {
+                    db.execute(
+                        "UPDATE exec_ops SET rollback_state='conflict', rollback_error=?3, code='E_CONFLICT' WHERE exec_id=?1 AND op_index=?2",
+                        params![exec_id, op.index, DETAIL_KEPT_USER_FILE],
+                    )?;
+                    files.push(fr(op, "conflict", Some("E_CONFLICT"), Some(DETAIL_KEPT_USER_FILE)));
+                }
             }
             continue;
         }
@@ -6655,5 +6712,81 @@ mod tests {
         assert_eq!(again.state, "ROLLED_BACK", "{:?}", again.files);
         assert!(!dir.path().join("dir/new.ts").exists());
         assert_eq!(fs::read(dir.path().join("src/old.ts")).unwrap(), b"body");
+    }
+
+    fn place_after_crash(proj: &Path, rel: &str, body: &[u8]) {
+        let path = proj.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, body).unwrap();
+    }
+
+    /// 改名已经落地、written 还没记下：内容和计划一致就当成我们的文件，备份后删掉，回滚结束。
+    #[test]
+    fn rollback_removes_create_and_keep_source_move_placed_before_written_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        fs::create_dir(&proj).unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(&proj);
+        let created = plan(vec![create_op(1, "pkg/new.ts", b"body")]);
+        execute(&db, &fsys, &created, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
+        place_after_crash(&proj, "pkg/new.ts", b"body");
+        let back = rollback(&db, &fsys, &created.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+        assert_eq!(back.state, "ROLLED_BACK", "{:?}", back.files);
+        assert_eq!(journal_state(&db, &created.id), "ROLLED_BACK");
+        assert!(!proj.join("pkg/new.ts").exists());
+        let saved = dir.path().join("bak").join(&created.id).join("conflict-current").join("pkg/new.ts");
+        assert_eq!(fs::read(saved).unwrap(), b"body");
+
+        let proj = dir.path().join("proj-move");
+        fs::create_dir_all(proj.join("src")).unwrap();
+        fs::write(proj.join("src/a.ts"), b"AAA").unwrap();
+        let fsys = LocalFs::new(&proj);
+        let moved = plan(vec![keep_into("src/a.ts", "pkg/c.ts", b"AAA")]);
+        execute(&db, &fsys, &moved, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
+        place_after_crash(&proj, "pkg/c.ts", b"AAA");
+        let back = rollback(&db, &fsys, &moved.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+        assert_eq!(back.state, "ROLLED_BACK", "{:?}", back.files);
+        assert_eq!(journal_state(&db, &moved.id), "ROLLED_BACK");
+        assert!(!proj.join("pkg/c.ts").exists());
+        assert_eq!(fs::read(proj.join("src/a.ts")).unwrap(), b"AAA");
+        let saved = dir.path().join("bak").join(&moved.id).join("conflict-current").join("pkg/c.ts");
+        assert_eq!(fs::read(saved).unwrap(), b"AAA");
+    }
+
+    /// 崩溃后用户把别的文件放在还没由我们写过的目标上：文件留下，回滚给出冲突说明并结束。
+    #[test]
+    fn rollback_keeps_user_file_at_unwritten_target_and_names_the_conflict() {
+        for (label, op) in [
+            ("create", create_op(1, "pkg/new.ts", b"body")),
+            ("move", keep_into("src/a.ts", "pkg/c.ts", b"AAA")),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let proj = dir.path().join("proj");
+            fs::create_dir_all(proj.join("src")).unwrap();
+            fs::write(proj.join("src/a.ts"), b"AAA").unwrap();
+            let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+            let fsys = LocalFs::new(&proj);
+            let p = plan(vec![op]);
+            execute(&db, &fsys, &p, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
+            let rel = if label == "create" { "pkg/new.ts" } else { "pkg/c.ts" };
+            place_after_crash(&proj, rel, b"xxxx");
+            let back = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+            assert_eq!(back.state, "ROLLBACK_PARTIAL", "{label} {:?}", back.files);
+            assert_eq!(back.history_result, "部分回滚");
+            let hit = back.files.iter().find(|f| f.path == rel).unwrap_or_else(|| panic!("{label} 结果清单是空的: {:?}", back.files));
+            assert_eq!(hit.error.as_deref(), Some(DETAIL_KEPT_USER_FILE));
+            assert_eq!(fs::read(proj.join(rel)).unwrap(), b"xxxx");
+            let again = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+            assert_eq!(again.state, "ROLLBACK_PARTIAL", "{label} retry {:?}", again.files);
+            let hit = again.files.iter().find(|f| f.path == rel).unwrap_or_else(|| panic!("{label} 重试清单是空的: {:?}", again.files));
+            assert_eq!(hit.error.as_deref(), Some(DETAIL_KEPT_USER_FILE));
+            assert_eq!(fs::read(proj.join(rel)).unwrap(), b"xxxx");
+            if label == "move" {
+                assert_eq!(fs::read(proj.join("src/a.ts")).unwrap(), b"AAA");
+            }
+        }
     }
 }
