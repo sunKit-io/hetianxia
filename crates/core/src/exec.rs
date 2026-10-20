@@ -289,6 +289,11 @@ pub fn detect_changes(fsys: &LocalFs, ops: &[PlanOp]) -> Result<Vec<ChangeHit>> 
         let st = match fsys.stat(&rel) {
             Ok(s) => s,
             Err(_) => {
+                // 保留旧文件的移动，新路径在写入前本来就不存在，父目录也可能还没建。
+                // 这不是扫描过的文件被删掉。把它当成变动的话，崩溃后续写会被拦住。
+                if op.kind == OpKind::Move && op.keep_source {
+                    continue;
+                }
                 hits.push(ChangeHit {
                     path: op.path.clone(),
                     hash_changed: true,
@@ -895,7 +900,9 @@ fn guess_written(fsys: &LocalFs, backup: &Path, op: &PlanOp) -> Result<WriteGues
             return Ok(WriteGuess::NotWritten);
         }
     }
-    if current.is_none() && matches!(op.kind, OpKind::Create) {
+    // 创建，以及「移动（保留旧文件）」：目标不在就是还没写。
+    // 这类移动的新路径在写入前可以连父目录都没有，不能当成「升级后被删除」。
+    if current.is_none() && (matches!(op.kind, OpKind::Create) || (op.kind == OpKind::Move && op.keep_source)) {
         return Ok(WriteGuess::NotWritten);
     }
     // 日志里已经有这条删除的 doing 记录，目标也确实不在了：算做完，不报「升级后被删除」。
@@ -2531,6 +2538,14 @@ fn conflict_backup_verified(backup: &Path, rel: &RelPath, live_hash: Option<&str
     file_hash(&saved).as_deref() == Some(live)
 }
 
+fn target_parent_is_dir(fsys: &LocalFs, rel: &RelPath) -> Result<bool> {
+    let path = fsys.abs(rel)?;
+    Ok(match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.is_dir(),
+        _ => true,
+    })
+}
+
 fn move_other_side_present(fsys: &LocalFs, op: &PlanOp) -> Result<bool> {
     if op.kind != OpKind::Move {
         return Ok(false);
@@ -2559,10 +2574,19 @@ fn undo_move(
     let to = RelPath::parse(&op.path)?;
     if op.keep_source {
         // 保留旧文件：只删除新路径。不读、不哈希、不覆盖原路径。
-        if fsys.stat(&to).is_ok() {
+        let removed = if fsys.stat(&to).is_ok() {
             fsys.remove_path(&to)?;
+            true
+        } else {
+            false
+        };
+        // 崩溃落在写入之前时，新路径的父目录可能从未创建。对它 fsync 会得到
+        // E_NOT_FOUND，回滚停在部分回滚，磁盘其实已经是升级前的样子，重试也一样。
+        // 没删到文件、父目录也不存在：没有需要同步的内容，也不要为了同步把目录建出来。
+        // 真的删掉了新文件时，父目录必须同步，失败就留着未完成，下次再试。
+        if removed || target_parent_is_dir(fsys, &to)? {
+            fsys.fsync_parent_of(&to, || fault.hit_fsync_dir())?;
         }
-        fsys.fsync_parent_of(&to, || fault.hit_fsync_dir())?;
         mark_rollback_done(db, exec_id, op.index)?;
         return Ok(RestoreOutcome::Restored);
     }
@@ -6269,5 +6293,201 @@ mod tests {
         assert_eq!(fs::read(b.join("a.txt")).unwrap(), b"old-b");
         assert_eq!(journal_state(&db, &pa.id), "COMMITTED");
         assert_eq!(journal_state(&db, &pb.id), "ROLLED_BACK");
+    }
+
+    fn project_hashes(root: &Path) -> Vec<(String, String)> {
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
+            let Ok(entries) = fs::read_dir(dir) else { return };
+            for ent in entries.flatten() {
+                let path = ent.path();
+                let rel = path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+                if rel == "bak" || rel.starts_with("bak/") || rel.contains(".sqlite") || rel.contains(".htx") {
+                    continue;
+                }
+                let Ok(ft) = ent.file_type() else { continue };
+                if ft.is_dir() {
+                    walk(root, &path, out);
+                } else if ft.is_file() {
+                    out.push((rel, sha256_hex(&fs::read(&path).unwrap())));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    fn crash_before_write(dir: &Path) -> ExecOpts {
+        ExecOpts {
+            allow_readonly: false,
+            backup_root: dir.join("bak"),
+            remote: false,
+            stop_after_log: Some("doing:1".into()),
+            corrupt_temp: false,
+        }
+    }
+
+    fn keep_into(from: &str, to: &str, body: &[u8]) -> PlanOp {
+        let mut op = keep_move_op();
+        op.from = Some(from.into());
+        op.path = to.into();
+        op.bytes = Some(body.to_vec());
+        op.expect = Some(Snapshot { size: body.len() as u64, mtime_ms: None, hash: sha256_hex(body) });
+        op
+    }
+
+    /// 写入前崩溃，目标目录还不存在：回滚必须一次成功，磁盘回到升级前，且不留下我们建的目录。
+    #[test]
+    fn keep_source_move_into_missing_dir_before_write_rolls_back_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        fs::create_dir_all(proj.join("src")).unwrap();
+        fs::write(proj.join("src/a.ts"), b"AAA").unwrap();
+        fs::write(proj.join("keep.txt"), b"k").unwrap();
+        let before = project_hashes(&proj);
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(&proj);
+        let p = plan(vec![keep_into("src/a.ts", "pkg/c.ts", b"AAA")]);
+        let rep = execute(&db, &fsys, &p, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
+        assert_ne!(rep.state, "COMMITTED");
+        assert!(!proj.join("pkg").exists());
+        assert_eq!(fs::read(proj.join("src/a.ts")).unwrap(), b"AAA");
+        let back = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+        assert_eq!(back.state, "ROLLED_BACK", "{:?}", back.files);
+        assert!(back.files.iter().all(|f| f.code.as_deref() != Some("E_NOT_FOUND")), "{:?}", back.files);
+        assert_eq!(journal_state(&db, &p.id), "ROLLED_BACK");
+        assert_eq!(project_hashes(&proj), before);
+        assert_eq!(fs::read(proj.join("src/a.ts")).unwrap(), b"AAA");
+        assert!(!proj.join("pkg").exists());
+        assert!(!proj.join("pkg/c.ts").exists());
+        let again = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap_err();
+        assert_eq!(again.code, ErrorCode::InvalidState);
+        assert_eq!(project_hashes(&proj), before);
+    }
+
+    /// 同一次崩溃选「继续」：新文件写完，旧文件还在，事务提交。
+    #[test]
+    fn keep_source_move_into_missing_dir_before_write_can_continue() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        fs::create_dir_all(proj.join("src")).unwrap();
+        fs::write(proj.join("src/a.ts"), b"AAA").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(&proj);
+        let p = plan(vec![keep_into("src/a.ts", "pkg/c.ts", b"AAA")]);
+        execute(&db, &fsys, &p, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
+        assert!(!proj.join("pkg/c.ts").exists());
+        let continued = resume(&db, &fsys, &p.id, ResumeChoice::Continue, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        let ResumeOutcome::Continued(rep) = continued else { panic!("继续被拒绝: {continued:?}"); };
+        assert_eq!(rep.state, "COMMITTED", "{:?}", rep.files);
+        assert_eq!(journal_state(&db, &p.id), "COMMITTED");
+        assert_eq!(fs::read(proj.join("pkg/c.ts")).unwrap(), b"AAA");
+        assert_eq!(fs::read(proj.join("src/a.ts")).unwrap(), b"AAA");
+    }
+
+    /// 创建走原来的「还没写」路径。顶层保留旧文件的移动，父目录本来就在，回滚仍然成功。
+    #[test]
+    fn create_and_top_level_keep_source_move_keep_crash_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        fs::create_dir(&proj).unwrap();
+        let before = project_hashes(&proj);
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(&proj);
+        let p = plan(vec![create_op(1, "pkg/new.ts", b"body")]);
+        execute(&db, &fsys, &p, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
+        let back = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+        assert_eq!(back.state, "ROLLED_BACK", "{:?}", back.files);
+        assert_eq!(project_hashes(&proj), before);
+        assert!(!proj.join("pkg").exists());
+
+        let proj = dir.path().join("proj-continue");
+        fs::create_dir(&proj).unwrap();
+        let fsys = LocalFs::new(&proj);
+        let p = plan(vec![create_op(1, "pkg/new.ts", b"body")]);
+        execute(&db, &fsys, &p, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
+        let continued = resume(&db, &fsys, &p.id, ResumeChoice::Continue, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        let ResumeOutcome::Continued(rep) = continued else { panic!("创建应能继续: {continued:?}"); };
+        assert_eq!(rep.state, "COMMITTED", "{:?}", rep.files);
+        assert_eq!(fs::read(proj.join("pkg/new.ts")).unwrap(), b"body");
+
+        let proj = dir.path().join("proj-top");
+        fs::create_dir(&proj).unwrap();
+        fs::write(proj.join("old.ts"), b"body").unwrap();
+        let before = project_hashes(&proj);
+        let fsys = LocalFs::new(&proj);
+        let p = plan(vec![keep_move_op()]);
+        execute(&db, &fsys, &p, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
+        let back = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+        assert_eq!(back.state, "ROLLED_BACK", "{:?}", back.files);
+        assert_eq!(project_hashes(&proj), before);
+        assert_eq!(fs::read(proj.join("old.ts")).unwrap(), b"body");
+        assert!(!proj.join("new.ts").exists());
+    }
+
+    /// 普通移动（不保留旧文件）写进还不存在的目录：崩溃后再回滚，旧文件还在，不删没创建过的路径。
+    #[test]
+    fn plain_move_into_missing_dir_before_write_still_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        fs::create_dir_all(proj.join("src")).unwrap();
+        fs::write(proj.join("src/a.ts"), b"AAA").unwrap();
+        let before = project_hashes(&proj);
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(&proj);
+        let p = plan(vec![move_op("src/a.ts", "pkg/c.ts", b"AAA")]);
+        execute(&db, &fsys, &p, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
+        assert_eq!(fs::read(proj.join("src/a.ts")).unwrap(), b"AAA");
+        assert!(!proj.join("pkg").exists());
+        let back = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+        assert_eq!(back.state, "ROLLED_BACK", "{:?}", back.files);
+        assert_eq!(journal_state(&db, &p.id), "ROLLED_BACK");
+        assert_eq!(project_hashes(&proj), before);
+        assert_eq!(fs::read(proj.join("src/a.ts")).unwrap(), b"AAA");
+        assert!(!proj.join("pkg").exists());
+    }
+
+    #[cfg(feature = "fault-inject")]
+    #[test]
+    fn keep_source_missing_parent_rollback_ignores_dir_fsync_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        fs::create_dir_all(proj.join("src")).unwrap();
+        fs::write(proj.join("src/a.ts"), b"AAA").unwrap();
+        let before = project_hashes(&proj);
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(&proj);
+        let p = plan(vec![keep_into("src/a.ts", "pkg/c.ts", b"AAA")]);
+        execute(&db, &fsys, &p, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
+        let back = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, crate::fault::parse_spec("fsync-dir:1").unwrap()).unwrap();
+        assert_eq!(back.state, "ROLLED_BACK", "{:?}", back.files);
+        assert_eq!(project_hashes(&proj), before);
+        assert!(!proj.join("pkg").exists());
+    }
+
+    #[cfg(feature = "fault-inject")]
+    #[test]
+    fn keep_source_rollback_still_fsyncs_after_deleting_the_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/old.ts"), b"body").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let mut op = keep_move_op();
+        op.path = "dir/new.ts".into();
+        op.from = Some("src/old.ts".into());
+        let p = plan(vec![op]);
+        execute(&db, &fsys, &p, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        assert_eq!(fs::read(dir.path().join("dir/new.ts")).unwrap(), b"body");
+        let rep = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, crate::fault::parse_spec("fsync-dir:1").unwrap()).unwrap();
+        assert_eq!(rep.state, "ROLLBACK_PARTIAL", "{:?}", rep.files);
+        assert_eq!(rep.files[0].code.as_deref(), Some("E_IO"));
+        assert!(!dir.path().join("dir/new.ts").exists());
+        assert_eq!(fs::read(dir.path().join("src/old.ts")).unwrap(), b"body");
+        let again = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+        assert_eq!(again.state, "ROLLED_BACK", "{:?}", again.files);
+        assert!(!dir.path().join("dir/new.ts").exists());
+        assert_eq!(fs::read(dir.path().join("src/old.ts")).unwrap(), b"body");
     }
 }
