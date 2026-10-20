@@ -183,6 +183,101 @@ export function previewCounts(files: PlannedFile[], allowReadonly: boolean): Pre
   return counts;
 }
 
+export type CheckState = "all" | "some" | "none";
+
+export type PlanListRow = { kind: "dir" | "file"; path: string; depth: number };
+
+function slashPath(path: string): string {
+  return path.replace(/\\/g, "/");
+}
+
+function parentPath(path: string): string {
+  const slash = slashPath(path);
+  const cut = slash.lastIndexOf("/");
+  return cut < 0 ? "" : slash.slice(0, cut);
+}
+
+function baseSegment(path: string): string {
+  const slash = slashPath(path);
+  const cut = slash.lastIndexOf("/");
+  return cut < 0 ? slash : slash.slice(cut + 1);
+}
+
+/** 目录行在文件行前面按层展开。移动在计划里已经是一条，这里不再拆。 */
+export function planListRows(files: readonly { path: string }[]): PlanListRow[] {
+  const dirs = new Set<string>();
+  const filePaths = files.map((file) => slashPath(file.path));
+  for (const path of filePaths) {
+    let parent = parentPath(path);
+    while (parent) {
+      dirs.add(parent);
+      parent = parentPath(parent);
+    }
+  }
+  const childDirs = new Map<string, string[]>();
+  const childFiles = new Map<string, string[]>();
+  const push = (map: Map<string, string[]>, key: string, value: string) => {
+    const list = map.get(key);
+    if (list) list.push(value);
+    else map.set(key, [value]);
+  };
+  for (const dir of dirs) push(childDirs, parentPath(dir), dir);
+  for (const path of filePaths) push(childFiles, parentPath(path), path);
+  const rows: PlanListRow[] = [];
+  const walk = (dir: string, depth: number) => {
+    const entries = [
+      ...(childDirs.get(dir) ?? []).map((path) => ({ kind: "dir" as const, path, name: baseSegment(path) })),
+      ...(childFiles.get(dir) ?? []).map((path) => ({ kind: "file" as const, path, name: baseSegment(path) })),
+    ];
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : a.kind === b.kind ? 0 : a.kind === "dir" ? -1 : 1));
+    for (const entry of entries) {
+      if (entry.kind === "dir") {
+        rows.push({ kind: "dir", path: entry.path, depth });
+        walk(entry.path, depth + 1);
+      } else {
+        rows.push({ kind: "file", path: entry.path, depth });
+      }
+    }
+  };
+  walk("", 0);
+  return rows;
+}
+
+export function filePathsUnder(dir: string, files: readonly { path: string }[]): string[] {
+  const prefix = `${slashPath(dir)}/`;
+  return files.map((file) => slashPath(file.path)).filter((path) => path.startsWith(prefix));
+}
+
+export function checkState(paths: readonly string[], picked: ReadonlySet<string>): CheckState {
+  if (paths.length === 0) return "none";
+  let hits = 0;
+  for (const path of paths) if (picked.has(path)) hits += 1;
+  if (hits === 0) return "none";
+  if (hits === paths.length) return "all";
+  return "some";
+}
+
+/** 全选再点变成全不选；半选或未选再点变成全选。 */
+export function applyCheck(picked: ReadonlySet<string>, paths: readonly string[], state: CheckState): Set<string> {
+  const next = new Set(picked);
+  const turnOn = state !== "all";
+  for (const path of paths) {
+    if (turnOn) next.add(path);
+    else next.delete(path);
+  }
+  return next;
+}
+
+export function selectionSummary(files: readonly { path: string }[], picked: ReadonlySet<string>): { selected: number; total: number } {
+  const paths = files.map((file) => slashPath(file.path));
+  return { selected: paths.filter((path) => picked.has(path)).length, total: paths.length };
+}
+
+/** 执行计划只留下勾选的文件。移动仍是一条。 */
+export function selectedPlan(plan: LocalPlan, picked: ReadonlySet<string>): LocalPlan {
+  return { ...plan, files: plan.files.filter((file) => picked.has(slashPath(file.path))) };
+}
+
 export function firstTextFile(plan: LocalPlan): string | null {
   const text = plan.files.find((file) => !file.binary && (file.kind === "overwrite" || file.kind === "create"));
   return text?.path ?? plan.files[0]?.path ?? null;

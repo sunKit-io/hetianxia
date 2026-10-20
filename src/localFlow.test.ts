@@ -23,7 +23,15 @@ test("preview empty state and execute stay on the real plan", () => {
   assert.match(zipPick, /useUpgradePackage/);
   assert.match(backend.slice(backend.indexOf("async function useUpgradePackage"), backend.indexOf("export function pickUpgradeDirectory")), /preparePackage/);
   assert.match(app, /备份并执行/);
-  assert.match(app, /disabled=\{target === "local" \? !localReady : !remoteReady\}/);
+  assert.match(app, /disabled=\{target === "local" \? !localReady \|\| summary\.selected === 0 : !remoteReady\}/);
+  assert.match(app, /已选 \{summary\.selected\} \/ 共 \{summary\.total\} 个文件/);
+  assert.match(app, /至少选一个文件/);
+  assert.match(app, /aria-label="全选"/);
+  assert.match(app, /indeterminate = allState === "some"/);
+  assert.match(app, /indeterminate = state === "some"/);
+  assert.match(app, /setPickedPaths\(new Set\(next\.files\.map\(\(file\) => file\.path\.replace/);
+  assert.match(app, /selectedPlan\(plan, pickedPaths\)/);
+  assert.match(app, /execPlanFor\(chosen/);
   assert.match(app, /connectionSelected && remoteRootReady && currentRemotePlan\(\) != null/);
   assert.match(app, /先在连接里填远程目录/);
   assert.match(app, /远程目录不能是根目录 \//);

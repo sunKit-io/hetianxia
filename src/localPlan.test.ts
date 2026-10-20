@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildLocalPlan, execPlanFor, previewCounts, textDocToString, textsFromDiff, type ScanFile, type SideText } from "./localPlan.ts";
+import { applyCheck, buildLocalPlan, checkState, execPlanFor, filePathsUnder, planListRows, previewCounts, selectedPlan, selectionSummary, textDocToString, textsFromDiff, type ScanFile, type SideText } from "./localPlan.ts";
 
 function side(text: string, extra: Partial<SideText> = {}): SideText {
   const bytes = Array.from(new TextEncoder().encode(text));
@@ -103,4 +103,55 @@ test("edited right side is what execute writes", async () => {
   assert.equal(new TextDecoder().decode(new Uint8Array(exec.ops[0].bytes ?? [])), "edited\n");
   assert.equal(exec.summary.overwrite, 1);
   assert.equal(exec.summary.merged, 1);
+});
+
+test("directory checks include nested files and the stored plan keeps one move row", async () => {
+  const plan = await buildLocalPlan({
+    projectRoot: "/work/demo",
+    packagePath: "/tmp/pkg",
+    files: [
+      { rel: "readme.txt", status: "added" },
+      { rel: "src/old.ts", status: "moved", message: "move-source", movedTo: "src/new.ts" },
+      { rel: "src/new.ts", status: "moved", movedFrom: "src/old.ts" },
+      { rel: "src/util/c.ts", status: "added" },
+    ],
+    async read() {
+      return side("same\n");
+    },
+    async mergeText(_left, right) {
+      return { text: right };
+    },
+  });
+  assert.deepEqual(plan.files.map((file) => file.path), ["readme.txt", "src/new.ts", "src/util/c.ts"]);
+  assert.equal(plan.files[1].kind, "move");
+  assert.deepEqual(planListRows(plan.files), [
+    { kind: "file", path: "readme.txt", depth: 0 },
+    { kind: "dir", path: "src", depth: 0 },
+    { kind: "file", path: "src/new.ts", depth: 1 },
+    { kind: "dir", path: "src/util", depth: 1 },
+    { kind: "file", path: "src/util/c.ts", depth: 2 },
+  ]);
+  const all = plan.files.map((file) => file.path);
+  let picked = new Set(all);
+  assert.equal(checkState(all, picked), "all");
+  assert.deepEqual(selectionSummary(plan.files, picked), { selected: 3, total: 3 });
+  const underSrc = filePathsUnder("src", plan.files);
+  assert.deepEqual(underSrc, ["src/new.ts", "src/util/c.ts"]);
+  picked = applyCheck(picked, underSrc, "all");
+  assert.equal(checkState(underSrc, picked), "none");
+  assert.equal(checkState(all, picked), "some");
+  assert.deepEqual(selectionSummary(plan.files, picked), { selected: 1, total: 3 });
+  picked = applyCheck(picked, filePathsUnder("src/util", plan.files), "none");
+  assert.equal(checkState(underSrc, picked), "some");
+  picked = applyCheck(picked, underSrc, "some");
+  assert.equal(checkState(underSrc, picked), "all");
+  const onlyMove = selectedPlan(plan, new Set(["src/new.ts"]));
+  const exec = await execPlanFor(onlyMove, {}, {}, async () => ({ text: "" }), "pick-1");
+  assert.deepEqual(exec.ops.map((op) => op.path), ["src/new.ts"]);
+  assert.equal(exec.ops[0].kind, "move");
+  assert.equal(exec.ops[0].from, "src/old.ts");
+  assert.equal(exec.ops[0].keepSource, true);
+  assert.equal(exec.summary.moveCount, 1);
+  assert.equal(exec.summary.create, 0);
+  assert.equal(exec.summary.overwrite, 0);
 });

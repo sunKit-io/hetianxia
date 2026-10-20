@@ -15,7 +15,14 @@ import {
   firstTextFile,
   newExecId,
   noteShownFile,
+  applyCheck,
+  checkState,
+  filePathsUnder,
+  planListRows,
   previewCounts,
+  selectedPlan,
+  selectionSummary,
+  type CheckState,
   type LocalPlan,
 } from "./localPlan";
 import { formatFileCounts, formatRunTime, historyContinue, historyRowButtons, historyStatusLabel, REMOTE_ROLLBACK_TITLE, type HistoryContinue } from "./historyRows";
@@ -72,6 +79,7 @@ export function App() {
   const [projectRoot, setProjectRoot] = useState<string | null>(null);
   const [packagePath, setPackagePath] = useState<string | null>(null);
   const [plan, setPlan] = useState<LocalPlan | null>(null);
+  const [pickedPaths, setPickedPaths] = useState<ReadonlySet<string>>(new Set());
   const [currentFile, setCurrentFile] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
   const [running, setRunning] = useState(false);
@@ -131,10 +139,12 @@ export function App() {
         mergeText: mergeTexts,
       });
       setPlan(next);
+      setPickedPaths(new Set(next.files.map((file) => file.path.replace(/\\/g, "/"))));
       setCurrentFile(firstTextFile(next));
       setStatus(null);
     } catch (err) {
       setPlan(null);
+      setPickedPaths(new Set());
       setCurrentFile(null);
       setStatus(formatEngineError(err));
     } finally {
@@ -166,10 +176,12 @@ export function App() {
 
   async function backupAndExecute(edits: Record<string, string>) {
     if (!projectRoot || !plan || running) return;
+    const chosen = selectedPlan(plan, pickedPaths);
+    if (chosen.files.length === 0) return;
     setRunning(true);
     setStatus("正在备份并执行…");
     try {
-      const execPlan = await execPlanFor(plan, edits, decisionMap(), mergeTexts, newExecId());
+      const execPlan = await execPlanFor(chosen, edits, decisionMap(), mergeTexts, newExecId());
       const result = await executeLocal(projectRoot, execPlan, allowReadonly);
       setReport(result);
       setStatus(formatReport(result));
@@ -279,6 +291,8 @@ export function App() {
             projectRoot={projectRoot}
             packagePath={packagePath}
             plan={plan}
+            picked={pickedPaths}
+            onPicked={setPickedPaths}
             scanning={scanning}
             running={running}
             report={report}
@@ -601,6 +615,8 @@ function PreviewPage({
   projectRoot,
   packagePath,
   plan,
+  picked,
+  onPicked,
   scanning,
   running,
   report,
@@ -620,6 +636,8 @@ function PreviewPage({
   projectRoot: string | null;
   packagePath: string | null;
   plan: LocalPlan | null;
+  picked: ReadonlySet<string>;
+  onPicked: (next: ReadonlySet<string>) => void;
   scanning: boolean;
   running: boolean;
   report: ExecReport | null;
@@ -635,6 +653,9 @@ function PreviewPage({
 }) {
   const [target, setTarget] = useState<"local" | "remote">("local");
   const counts = useMemo(() => previewCounts(plan?.files ?? [], allowReadonly), [plan, allowReadonly]);
+  const summary = selectionSummary(plan?.files ?? [], picked);
+  const allPaths = (plan?.files ?? []).map((file) => file.path.replace(/\\/g, "/"));
+  const allState = checkState(allPaths, picked);
   const localReady = Boolean(plan) && !scanning && !running;
   const remoteReady = connectionSelected && remoteRootReady && currentRemotePlan() != null;
   const localSub = projectRoot && packagePath ? `${baseName(projectRoot)} · ${projectRoot} ← ${baseName(packagePath)}` : "";
@@ -662,16 +683,54 @@ function PreviewPage({
           </div>
         )}
         {plan && (
+          <div className="pickrow">
+            <input
+              type="checkbox"
+              aria-label="全选"
+              checked={allState === "all"}
+              ref={(el) => { if (el) el.indeterminate = allState === "some"; }}
+              onChange={() => onPicked(applyCheck(picked, allPaths, allState))}
+            />
+            <span>已选 {summary.selected} / 共 {summary.total} 个文件</span>
+          </div>
+        )}
+        {plan && (
           <ul className="changes">
-            {plan.files.map((file) => (
-              <li key={file.path} data-keep-source={keepSource(file.label) ? "1" : "0"}>
-                <i className={file.kind === "create" ? "add" : file.kind === "move" ? "move" : "mod"} />
-                <button type="button" onClick={() => onOpenFile(file.path)}>
-                  <Text value={file.kind === "move" && file.from ? `${file.from} → ${file.path}` : file.path} />
-                </button>
-                <em>{file.label}</em>
-              </li>
-            ))}
+            {planListRows(plan.files).map((row) => {
+              if (row.kind === "dir") {
+                const paths = filePathsUnder(row.path, plan.files);
+                const state: CheckState = checkState(paths, picked);
+                return (
+                  <li key={`dir:${row.path}`} style={row.depth ? { paddingLeft: 10 + row.depth * 16 } : undefined}>
+                    <input
+                      type="checkbox"
+                      checked={state === "all"}
+                      ref={(el) => { if (el) el.indeterminate = state === "some"; }}
+                      onChange={() => onPicked(applyCheck(picked, paths, state))}
+                    />
+                    <span><Text value={row.path} /></span>
+                    <em>目录</em>
+                  </li>
+                );
+              }
+              const file = plan.files.find((item) => item.path.replace(/\\/g, "/") === row.path);
+              if (!file) return null;
+              const state: CheckState = picked.has(row.path) ? "all" : "none";
+              return (
+                <li key={file.path} data-keep-source={keepSource(file.label) ? "1" : "0"} style={row.depth ? { paddingLeft: 10 + row.depth * 16 } : undefined}>
+                  <input
+                    type="checkbox"
+                    checked={picked.has(row.path)}
+                    onChange={() => onPicked(applyCheck(picked, [row.path], state))}
+                  />
+                  <i className={file.kind === "create" ? "add" : file.kind === "move" ? "move" : "mod"} />
+                  <button type="button" onClick={() => onOpenFile(file.path)}>
+                    <Text value={file.kind === "move" && file.from ? `${file.from} → ${file.path}` : file.path} />
+                  </button>
+                  <em>{file.label}</em>
+                </li>
+              );
+            })}
           </ul>
         )}
         {readonlyFiles.length > 0 && (
@@ -698,8 +757,9 @@ function PreviewPage({
         <p className="bak">执行前备份到 {bakDir ? <Text value={bakDir} /> : "…"}</p>
         {target === "remote" && remoteRootIsSlash && <p>远程目录不能是根目录 /</p>}
         {target === "remote" && !remoteRootReady && !remoteRootIsSlash && <p>先在连接里填远程目录</p>}
+        {target === "local" && plan && summary.selected === 0 && <p>至少选一个文件</p>}
         <footer>
-          <button className="primary" disabled={target === "local" ? !localReady : !remoteReady} onClick={() => { if (target === "remote") onRemoteWrite(); else onExecute(); }}>{target === "remote" ? "写入远程" : "备份并执行"}</button>
+          <button className="primary" disabled={target === "local" ? !localReady || summary.selected === 0 : !remoteReady} onClick={() => { if (target === "remote") onRemoteWrite(); else onExecute(); }}>{target === "remote" ? "写入远程" : "备份并执行"}</button>
         </footer>
       </div>
     </div>
