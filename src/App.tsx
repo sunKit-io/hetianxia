@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Server, ShieldAlert, KeyRound, AlertTriangle } from "lucide-react";
-import { appBakDir, clearConnectionFingerprint, commitRemoteOverwrite, confirmExecute, deleteConnection, deleteSshSecret, executeLocal, journalRuns, listConnections, loadFilePicks, mergeTexts, pickProjectDirectory, pickUpgradeDirectory, pickUpgradeZip, readSide, remoteWritePrompt, rollbackPreview, rollbackRun, resumeRun, saveConnection, saveFilePicks, saveSshSecret, scanPair, sshSecretStatus, startupFailure, startupOffers, testConnection, type JournalRun, type ProbeReport, type SavedConnection } from "./backend";
+import { appBakDir, clearConnectionFingerprint, commitRemoteOverwrite, confirmExecute, deleteConnection, deleteSshSecret, executeLocal, journalRuns, listConnections, listRemoteDirs, loadFilePicks, mergeTexts, pickProjectDirectory, pickUpgradeDirectory, pickUpgradeZip, readSide, remoteWritePrompt, rollbackPreview, rollbackRun, resumeRun, saveConnection, saveFilePicks, saveSshSecret, scanPair, sshSecretStatus, startupFailure, startupOffers, testConnection, type JournalRun, type ProbeReport, type SavedConnection } from "./backend";
+import { browseCrumbs, joinChild } from "./remoteBrowse";
 import { invertPicked, pickedFromSkipped, skippedOf } from "./filePicks";
 import { confirmExecuteBody, settleExecuteConfirm, type ExecuteConfirm } from "./confirmExecute";
 import { externalChoice, keepSource, pendingChoice, rollbackChoice, type ResumeChoice, type RollbackChoice } from "./choices";
@@ -70,6 +71,8 @@ export function App() {
   const [historyToken, setHistoryToken] = useState(0);
   const [remoteTx, setRemoteTx] = useState<PendingRemoteWrite | null>(null);
   const [remoteBatch, setRemoteBatch] = useState<RemoteBatchReport | null>(null);
+  const [remoteProject, setRemoteProject] = useState<string | null>(null);
+  const [remoteBrowser, setRemoteBrowser] = useState<{ path: string; dirs: string[]; reading: boolean; error: string | null } | null>(null);
   const [verifyBody, setVerifyBody] = useState<string | null>(null);
   const [bakDir, setBakDir] = useState<string | null>(null);
   const [flowId, setFlowId] = useState("");
@@ -102,8 +105,13 @@ export function App() {
   }, [plan, currentFile]);
 
   useEffect(() => {
-    noteRemoteRoot(connectionRemoteRoot(selected));
-  }, [selected]);
+    setRemoteProject(null);
+    setRemoteBrowser(null);
+  }, [selectedId]);
+
+  useEffect(() => {
+    noteRemoteRoot(remoteProject || connectionRemoteRoot(selected));
+  }, [selected, remoteProject]);
 
   useEffect(() => attachFlowStatus(setStatus), []);
 
@@ -285,7 +293,55 @@ export function App() {
   }
 
   noteShownFile(plan, currentFile);
-  noteRemoteRoot(connectionRemoteRoot(selected));
+  noteRemoteRoot(remoteProject || connectionRemoteRoot(selected));
+
+  async function loadRemoteDir(path: string) {
+    if (!selected) return;
+    setRemoteBrowser({ path, dirs: [], reading: true, error: null });
+    try {
+      const listed = await listRemoteDirs(selected.id, path);
+      setRemoteBrowser({ path: listed.path, dirs: listed.dirs, reading: false, error: null });
+    } catch (err) {
+      setRemoteBrowser({ path, dirs: [], reading: false, error: formatEngineError(err) });
+    }
+  }
+
+  function openRemoteBrowser() {
+    if (!selected) {
+      setStatus("先保存并选择一个连接");
+      return;
+    }
+    const root = connectionRemoteRoot(selected);
+    if (!root) {
+      setStatus("先在连接里填远程目录");
+      return;
+    }
+    void loadRemoteDir(remoteProject || root);
+  }
+
+  function enterRemoteDir(name: string) {
+    if (!selected || !remoteBrowser || remoteBrowser.reading) return;
+    const next = joinChild(connectionRemoteRoot(selected), remoteBrowser.path, name);
+    if (!next) {
+      setRemoteBrowser({ ...remoteBrowser, reading: false, error: "不能走出远程目录" });
+      return;
+    }
+    void loadRemoteDir(next);
+  }
+
+  function chooseRemoteDir() {
+    if (!selected || !remoteBrowser || remoteBrowser.reading || remoteBrowser.error) return;
+    const root = connectionRemoteRoot(selected);
+    const allowed = browseCrumbs(root, remoteBrowser.path);
+    const path = allowed[allowed.length - 1]?.path;
+    if (!path) {
+      setRemoteBrowser({ ...remoteBrowser, error: "不能走出远程目录" });
+      return;
+    }
+    setRemoteProject(path);
+    noteRemoteRoot(path);
+    setRemoteBrowser(null);
+  }
 
   return (
     <div className="desktop">
@@ -351,6 +407,8 @@ export function App() {
             connectionSelected={selected != null}
             remoteRootReady={isAbsoluteRemoteRoot(connectionRemoteRoot(selected))}
             remoteRootIsSlash={isFilesystemRemoteRoot(selected?.remoteRoot ?? "")}
+            remoteProject={remoteProject}
+            onBrowseRemote={openRemoteBrowser}
             onRemoteWrite={() => {
               const pickedFiles = remotePlanFiles(plan, pickedPaths);
               if (!selected) {
@@ -442,6 +500,17 @@ export function App() {
             </div>
           </div>
         )}
+        {remoteBrowser && (
+          <RemoteDirSheet
+            root={connectionRemoteRoot(selected)}
+            browser={remoteBrowser}
+            onCrumb={(path) => { void loadRemoteDir(path); }}
+            onEnter={enterRemoteDir}
+            onRetry={() => { void loadRemoteDir(remoteBrowser.path); }}
+            onCancel={() => setRemoteBrowser(null)}
+            onChoose={chooseRemoteDir}
+          />
+        )}
         {remoteTx && (
           <RemoteWriteSheet
             pending={remoteTx}
@@ -473,6 +542,61 @@ export function App() {
           />
         )}
         {verifyBody && <VerifyFailedSheet body={verifyBody} onClose={() => setVerifyBody(null)} />}
+      </div>
+    </div>
+  );
+}
+
+function RemoteDirSheet({
+  root,
+  browser,
+  onCrumb,
+  onEnter,
+  onRetry,
+  onCancel,
+  onChoose,
+}: {
+  root: string;
+  browser: { path: string; dirs: string[]; reading: boolean; error: string | null };
+  onCrumb: (path: string) => void;
+  onEnter: (name: string) => void;
+  onRetry: () => void;
+  onCancel: () => void;
+  onChoose: () => void;
+}) {
+  const crumbs = browseCrumbs(root, browser.path);
+  return (
+    <div className="mask" role="dialog" aria-modal="true" aria-labelledby="remote-dir-title">
+      <div className="sheet small">
+        <h1 id="remote-dir-title">选择远程项目目录</h1>
+        <p className="sub">
+          {crumbs.map((crumb, index) => (
+            <button type="button" key={crumb.path} onClick={() => onCrumb(crumb.path)}>
+              {index === 0 ? crumb.path : crumb.name}
+            </button>
+          ))}
+        </p>
+        {browser.reading && <p role="status">正在读取…</p>}
+        {browser.error && (
+          <p className="err" role="alert">
+            读不到这个目录：<Text value={browser.error} />
+            <button type="button" onClick={onRetry}>重试</button>
+          </p>
+        )}
+        {!browser.reading && !browser.error && (
+          <ul className="changes">
+            {browser.dirs.map((name) => (
+              <li key={name}>
+                <button type="button" onDoubleClick={() => onEnter(name)}><Text value={name} /></button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <footer>
+          <button type="button" onClick={onCancel}>取消</button>
+          <span style={{ flex: 1 }} />
+          <button type="button" className="primary" onClick={onChoose} disabled={browser.reading || browser.error != null}>选这个目录</button>
+        </footer>
       </div>
     </div>
   );
@@ -690,6 +814,8 @@ function PreviewPage({
   connectionSelected,
   remoteRootReady,
   remoteRootIsSlash,
+  remoteProject,
+  onBrowseRemote,
   onRemoteWrite,
 }: {
   allowReadonly: boolean;
@@ -712,6 +838,8 @@ function PreviewPage({
   connectionSelected: boolean;
   remoteRootReady: boolean;
   remoteRootIsSlash: boolean;
+  remoteProject: string | null;
+  onBrowseRemote: () => void;
   onRemoteWrite: () => void;
 }) {
   const [target, setTarget] = useState<"local" | "remote">("local");
@@ -728,9 +856,9 @@ function PreviewPage({
       <div className="sheet">
         <h1><ShieldAlert size={18} /> 确认执行升级</h1>
         {!plan && <p>先选项目目录和升级包</p>}
-        <p className="sub">{target === "remote" ? "远程" : localSub}</p>
+        <p className="sub">{target === "remote" ? (remoteProject || "远程") : localSub}</p>
         <div className="pickrow">
-          <button type="button" onClick={onPickProject}>选择项目目录…</button>
+          <button type="button" onClick={target === "remote" ? onBrowseRemote : onPickProject}>{target === "remote" ? "选择远程项目目录…" : "选择项目目录…"}</button>
           <button type="button" onClick={onPickDirectory}>选择升级包文件夹…</button>
           <button type="button" onClick={onPickZip}>选择 zip 升级包…</button>
         </div>

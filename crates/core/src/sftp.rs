@@ -8,7 +8,7 @@ use std::time::Duration;
 use russh::client::Handler;
 use russh::keys::PrivateKeyWithHashAlg;
 use russh_sftp::client::RawSftpSession;
-use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
+use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags, StatusCode};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
@@ -374,6 +374,42 @@ impl RemoteSession {
         Err(remote::remote_write_unsupported())
     }
 
+    /// 先 lstat。符号链接不当成目录打开，避免顺着链接走出远程目录。
+    pub async fn list_child_entries(&self, path: &str) -> Result<Vec<crate::remote_browse::RawEntry>> {
+        let stat = self.sftp.lstat(path).await.map_err(map_sftp)?;
+        let kind = stat.attrs.file_type();
+        if kind.is_symlink() {
+            return Err(Error::new(ErrorCode::SymlinkRefused, "这是符号链接"));
+        }
+        if !kind.is_dir() {
+            return Err(Error::new(ErrorCode::InvalidLocation, "这不是文件夹"));
+        }
+        let opened = self.sftp.opendir(path).await.map_err(map_sftp)?;
+        let mut entries = Vec::new();
+        loop {
+            match self.sftp.readdir(&opened.handle).await {
+                Ok(name) => {
+                    for file in name.files {
+                        let kind = match file.attrs.file_type() {
+                            FileType::Dir => crate::remote_browse::EntryKind::Dir,
+                            FileType::File => crate::remote_browse::EntryKind::File,
+                            FileType::Symlink => crate::remote_browse::EntryKind::Link,
+                            FileType::Other => crate::remote_browse::EntryKind::Other,
+                        };
+                        entries.push(crate::remote_browse::RawEntry { name: file.filename, kind });
+                    }
+                }
+                Err(russh_sftp::client::error::Error::Status(status)) if status.status_code == StatusCode::Eof => break,
+                Err(err) => {
+                    let _ = self.sftp.close(&opened.handle).await;
+                    return Err(map_sftp(err));
+                }
+            }
+        }
+        self.sftp.close(&opened.handle).await.map_err(map_sftp)?;
+        Ok(entries)
+    }
+
     pub async fn exists(&self, path: &str) -> Result<bool> {
         match self.sftp.lstat(path).await {
             Ok(_) => Ok(true),
@@ -584,6 +620,23 @@ impl RemoteSession {
         });
         req.secret.zeroize();
         result.and_then(|inner| inner)
+    }
+
+    /// 列出当前目录下的文件夹。`root` 是连接里的远程目录，`path` 不能走到它外面。
+    pub fn list_dirs_blocking(req: &mut ProbeRequest, root: &str, path: &str) -> Result<Vec<String>> {
+        let current = crate::remote_browse::directory_inside(root, path)?;
+        let result = block_on(async {
+            let session = match RemoteSession::connect(req).await {
+                Ok(session) => session,
+                Err(err) => return Err(err),
+            };
+            let listed = session.list_child_entries(&current).await;
+            let _ = session.close().await;
+            listed
+        });
+        req.secret.zeroize();
+        let entries = result.and_then(|inner| inner)?;
+        crate::remote_browse::directory_names(root, &current, &entries)
     }
 
     async fn write_new(&self, path: &str, bytes: &[u8]) -> Result<()> {

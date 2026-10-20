@@ -10,6 +10,7 @@ use hetianxia_core::remote::{self, ImportedHost};
 use hetianxia_core::scan::{self, ScanOptions, ScanOutput};
 use hetianxia_core::secrets::{self, KeyringStore, SecretStatus, SecretStore};
 use hetianxia_core::connections::{self, SavedConnection};
+use hetianxia_core::remote_browse;
 use hetianxia_core::remote_write::{self, BatchFileInput, BatchPromptInput, RemoteBatchReport, RemoteWritePrompt};
 use hetianxia_core::sftp::{self, ProbeReport, ProbeRequest};
 use hetianxia_core::vfs::LocalFs;
@@ -621,6 +622,36 @@ pub fn remote_write_prompt(
         files: &batch,
     };
     remote_write::issue_batch_prompt(&app_data, &input)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDirListing {
+    pub path: String,
+    pub dirs: Vec<String>,
+}
+
+#[tauri::command]
+pub fn list_remote_dirs(
+    app: tauri::AppHandle,
+    session: tauri::State<crate::Session>,
+    connection_id: String,
+    path: String,
+) -> Result<RemoteDirListing, Error> {
+    ready(&session)?;
+    let app_data = app.path().app_data_dir().map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
+    let db = exec::open_db(&session.db_path)?;
+    let saved = connections::get(&db, &connection_id)?;
+    if saved.auth == "agent" {
+        return Err(Error::new(ErrorCode::Unsupported, "ssh-agent 这一版还不能用来连接"));
+    }
+    let root = saved.remote_root.as_deref().map(str::trim).filter(|value| !value.is_empty()).ok_or_else(|| {
+        Error::new(ErrorCode::InvalidState, "先在连接里填远程目录")
+    })?;
+    let current = remote_browse::directory_inside(root, &path)?;
+    let mut probe = probe_for_saved(&saved, &app_data, &session, false, None)?;
+    let dirs = sftp::RemoteSession::list_dirs_blocking(&mut probe, root, &current)?;
+    Ok(RemoteDirListing { path: current, dirs })
 }
 
 #[tauri::command]

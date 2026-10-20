@@ -31,6 +31,7 @@ fn main() {
         "test_connection",
         "remote_write_prompt",
         "commit_remote_overwrite",
+        "list_remote_dirs",
         "app_bak_dir",
         "load_file_picks",
         "save_file_picks",

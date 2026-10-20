@@ -36,6 +36,7 @@
     "allow-test-connection",
     "allow-remote-write-prompt",
     "allow-commit-remote-overwrite",
+    "allow-list-remote-dirs",
     "allow-app-bak-dir",
     "allow-load-file-picks",
     "allow-save-file-picks",

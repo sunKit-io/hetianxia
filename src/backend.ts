@@ -110,6 +110,10 @@ export function commitRemoteOverwrite(execId: string) {
   return invoke<RemoteBatchReport>("commit_remote_overwrite", { execId });
 }
 
+export function listRemoteDirs(connectionId: string, path: string) {
+  return invoke<{ path: string; dirs: string[] }>("list_remote_dirs", { connectionId, path });
+}
+
 export type JournalRun = {
   execId: string;
   projectRoot?: string | null;

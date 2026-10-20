@@ -141,6 +141,7 @@ pub fn run() {
             commands::test_connection,
             commands::remote_write_prompt,
             commands::commit_remote_overwrite,
+            commands::list_remote_dirs,
             commands::app_bak_dir,
             commands::load_file_picks,
             commands::save_file_picks,
