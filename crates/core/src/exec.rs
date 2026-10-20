@@ -2443,13 +2443,36 @@ pub fn rollback(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: 
         if !op_touched(row) {
             continue;
         }
+        // 普通移动还没记下 written：源文件还在说明改名没落地。目标上的文件是用户的，
+        // 不论内容和计划一不一样，都不搬走、不删除，记「冲突，已保留你的文件」。
+        // 源文件不在、目标内容和计划的大小与哈希一致：这是我们落地的改名，交给 undo_move 改回去。
+        // 源文件不在、目标对不上：不搬这个文件；用备份把原路径写回来，并记下同一条冲突。
+        if !row.written && op.kind == OpKind::Move && !op.keep_source {
+            let class = unwritten_placed_file(fsys, op)?;
+            let source_here = move_source_present(fsys, op)?;
+            let keep_target = match class {
+                UnwrittenTarget::Missing => false,
+                UnwrittenTarget::UserFile => true,
+                UnwrittenTarget::Ours => source_here,
+            };
+            if keep_target {
+                if !source_here {
+                    if let Err(err) = restore_move_source_only(db, exec_id, fsys, &backup, op, &mut fault) {
+                        any_fail = true;
+                        mark_rollback_unrestored(db, exec_id, op.index, &err)?;
+                        files.push(fr(op, "rollback-failed", Some(err.code_str()), Some(&err.message)));
+                        continue;
+                    }
+                }
+                record_kept_user_file(db, exec_id, op, &mut files)?;
+                continue;
+            }
+        }
         // 新增，以及「移动（保留旧文件）」：written 还没记下时不能一律跳过。
         // 目标不在：这次没写出来，记成已回滚。
         // 目标和计划的大小、哈希一致：改名已经落地、只是还没来得及记 written。先备份到
         // conflict-current，再删掉，回滚才能结束。备份失败就不删。
-        // 目标对不上：那是用户的文件，绝不删除，并在结果里写明保留原因。
-        // 普通移动不走这里。目标上的文件就是用户原来的文件，删掉它不会把原路径写回来。
-        // 交给 undo_move：目标在就改回原路径；目标不在、原路径还在，就当作还没做完。
+        // 目标对不上：那是用户的文件，绝不删除，并在结果里写明保留原因。任何回滚选择都一样。
         if !row.written && (op.kind == OpKind::Create || (op.kind == OpKind::Move && op.keep_source)) {
             match unwritten_placed_file(fsys, op)? {
                 UnwrittenTarget::Missing => {
@@ -2479,13 +2502,7 @@ pub fn rollback(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: 
                         files.push(fr(op, "rolled-back", None, None));
                     }
                 }
-                UnwrittenTarget::UserFile => {
-                    db.execute(
-                        "UPDATE exec_ops SET rollback_state='conflict', rollback_error=?3, code='E_CONFLICT' WHERE exec_id=?1 AND op_index=?2",
-                        params![exec_id, op.index, DETAIL_KEPT_USER_FILE],
-                    )?;
-                    files.push(fr(op, "conflict", Some("E_CONFLICT"), Some(DETAIL_KEPT_USER_FILE)));
-                }
+                UnwrittenTarget::UserFile => record_kept_user_file(db, exec_id, op, &mut files)?,
             }
             continue;
         }
@@ -2747,6 +2764,70 @@ fn move_other_side_present(fsys: &LocalFs, op: &PlanOp) -> Result<bool> {
     }
     let to = RelPath::parse(&op.path)?;
     Ok(fsys.stat(&to).is_ok())
+}
+
+fn move_source_present(fsys: &LocalFs, op: &PlanOp) -> Result<bool> {
+    let Some(from) = op.from.as_deref() else {
+        return Ok(false);
+    };
+    let rel = RelPath::parse(from)?;
+    match fsys.stat(&rel) {
+        Ok(_) => Ok(true),
+        Err(err) if err.code == ErrorCode::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn record_kept_user_file(db: &Connection, exec_id: &str, op: &PlanOp, files: &mut Vec<FileResult>) -> Result<()> {
+    db.execute(
+        "UPDATE exec_ops SET rollback_state='conflict', rollback_error=?3, code='E_CONFLICT' WHERE exec_id=?1 AND op_index=?2",
+        params![exec_id, op.index, DETAIL_KEPT_USER_FILE],
+    )?;
+    files.push(fr(op, "conflict", Some("E_CONFLICT"), Some(DETAIL_KEPT_USER_FILE)));
+    Ok(())
+}
+
+/// 普通移动的目标对不上、不能搬走时，只把备份里的原文件抄回原路径。不动目标。
+fn restore_move_source_only(
+    db: &Connection,
+    exec_id: &str,
+    fsys: &LocalFs,
+    backup: &Path,
+    op: &PlanOp,
+    fault: &mut FaultRuntime,
+) -> Result<()> {
+    let Some(from_raw) = &op.from else {
+        return Err(Error::new(ErrorCode::Internal, "移动操作缺少原路径"));
+    };
+    let from = RelPath::parse(from_raw)?;
+    if fsys.stat(&from).is_ok() {
+        return Ok(());
+    }
+    let bak = backup_file(backup, from_raw);
+    if !bak.is_file() {
+        return Err(Error::new(
+            ErrorCode::NotFound,
+            format!("备份里没有 {from_raw}，这个文件没有回滚"),
+        ));
+    }
+    match fsys.copy_in_renamed(
+        &bak,
+        &from,
+        op.mode,
+        None,
+        |tmp| remember_temp(db, exec_id, tmp),
+        |tmp| {
+            let _ = forget_temp(db, exec_id, tmp);
+        },
+        || Ok(()),
+    ) {
+        Ok(()) => {}
+        Err(err) if err.message == ATTR_RESTORE_FAILED => {}
+        Err(err) => return Err(err),
+    }
+    fsync_rel_file(fsys, &from)?;
+    fsys.fsync_parent_of(&from, || fault.hit_fsync_dir())?;
+    Ok(())
 }
 
 fn fsync_rel_file(fsys: &LocalFs, rel: &RelPath) -> Result<()> {
@@ -6960,6 +7041,103 @@ mod tests {
                     assert_eq!(fs::read(proj.join("src/a.ts")).unwrap(), b"AAA");
                 }
             }
+        }
+    }
+
+    fn assert_kept_user_conflict(back: &ExecReport, rel: &str) {
+        assert_eq!(back.state, "ROLLBACK_PARTIAL", "{:?}", back.files);
+        assert_eq!(back.history_result, "部分回滚");
+        let hit = back.files.iter().find(|f| f.path == rel).unwrap_or_else(|| panic!("结果清单没有 {rel}: {:?}", back.files));
+        assert_eq!(hit.state, "conflict");
+        assert_eq!(hit.code.as_deref(), Some("E_CONFLICT"));
+        assert_eq!(hit.error.as_deref(), Some(DETAIL_KEPT_USER_FILE));
+    }
+
+    /// 备份当前后继续，以及跳过冲突：新增、保留旧文件的移动、普通移动，目标上的用户文件都留在原地。
+    #[test]
+    fn backup_current_keeps_a_user_file_at_each_unwritten_target() {
+        for streamed in [false, true] {
+            for choice in [RollbackChoice::ProceedBackupCurrent, RollbackChoice::SkipConflicts] {
+                for (label, mut op, rel) in [
+                    ("create", create_op(1, "pkg/new.ts", b"body"), "pkg/new.ts"),
+                    ("keep", keep_into("src/a.ts", "pkg/c.ts", b"AAA"), "pkg/c.ts"),
+                    ("plain", move_op("src/a.ts", "pkg/c.ts", b"AAA"), "pkg/c.ts"),
+                ] {
+                    if streamed {
+                        op = as_streamed(op);
+                    }
+                    let dir = tempfile::tempdir().unwrap();
+                    let proj = dir.path().join("proj");
+                    fs::create_dir_all(proj.join("src")).unwrap();
+                    fs::write(proj.join("src/a.ts"), b"AAA").unwrap();
+                    let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+                    let fsys = LocalFs::new(&proj);
+                    let p = plan(vec![op]);
+                    execute(&db, &fsys, &p, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
+                    place_after_crash(&proj, rel, b"xxxx");
+                    let back = rollback(&db, &fsys, &p.id, choice, FaultPlan::default()).unwrap();
+                    assert_kept_user_conflict(&back, rel);
+                    assert_eq!(fs::read(proj.join(rel)).unwrap(), b"xxxx", "{label} streamed={streamed} {choice:?}");
+                    if label != "create" {
+                        assert_eq!(fs::read(proj.join("src/a.ts")).unwrap(), b"AAA");
+                    }
+                    assert!(recover_on_startup(&db, &fsys).unwrap().iter().all(|offer| offer.exec_id != p.id));
+                    assert!(pending(&db).unwrap().iter().all(|item| item.exec_id != p.id));
+                    let again = rollback(&db, &fsys, &p.id, choice, FaultPlan::default()).unwrap();
+                    assert_kept_user_conflict(&again, rel);
+                    assert_eq!(fs::read(proj.join(rel)).unwrap(), b"xxxx");
+                }
+            }
+        }
+    }
+
+    /// 普通移动还没改名，目标上即使放着和计划一样的内容，也是用户的文件，不能删。
+    #[test]
+    fn plain_move_keeps_matching_target_while_source_is_still_present() {
+        for streamed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let proj = dir.path().join("proj");
+            fs::create_dir_all(proj.join("src")).unwrap();
+            fs::write(proj.join("src/a.ts"), b"AAA").unwrap();
+            let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+            let fsys = LocalFs::new(&proj);
+            let mut op = move_op("src/a.ts", "pkg/c.ts", b"AAA");
+            if streamed {
+                op = as_streamed(op);
+            }
+            let p = plan(vec![op]);
+            execute(&db, &fsys, &p, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
+            place_after_crash(&proj, "pkg/c.ts", b"AAA");
+            let back = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+            assert_kept_user_conflict(&back, "pkg/c.ts");
+            assert_eq!(fs::read(proj.join("pkg/c.ts")).unwrap(), b"AAA");
+            assert_eq!(fs::read(proj.join("src/a.ts")).unwrap(), b"AAA");
+        }
+    }
+
+    /// 普通移动的源文件已经不在，目标内容却对不上：不搬走目标，用备份把原路径写回来，并记下冲突。
+    #[test]
+    fn plain_move_keeps_nonmatching_target_when_source_is_already_gone() {
+        for streamed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let proj = dir.path().join("proj");
+            fs::create_dir_all(proj.join("src")).unwrap();
+            fs::write(proj.join("src/a.ts"), b"AAA").unwrap();
+            let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+            let fsys = LocalFs::new(&proj);
+            let mut op = move_op("src/a.ts", "pkg/c.ts", b"AAA");
+            if streamed {
+                op = as_streamed(op);
+            }
+            let p = plan(vec![op]);
+            execute(&db, &fsys, &p, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
+            fs::remove_file(proj.join("src/a.ts")).unwrap();
+            place_after_crash(&proj, "pkg/c.ts", b"xxxx");
+            let back = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+            assert_kept_user_conflict(&back, "pkg/c.ts");
+            assert_eq!(fs::read(proj.join("pkg/c.ts")).unwrap(), b"xxxx", "streamed={streamed}");
+            assert_eq!(fs::read(proj.join("src/a.ts")).unwrap(), b"AAA");
+            assert!(recover_on_startup(&db, &fsys).unwrap().iter().all(|offer| offer.exec_id != p.id));
         }
     }
 }
