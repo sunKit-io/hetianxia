@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Server, ShieldAlert, KeyRound, AlertTriangle } from "lucide-react";
-import { appBakDir, clearConnectionFingerprint, commitRemoteOverwrite, confirmExecute, deleteConnection, deleteSshSecret, executeLocal, journalRuns, listConnections, listRemoteDirs, loadFilePicks, mergeTexts, pickProjectDirectory, pickUpgradeDirectory, pickUpgradeZip, remoteWritePrompt, rollbackPreview, rollbackRun, resumeRun, saveConnection, saveFilePicks, saveSshSecret, scanPair, sshSecretStatus, startupFailure, startupOffers, testConnection, type JournalRun, type ProbeReport, type SavedConnection } from "./backend";
+import { appBakDir, clearConnectionFingerprint, commitRemoteOverwrite, confirmExecute, deleteConnection, deleteSshSecret, executeLocal, journalRuns, listConnections, listRemoteDirs, loadFilePicks, mergeTexts, pickProjectDirectory, pickUpgradeDirectory, pickUpgradeZip, remoteWritePrompt, revealBackup, rollbackPreview, rollbackRun, resumeRun, saveConnection, saveFilePicks, saveSshSecret, scanPair, sshSecretStatus, startupFailure, startupOffers, testConnection, type JournalRun, type ProbeReport, type SavedConnection } from "./backend";
 import { browseCrumbs, joinChild } from "./remoteBrowse";
 import { invertPicked, pickedFromSkipped, skippedOf } from "./filePicks";
 import { confirmExecuteBody, settleExecuteConfirm, type ExecuteConfirm } from "./confirmExecute";
 import { externalChoice, keepSource, pendingChoice, rollbackChoice, type ResumeChoice, type RollbackChoice } from "./choices";
 import { DiffEditor } from "./editor";
-import { afterResume, engineCode, formatEngineError, formatFileResult, formatOffer, formatReport, type ConflictFile, type ExecReport, type RecoveryOffer } from "./engine";
+import { afterResume, backupNotes, engineCode, formatEngineError, formatFileResult, formatOffer, formatReport, savedPathSentence, type ConflictFile, type ExecReport, type FileResult, type RecoveryOffer, type SavedKind } from "./engine";
 import {
   attachFlowStatus,
   baseName,
@@ -77,6 +77,7 @@ export function App() {
   const [bakDir, setBakDir] = useState<string | null>(null);
   const [flowId, setFlowId] = useState("");
   const [status, setStatus] = useState<string | null>(null);
+  const [pathNotes, setPathNotes] = useState<FileResult[]>([]);
   const [offer, setOffer] = useState<RecoveryOffer | null>(null);
   const [bootError, setBootError] = useState<string | null>(null);
   const [externalFiles, setExternalFiles] = useState<ConflictFile[]>(EXTERNAL_FILES);
@@ -237,8 +238,10 @@ export function App() {
     try {
       const result = await executeLocal(current.root, current.plan, current.allowReadonly, current.preview.token);
       setReport(result);
+      setPathNotes(result.files);
       setStatus(formatReport(result));
     } catch (err) {
+      setPathNotes([]);
       setStatus(formatEngineError(err));
     } finally {
       setRunning(false);
@@ -283,10 +286,12 @@ export function App() {
     try {
       const report = await rollbackRun(id, choice);
       setHistoryToken((token) => token + 1);
+      setPathNotes(report.files);
       setStatus(formatReport(report));
       setSheet(null);
     } catch (err) {
       const message = formatEngineError(err);
+      setPathNotes([]);
       setStatus(message);
       if (choice === "cancel") setSheet(null);
     }
@@ -343,6 +348,9 @@ export function App() {
     setRemoteBrowser(null);
   }
 
+  const previewShowsNotes = page === "preview" && report != null && savedKey(pathNotes) !== "" && savedKey(pathNotes) === savedKey(report.files);
+  const statusNotes = previewShowsNotes ? [] : notesOf(pathNotes).filter((note) => status?.includes(note.path));
+
   return (
     <div className="desktop">
       <div className="window">
@@ -367,7 +375,12 @@ export function App() {
             </>
           )}
         </header>
-        {status && !sheet && <p className={status.includes("E_") || status.startsWith("写到第") ? "status err" : "status"} role="status">{status}</p>}
+        {status && !sheet && (
+          <div className={status.includes("E_") || status.startsWith("写到第") ? "status err" : "status"} role="status">
+            <p>{status}</p>
+            {statusNotes.map((note) => <SavedPathNote key={note.key} path={note.path} kind={note.kind} />)}
+          </div>
+        )}
         {page === "edit" && (
           <DiffEditor
             projectRoot={plan ? projectRoot : null}
@@ -422,16 +435,19 @@ export function App() {
               }
               const edits = editedContents();
               let carried: Record<string, number[]> = {};
+              const keepLeft = new Set<string>();
               try {
                 const exec = await execPlanFor(source, edits, decisionMap(), mergeTexts, "remote");
                 for (const op of exec.ops) {
-                  if (op.bytes != null) carried[op.path.replace(/\\/g, "/")] = op.bytes;
+                  const rel = op.path.replace(/\\/g, "/");
+                  if (op.bytes != null) carried[rel] = op.bytes;
+                  if (op.decision === "keep_left") keepLeft.add(rel);
                 }
               } catch (err) {
                 setStatus(formatEngineError(err));
                 return;
               }
-              const pickedFiles = remotePlanFiles(source, pickedPaths, carried);
+              const pickedFiles = remotePlanFiles(source, pickedPaths, carried, keepLeft);
               if (pickedFiles.error) {
                 setStatus(pickedFiles.error);
                 return;
@@ -811,6 +827,31 @@ function SshPage({
   );
 }
 
+function savedKey(files: FileResult[]): string {
+  return files.flatMap((file) => backupNotes(file).map((note) => `${note.kind}:${note.path}`)).join("\n");
+}
+
+function notesOf(files: FileResult[]): Array<{ key: string; path: string; kind: SavedKind }> {
+  return files.flatMap((file) => backupNotes(file).map((note) => ({
+    key: `${file.index}-${note.kind}-${note.path}`,
+    path: note.path,
+    kind: note.kind,
+  })));
+}
+
+function SavedPathNote({ path, kind }: { path: string; kind: SavedKind }) {
+  const [err, setErr] = useState<string | null>(null);
+  const sentence = savedPathSentence(path, kind);
+  const lead = sentence.slice(0, sentence.length - path.length).trimEnd();
+  return (
+    <span className="saved-note">
+      {lead} <code>{path}</code>
+      <button type="button" onClick={() => { void revealBackup(path).catch((error) => setErr(formatEngineError(error))); }}>在 Finder 中显示</button>
+      {err ? <em>{err}</em> : null}
+    </span>
+  );
+}
+
 function PreviewPage({
   allowReadonly,
   setAllowReadonly,
@@ -958,7 +999,8 @@ function PreviewPage({
             {report.files.map((file) => (
               <li key={`${file.index}-${file.path}`}>
                 <span><Text value={file.path} /></span>
-                <em>{formatFileResult(file)}</em>
+                <em>{formatFileResult({ ...file, savedPath: null, savedKind: null, savedFiles: [] })}</em>
+                {backupNotes(file).map((note) => <SavedPathNote key={`${note.kind}-${note.path}`} path={note.path} kind={note.kind} />)}
               </li>
             ))}
           </ul>

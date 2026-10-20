@@ -51,6 +51,9 @@ pub struct PlanOp {
     pub keep_source: bool,
     pub readonly: bool,
     pub label: String,
+    /// `keep_left` 或 `skip`：二进制或超 1MB 选「保留左边」，跳过写入，不备份。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<String>,
     /// 要写入内容的 SHA-256。删除没有。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,

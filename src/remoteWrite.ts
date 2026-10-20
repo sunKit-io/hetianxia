@@ -164,6 +164,7 @@ export function remotePlanFiles(
   plan: LocalPlan | null,
   picked: ReadonlySet<string>,
   carried?: Readonly<Record<string, number[]>>,
+  keepLeft?: ReadonlySet<string>,
 ): { files: RemoteBatchFile[]; error: string | null } {
   if (!plan) return { files: [], error: null };
   const edited = editedContents();
@@ -171,6 +172,7 @@ export function remotePlanFiles(
   for (const file of plan.files) {
     const rel = file.path.replace(/\\/g, "/");
     if (!picked.has(rel)) continue;
+    if (keepLeft?.has(rel) || keepLeft?.has(file.path)) continue;
     if (file.kind === "delete") return { files: [], error: `远程写入还不能删除：${rel}` };
     const remotePath = joinRemote(remoteRoot, rel);
     if (!remotePath) return { files: [], error: `远程路径越出了远程目录：${rel}` };

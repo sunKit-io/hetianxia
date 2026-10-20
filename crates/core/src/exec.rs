@@ -82,7 +82,23 @@ pub struct FileResult {
     /// 备份到 conflict-current 之后的完整路径。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_path: Option<String>,
+    /// `user`：用户自己的文件（冲突保留或另存）。`deleted_backup`：内容和升级包一致，备份后已删除。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_kind: Option<String>,
+    /// 同一项里原路径和目标路径都另存时，每条各自带种类。只有一条时不填，用上面两个字段。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub saved_files: Vec<SavedCopy>,
 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedCopy {
+    pub path: String,
+    pub kind: String,
+}
+
+const SAVED_USER: &str = "user";
+const SAVED_DELETED_BACKUP: &str = "deleted_backup";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1414,6 +1430,11 @@ pub fn execute(db: &Connection, fsys: &LocalFs, plan: &ExecPlan, opts: &ExecOpts
     }
 
     for op in &plan.ops {
+        if keeps_original(op) {
+            set_op(db, &plan.id, op.index, "kept", None, None)?;
+            files.push(fr(op, "kept", None, None));
+            continue;
+        }
         if !will_apply(op, opts.allow_readonly) {
             set_op(db, &plan.id, op.index, "skipped", Some("只读文件未勾选覆盖"), Some("E_PERMISSION"))?;
             files.push(fr(op, "skipped", Some("E_PERMISSION"), Some("跳过（只读）")));
@@ -1474,7 +1495,7 @@ pub fn execute(db: &Connection, fsys: &LocalFs, plan: &ExecPlan, opts: &ExecOpts
         return Ok(partial(plan, &backup, "VERIFYING", files, true));
     }
     for op in &plan.ops {
-        if !will_apply(op, opts.allow_readonly) {
+        if keeps_original(op) || !will_apply(op, opts.allow_readonly) {
             continue;
         }
         if let Some(expect) = payload_hash(op) {
@@ -1707,7 +1728,14 @@ fn finish_source_removal(
     Ok(())
 }
 
+fn keeps_original(op: &PlanOp) -> bool {
+    matches!(op.decision.as_deref(), Some("keep_left") | Some("skip"))
+}
+
 fn needs_backup(op: &PlanOp) -> bool {
+    if keeps_original(op) {
+        return false;
+    }
     match op.kind {
         OpKind::Overwrite | OpKind::Delete => true,
         OpKind::Move => !op.keep_source,
@@ -1897,7 +1925,7 @@ pub fn unfinished_ops(db: &Connection, exec_id: &str) -> Result<Vec<PlanOp>> {
     let mut out = Vec::new();
     for row in rows {
         let (json, state) = row?;
-        if state == "done" || state == "skipped" {
+        if state == "done" || state == "skipped" || state == "kept" {
             continue;
         }
         if let Ok(op) = serde_json::from_str::<PlanOp>(&json) {
@@ -2165,6 +2193,8 @@ fn fr(op: &PlanOp, state: &str, code: Option<&str>, error: Option<&str>) -> File
         error: error.map(|s| s.to_string()),
         code: code.map(|s| s.to_string()),
         saved_path: None,
+        saved_kind: None,
+        saved_files: Vec::new(),
     }
 }
 
@@ -2503,7 +2533,7 @@ pub fn rollback(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: 
     let mut fault = FaultRuntime::new(fault);
     let mut files = Vec::new();
     let mut any_fail = false;
-    let mut plain_move_saved: HashMap<u32, String> = HashMap::new();
+    let mut plain_move_saved: HashMap<u32, Vec<RememberedBackup>> = HashMap::new();
     // 已写入的文件都要还原，包括改名之后才失败、状态被标成 failed 的。未执行的 Create 不能删目标。
     for op in plan.ops.iter().rev() {
         let Some(row) = states.get(&op.index) else { continue };
@@ -2609,8 +2639,10 @@ pub fn rollback(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: 
                     saved = false;
                     break;
                 }
-                if op.kind == OpKind::Move && !op.keep_source && hit.path == op.path {
-                    remember_conflict_backup(&mut plain_move_saved, op.index, &backup, &rel);
+                // 只记结果。原路径和目标路径上用户改过的文件都会先另存到 conflict-current。
+                let source_hit = op.from.as_deref() == Some(hit.path.as_str());
+                if op.kind == OpKind::Move && !op.keep_source && (hit.path == op.path || source_hit) {
+                    remember_conflict_backup(&mut plain_move_saved, op.index, &backup, &rel, SAVED_USER);
                 }
             }
             if !saved {
@@ -2690,7 +2722,7 @@ pub fn rollback(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: 
     }
     for file in &mut files {
         if let Some(saved) = plain_move_saved.get(&file.index) {
-            file.saved_path = Some(saved.clone());
+            apply_remembered_backups(file, saved);
         }
     }
     let _ = any_fail;
@@ -2771,9 +2803,32 @@ fn restore_one(db: &Connection, exec_id: &str, fsys: &LocalFs, backup: &Path, op
     }
 }
 
-fn remember_conflict_backup(saved: &mut HashMap<u32, String>, index: u32, backup: &Path, rel: &RelPath) {
-    let full = backup.join("conflict-current").join(rel.as_str());
-    saved.insert(index, full.display().to_string());
+struct RememberedBackup {
+    path: String,
+    kind: &'static str,
+}
+
+fn remember_conflict_backup(saved: &mut HashMap<u32, Vec<RememberedBackup>>, index: u32, backup: &Path, rel: &RelPath, kind: &'static str) {
+    let full = backup.join("conflict-current").join(rel.as_str()).display().to_string();
+    let list = saved.entry(index).or_default();
+    if list.iter().any(|item| item.path == full) {
+        return;
+    }
+    list.push(RememberedBackup { path: full, kind });
+}
+
+fn apply_remembered_backups(file: &mut FileResult, saved: &[RememberedBackup]) {
+    let copies: Vec<SavedCopy> = saved
+        .iter()
+        .map(|item| SavedCopy { path: item.path.clone(), kind: item.kind.to_string() })
+        .collect();
+    if copies.len() > 1 {
+        file.saved_files = copies.clone();
+    }
+    if let Some(first) = copies.first() {
+        file.saved_path = Some(first.path.clone());
+        file.saved_kind = Some(first.kind.clone());
+    }
 }
 
 /// 把冲突文件的当前内容写到 `conflict-current/<path>`，同步所在目录，再核对哈希。
@@ -2870,6 +2925,7 @@ fn backup_and_remove_our_target(
     mark_rollback_done(db, exec_id, op.index)?;
     let mut done = fr(op, "rolled-back", None, None);
     done.saved_path = Some(backup.join("conflict-current").join(rel.as_str()).display().to_string());
+    done.saved_kind = Some(SAVED_DELETED_BACKUP.to_string());
     files.push(done);
     Ok(true)
 }
@@ -3306,7 +3362,7 @@ pub fn resume(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: Re
         .iter()
         .filter(|op| {
             let Some(row) = states.get(&op.index) else { return true };
-            row.state != "done" && row.state != "skipped" && row.kept_hash.is_none() && !row.written
+            row.state != "done" && row.state != "skipped" && row.state != "kept" && row.kept_hash.is_none() && !row.written
         })
         .cloned()
         .collect();
@@ -3359,6 +3415,8 @@ fn continue_same_transaction(
             files.push(fr(op, "done", Some("E_CHANGED_SINCE_SCAN"), None));
         } else if row.state == "done" {
             files.push(fr(op, "done", None, None));
+        } else if row.state == "kept" {
+            files.push(fr(op, "kept", None, None));
         } else if row.state == "skipped" {
             files.push(fr(op, "skipped", Some("E_PERMISSION"), Some("跳过（只读）")));
         }
@@ -3387,8 +3445,17 @@ fn continue_same_transaction(
     let mut temps = Vec::new();
     for op in &plan.ops {
         let row = states.get(&op.index);
+        if keeps_original(op) {
+            if row.map(|item| item.state.as_str()) != Some("kept") {
+                set_op(db, &plan.id, op.index, "kept", None, None)?;
+            }
+            if !files.iter().any(|file| file.index == op.index) {
+                files.push(fr(op, "kept", None, None));
+            }
+            continue;
+        }
         if let Some(row) = row {
-            if row.kept_hash.is_some() || row.state == "done" || row.state == "skipped" {
+            if row.kept_hash.is_some() || row.state == "done" || row.state == "skipped" || row.state == "kept" {
                 continue;
             }
             if row.written {
@@ -3505,11 +3572,11 @@ fn continue_same_transaction(
 }
 
 fn will_resume_write(states: &HashMap<u32, OpRow>, op: &PlanOp, opts: &ExecOpts, skip_paths: &HashSet<&str>) -> bool {
-    if skip_paths.contains(op.path.as_str()) || !will_apply(op, opts.allow_readonly) {
+    if keeps_original(op) || skip_paths.contains(op.path.as_str()) || !will_apply(op, opts.allow_readonly) {
         return false;
     }
     match states.get(&op.index) {
-        Some(row) => row.state != "done" && row.state != "skipped" && row.kept_hash.is_none() && !row.written,
+        Some(row) => row.state != "done" && row.state != "skipped" && row.state != "kept" && row.kept_hash.is_none() && !row.written,
         None => true,
     }
 }
@@ -3552,6 +3619,7 @@ mod tests {
             keep_source: false,
             readonly: false,
             label: "覆盖".into(),
+            decision: None,
         }
     }
 
@@ -3572,6 +3640,7 @@ mod tests {
             keep_source: false,
             readonly: false,
             label: "删除".into(),
+            decision: None,
         }
     }
 
@@ -3679,6 +3748,7 @@ mod tests {
             keep_source: true,
             readonly: false,
             label: "移动（保留旧文件）".into(),
+            decision: None,
         };
         let p = plan(vec![op]);
         let opts = ExecOpts { allow_readonly: false, backup_root: dir.path().join("bak"), remote: false, stop_after_log: None, corrupt_temp: false };
@@ -4053,6 +4123,7 @@ mod tests {
             keep_source: false,
             readonly: false,
             label: "新增".into(),
+            decision: None,
         }
     }
 
@@ -4104,6 +4175,34 @@ mod tests {
             assert_eq!(err.message, format!("{name} 无法合并：没有读到文件内容，这一项没有写入。"));
             assert!(!dir.path().join(name).exists(), "{name}");
         }
+    }
+
+    /// 二进制选「保留左边」：不写、不备份，原文件哈希不变，整次执行仍是成功。
+    #[test]
+    fn keep_left_on_png_leaves_the_original_and_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = b"\x89PNG\r\n\x1a\n\x00rest";
+        fs::write(dir.path().join("logo.png"), png).unwrap();
+        let before = sha256_hex(png);
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let mut op = ov(1, "logo.png", png, b"package", None);
+        op.bytes = None;
+        op.merged = false;
+        op.decision = Some("keep_left".into());
+        let p = plan(vec![op]);
+        let rep = execute(&db, &fsys, &p, &opts_at(dir.path()), FaultPlan::default()).unwrap();
+        assert_eq!(rep.state, "COMMITTED", "{:?}", rep.files);
+        assert_eq!(rep.history_result, "成功");
+        assert_eq!(fs::read(dir.path().join("logo.png")).unwrap(), png);
+        assert_eq!(sha256_hex(&fs::read(dir.path().join("logo.png")).unwrap()), before);
+        let hit = rep.files.iter().find(|file| file.path == "logo.png").unwrap();
+        assert_eq!(hit.state, "kept");
+        assert!(!dir.path().join("bak").join(&p.id).join("files").join("logo.png").exists());
+        let state: String = db
+            .query_row("SELECT state FROM exec_ops WHERE exec_id=?1 AND op_index=1", params![p.id], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state, "kept");
     }
 
     #[test]
@@ -4389,6 +4488,7 @@ mod tests {
             keep_source: false,
             readonly: false,
             label: "移动".into(),
+            decision: None,
         };
         let p = plan(vec![mv, ov(2, "tail.txt", b"tail", b"TAIL", None)]);
         let old = dir.path().join("old");
@@ -5752,6 +5852,7 @@ mod tests {
             keep_source: false,
             readonly: false,
             label: "移动".into(),
+            decision: None,
         }
     }
 
@@ -5907,6 +6008,7 @@ mod tests {
         assert_eq!(fs::read(&saved).unwrap(), b"user-edit");
         let hit = back.files.iter().find(|file| file.path == "new.ts").unwrap();
         assert_eq!(hit.saved_path.as_deref(), Some(saved.display().to_string().as_str()));
+        assert_eq!(hit.saved_kind.as_deref(), Some(SAVED_USER));
     }
 
     #[test]
@@ -6383,6 +6485,7 @@ mod tests {
             keep_source: true,
             readonly: false,
             label: "移动（保留旧文件）".into(),
+            decision: None,
         }
     }
 
@@ -7104,6 +7207,7 @@ mod tests {
             assert_eq!(fs::read(&saved).unwrap(), b"body");
             let hit = back.files.iter().find(|file| file.path == "pkg/new.ts").unwrap();
             assert_eq!(hit.saved_path.as_deref(), Some(saved.display().to_string().as_str()));
+            assert_eq!(hit.saved_kind.as_deref(), Some(SAVED_DELETED_BACKUP));
 
             let proj = dir.path().join("proj-move");
             fs::create_dir_all(proj.join("src")).unwrap();
@@ -7125,6 +7229,7 @@ mod tests {
             assert_eq!(fs::read(&saved).unwrap(), b"AAA");
             let hit = back.files.iter().find(|file| file.path == "pkg/c.ts").unwrap();
             assert_eq!(hit.saved_path.as_deref(), Some(saved.display().to_string().as_str()));
+            assert_eq!(hit.saved_kind.as_deref(), Some(SAVED_DELETED_BACKUP));
         }
     }
 
@@ -7267,8 +7372,29 @@ mod tests {
             assert_eq!(fs::read(&saved).unwrap(), b"AAA");
             let hit = back.files.iter().find(|file| file.path == "pkg/c.ts").unwrap();
             assert_eq!(hit.saved_path.as_deref(), Some(saved.display().to_string().as_str()));
+            assert_eq!(hit.saved_kind.as_deref(), Some(SAVED_DELETED_BACKUP));
             assert_eq!(hit.state, "rolled-back");
         }
+    }
+
+    /// 普通移动复制前崩溃，用户改了原文件：备份当前后继续，结果指向 conflict-current 里的原路径，内容是用户的版本。
+    #[test]
+    fn plain_move_source_changed_before_copy_records_the_user_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        fs::create_dir_all(proj.join("src")).unwrap();
+        fs::write(proj.join("src/a.ts"), b"AAA").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(&proj);
+        let p = plan(vec![move_op("src/a.ts", "pkg/c.ts", b"AAA")]);
+        execute(&db, &fsys, &p, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
+        fs::write(proj.join("src/a.ts"), b"BBB").unwrap();
+        let back = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+        let saved = dir.path().join("bak").join(&p.id).join("conflict-current").join("src/a.ts");
+        assert_eq!(fs::read(&saved).unwrap(), b"BBB");
+        let hit = back.files.iter().find(|file| file.path == "pkg/c.ts").unwrap();
+        assert_eq!(hit.saved_path.as_deref(), Some(saved.display().to_string().as_str()));
+        assert_eq!(hit.saved_kind.as_deref(), Some(SAVED_USER));
     }
 
     /// 普通移动的源文件已经不在，目标内容却对不上：不搬走目标，用备份把原路径写回来，并记下冲突。
@@ -7330,6 +7456,7 @@ mod tests {
             keep_source: false,
             readonly: false,
             label: "移动".into(),
+            decision: None,
         };
         assert!(op.bytes.is_none());
         assert!(op.content_hash.as_ref().is_some_and(|hash| !hash.is_empty()));

@@ -82,6 +82,10 @@ footer { margin-top: auto; }
 .sheet.small { width: min(520px, 92vw); }
 .err { color: #d70015; white-space: pre-wrap; }
 .status { white-space: pre-wrap; margin: 0; padding: 8px 14px; background: white; border-bottom: 1px solid #ececf1; }
+.status p { margin: 0; }
+.saved-note { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.saved-note code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; word-break: break-all; }
+.saved-note button { border: 1px solid #d2d2d7; background: white; border-radius: 6px; padding: 2px 8px; }
 .history table { width: 100%; border-collapse: collapse; background: white; border-radius: 10px; overflow: hidden; }
 .history th, .history td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #f2f2f7; }
 .history .ok { color: #248a3d; }

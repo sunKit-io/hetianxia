@@ -36,6 +36,7 @@ fn main() {
         "load_file_picks",
         "save_file_picks",
         "read_ssh_config",
+        "reveal_backup",
     ]);
     if let Err(error) = tauri_build::try_build(tauri_build::Attributes::new().app_manifest(manifest)) {
         println!("{error:#}");

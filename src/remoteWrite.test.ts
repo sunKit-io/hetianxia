@@ -234,7 +234,7 @@ test("remotePlanFiles sends every checked file and the failure list stops at the
   assert.equal(remoteFileMark(report.files[2]), "未开始");
   assert.equal(remoteBatchFailure({ ...report, failedIndex: null, failedPath: null }), null);
   const app = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
-  assert.match(app, /remotePlanFiles\(source, pickedPaths, carried\)/);
+  assert.match(app, /remotePlanFiles\(source, pickedPaths, carried, keepLeft\)/);
   const writeStart = app.indexOf("onRemoteWrite");
   const writeSlice = app.slice(writeStart, app.indexOf('page === "history"', writeStart));
   assert.equal(writeSlice.includes("readSide"), false);

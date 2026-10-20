@@ -78,6 +78,8 @@ export type ExecPlan = {
     keepSource: boolean;
     readonly: boolean;
     label: string;
+    /** 二进制或超 1MB 选「保留左边」时为 keep_left：跳过写入，不备份。 */
+    decision?: "keep_left" | null;
   }>;
   summary: {
     create: number;
@@ -103,7 +105,7 @@ export type MergeDecision = "keepLeft" | "takeRight" | "both" | "bothRight";
 /** 和 read_side 一致：超过 1MB 不能当文本打开。正好 1MB 仍可以。 */
 export const TEXT_FILE_LIMIT = 1024 * 1024;
 
-export const BLOCKED_MERGE_HINT = "二进制文件或超过 1MB 的文件无法在这里编辑或合并，只能选「用左边」或「用右边」";
+export const BLOCKED_MERGE_HINT = "二进制文件或超过 1MB 的文件无法在这里编辑或合并。勾选会用升级包里的版本（先备份原文件）；想保留你自己的文件，选「保留左边」或取消勾选这一项。";
 
 export const BLOCKED_PREVIEW = "这个文件无法预览（二进制或超过 1MB）";
 
@@ -446,7 +448,8 @@ export async function execPlanFor(
     let sourceMtimeMs = file.sourceMtimeMs;
     let bytes: number[] | undefined;
     const wantsMerge = edited || (decision !== "takeRight" && decision !== undefined);
-    if ((file.kind === "overwrite" || file.kind === "create") && wantsMerge && isBlockedFile(file)) {
+    const keepOriginal = isBlockedFile(file) && decision === "keepLeft" && !edited && (file.kind === "overwrite" || file.kind === "create");
+    if ((file.kind === "overwrite" || file.kind === "create") && wantsMerge && isBlockedFile(file) && !keepOriginal) {
       throw new Error(mergeRefusedMessage(file.path));
     }
     if (!isBlockedFile(file) && (file.kind === "overwrite" || file.kind === "create") && wantsMerge) {
@@ -473,6 +476,7 @@ export async function execPlanFor(
       readonly: file.readonly,
       label: file.label,
     };
+    if (keepOriginal) op.decision = "keep_left";
     if (bytes) op.bytes = bytes;
     ops.push(op);
   }

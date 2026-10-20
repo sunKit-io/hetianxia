@@ -190,8 +190,17 @@ test("png and files over 1MB are not merged into the plan", async () => {
   assert.equal(png.files[0].binary, false);
   png.files[0].binary = true;
   noteBlockedFile("logo.png");
+  let mergedCalls = 0;
+  const kept = await execPlanFor(png, {}, { "logo.png": "keepLeft" }, async () => {
+    mergedCalls += 1;
+    return { text: "" };
+  }, "png");
+  assert.equal(mergedCalls, 0);
+  assert.equal(kept.ops[0].bytes, undefined);
+  assert.equal(kept.ops[0].merged, false);
+  assert.equal(kept.ops[0].decision, "keep_left");
   await assert.rejects(
-    () => execPlanFor(png, {}, { "logo.png": "keepLeft" }, async () => ({ text: "" }), "png"),
+    () => execPlanFor(png, {}, { "logo.png": "both" }, async () => ({ text: "" }), "png-both"),
     /logo\.png 无法合并/,
   );
   const streamed = await execPlanFor(png, {}, { "logo.png": "takeRight" }, async () => {
@@ -199,10 +208,13 @@ test("png and files over 1MB are not merged into the plan", async () => {
   }, "png-right");
   assert.equal(streamed.ops[0].bytes, undefined);
   assert.equal(streamed.ops[0].merged, false);
-  assert.equal(BLOCKED_MERGE_HINT, "二进制文件或超过 1MB 的文件无法在这里编辑或合并，只能选「用左边」或「用右边」");
+  assert.equal(BLOCKED_MERGE_HINT, "二进制文件或超过 1MB 的文件无法在这里编辑或合并。勾选会用升级包里的版本（先备份原文件）；想保留你自己的文件，选「保留左边」或取消勾选这一项。");
   assert.equal(BLOCKED_PREVIEW, "这个文件无法预览（二进制或超过 1MB）");
   const editor = readFileSync(new URL("./editor.tsx", import.meta.url), "utf8");
-  assert.match(editor, /title=\{blocked \? BLOCKED_MERGE_HINT/);
+  assert.match(editor, /onClick=\{\(\) => choose\("left"\)\}>保留左边</);
+  assert.match(editor, /disabled=\{blocked\} title=\{blocked \? BLOCKED_MERGE_HINT : undefined\} onClick=\{\(\) => choose\("both"\)\}>都保留</);
+  assert.match(editor, /disabled title=\{BLOCKED_MERGE_HINT\}>编辑</);
+  assert.match(editor, /下一版支持/);
   assert.match(editor, /\{BLOCKED_PREVIEW\}/);
   assert.match(editor, /bothRight/);
 });

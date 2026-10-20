@@ -732,3 +732,57 @@ pub fn commit_remote_overwrite(
     sftp::RemoteSession::commit_batch_blocking(&mut probe, &exec_id, app_data)
 }
 
+/// 备份路径必须落在本次运行的 bak 目录里。解析符号链接后再比较，避免指到目录外面。
+pub(crate) fn backup_contains(backup: &Path, target: &Path) -> Result<PathBuf, Error> {
+    let root = backup.canonicalize().map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
+    if !target.exists() {
+        return Err(Error::new(ErrorCode::NotFound, "备份文件不在了"));
+    }
+    let canon = target.canonicalize().map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
+    if !canon.starts_with(&root) {
+        return Err(Error::new(ErrorCode::InvalidLocation, "只能显示备份目录里的文件"));
+    }
+    Ok(canon)
+}
+
+fn reveal_in_file_manager(path: &Path) -> Result<(), Error> {
+    let status = reveal_command(path)
+        .status()
+        .map_err(|err| Error::new(ErrorCode::Io, format!("无法在文件管理器中显示：{err}")))?;
+    if !status.success() {
+        return Err(Error::new(ErrorCode::Io, "无法在文件管理器中显示"));
+    }
+    Ok(())
+}
+
+fn reveal_command(path: &Path) -> std::process::Command {
+    // 和 tauri-plugin-opener 的 reveal_item_in_dir 一样：macOS 用 Finder 的 open -R。
+    // 不挂 shell / opener 插件，能力表里也就没有 shell: 或 fs:。调用方先用 backup_contains 收窄路径。
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = std::process::Command::new("open");
+        cmd.arg("-R").arg(path);
+        return cmd;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = std::process::Command::new("explorer");
+        cmd.arg(format!("/select,{}", path.display()));
+        return cmd;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let mut cmd = std::process::Command::new("xdg-open");
+        let parent = path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(path);
+        cmd.arg(parent);
+        cmd
+    }
+}
+
+#[tauri::command]
+pub fn reveal_backup(session: tauri::State<crate::Session>, path: String) -> Result<(), Error> {
+    ready(&session)?;
+    let canon = backup_contains(&session.backup_root, Path::new(&path))?;
+    reveal_in_file_manager(&canon)
+}
+

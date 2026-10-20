@@ -573,6 +573,7 @@ mod tests {
                     _ => "覆盖",
                 }
                 .into(),
+                decision: None,
                 content_hash: file.content_sha256.clone(),
                 size: file.right_size,
                 source: Some(ContentSource {

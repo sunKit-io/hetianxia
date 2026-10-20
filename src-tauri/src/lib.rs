@@ -146,6 +146,7 @@ pub fn run() {
             commands::load_file_picks,
             commands::save_file_picks,
             commands::read_ssh_config,
+            commands::reveal_backup,
         ])
         .build(tauri::generate_context!())
         .expect("合天下启动失败")
@@ -298,7 +299,28 @@ mod tests {
         assert!(caps.contains("allow-execute"));
         assert!(caps.contains("allow-journal-runs"));
         assert!(caps.contains("allow-rollback-preview"));
+        assert!(caps.contains("allow-reveal-backup"));
         assert!(caps.contains("core:default"));
+        assert!(include_str!("commands.rs").contains("\"-R\""));
+    }
+
+    #[test]
+    fn reveal_backup_stays_inside_the_backup_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let bak = dir.path().join("bak");
+        let outside = dir.path().join("proj");
+        std::fs::create_dir(&bak).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let kept = bak.join("conflict-current");
+        std::fs::create_dir(&kept).unwrap();
+        let file = kept.join("a.ts");
+        std::fs::write(&file, b"BBB").unwrap();
+        let outside_file = outside.join("a.ts");
+        std::fs::write(&outside_file, b"no").unwrap();
+        let shown = commands::backup_contains(&bak, &file).unwrap();
+        assert!(shown.ends_with("a.ts"));
+        assert!(commands::backup_contains(&bak, &outside_file).is_err());
+        assert!(commands::backup_contains(&bak, &bak.join("missing.ts")).is_err());
     }
 
     #[test]
@@ -351,6 +373,7 @@ mod tests {
                 keep_source: false,
                 readonly: false,
                 label: "覆盖".into(),
+                decision: None,
             }],
             summary: Summary { overwrite: 1, ..Summary::default() },
         };
@@ -442,6 +465,7 @@ mod tests {
                 keep_source: false,
                 readonly: false,
                 label: "覆盖".into(),
+                decision: None,
             }],
             summary: Summary { overwrite: 1, ..Summary::default() },
         }

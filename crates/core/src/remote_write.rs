@@ -601,6 +601,7 @@ pub fn materialize_batch_file(db: &rusqlite::Connection, file: StoredBatchFile) 
             keep_source: false,
             readonly: false,
             label: String::new(),
+            decision: None,
             content_hash: Some(file.content_sha256.clone()),
             size: Some(file.size),
             source: Some(source),

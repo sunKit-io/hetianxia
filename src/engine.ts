@@ -2,6 +2,10 @@ import type { ResumeChoice } from "./choices";
 
 /** 和核心 ExecReport / ResumeOutcome 的 camelCase 序列化一致。 */
 
+export type SavedKind = "user" | "deleted_backup";
+
+export type SavedCopy = { path: string; kind?: string | null };
+
 export type FileResult = {
   index: number;
   path: string;
@@ -10,10 +14,35 @@ export type FileResult = {
   error?: string | null;
   code?: string | null;
   savedPath?: string | null;
+  savedKind?: string | null;
+  savedFiles?: SavedCopy[] | null;
 };
 
+export function savedPathSentence(path: string, kind?: string | null): string {
+  if (kind === "deleted_backup") return `已删除，删除前备份在 ${path}`;
+  return `你的文件已存到 ${path}`;
+}
+
 export function keptFileNote(savedPath: string): string {
-  return `你的文件已存到 ${savedPath}`;
+  return savedPathSentence(savedPath, "user");
+}
+
+export function deletedBackupNote(path: string): string {
+  return savedPathSentence(path, "deleted_backup");
+}
+
+/** 缺省种类按用户自己的文件。多条时每条用自己的种类。 */
+export function backupNotes(file: Pick<FileResult, "savedPath" | "savedKind" | "savedFiles">): Array<{ path: string; kind: SavedKind }> {
+  if (file.savedFiles && file.savedFiles.length > 0) {
+    return file.savedFiles.filter((item) => item.path).map((item) => ({
+      path: item.path,
+      kind: item.kind === "deleted_backup" ? "deleted_backup" : "user",
+    }));
+  }
+  if (file.savedPath) {
+    return [{ path: file.savedPath, kind: file.savedKind === "deleted_backup" ? "deleted_backup" : "user" }];
+  }
+  return [];
 }
 
 export type ExecReport = {
@@ -112,12 +141,17 @@ const FILE_STATE: Record<string, string> = {
   doing: "进行中",
   pending: "未开始",
   conflict: "有冲突",
+  kept: "已保留原文件",
 };
 
+function savedSentences(file: Pick<FileResult, "savedPath" | "savedKind" | "savedFiles">): string {
+  return backupNotes(file).map((note) => savedPathSentence(note.path, note.kind)).join(" · ");
+}
+
 /** 执行结果列表：状态用中文，错误码原样保留。 */
-export function formatFileResult(file: Pick<FileResult, "state" | "code" | "error" | "savedPath">): string {
+export function formatFileResult(file: Pick<FileResult, "state" | "code" | "error" | "savedPath" | "savedKind" | "savedFiles">): string {
   const state = FILE_STATE[file.state] ?? file.state;
-  const kept = file.savedPath ? keptFileNote(file.savedPath) : "";
+  const kept = savedSentences(file);
   return [state, file.code, file.error, kept].filter(Boolean).join(" · ");
 }
 
@@ -125,7 +159,7 @@ export function formatReport(report: ExecReport): string {
   const head = report.historyResult ? `${report.state} · ${report.historyResult}` : report.state;
   const lines = [head];
   for (const file of report.files) {
-    const kept = file.savedPath ? keptFileNote(file.savedPath) : "";
+    const kept = savedSentences(file);
     if (!file.code && !file.error && !kept) continue;
     const bits = [file.path];
     if (file.code) bits.push(engineCode(file.code));

@@ -133,9 +133,12 @@ export function DiffEditor({
       setLeftText("");
       setRightBase("");
       setBlocked(true);
-      setChoice("right");
       noteBlockedFile(file);
-      rememberDecision(file, "takeRight");
+      if (fileDecision(file) === "keepLeft") setChoice("left");
+      else {
+        setChoice("right");
+        rememberDecision(file, "takeRight");
+      }
       reportFlowStatus(formatEngineError(err));
     });
     return () => {
@@ -222,7 +225,7 @@ export function DiffEditor({
   };
 
   const choose = (next: "left" | "right" | "both") => {
-    if (blocked && next !== "right") return;
+    if (blocked && next === "both") return;
     setChoice(next);
     if (currentFile) rememberDecision(currentFile, decisionOf(next, bothOrder));
   };
@@ -256,7 +259,7 @@ export function DiffEditor({
     <div className="editorwrap" data-merge={choice} data-order={bothOrder}>
       <div className="filebar">
         <button className={choice === "right" ? "on" : ""} onClick={() => choose("right")}>全部用右边</button>
-        <button className={choice === "left" ? "on" : ""} disabled={blocked} title={blocked ? BLOCKED_MERGE_HINT : undefined} onClick={() => choose("left")}>全部保留左边</button>
+        <button className={choice === "left" ? "on" : ""} onClick={() => choose("left")}>全部保留左边</button>
         <button onClick={reset}>全部恢复</button>
       </div>
       <div className="editor">
@@ -264,8 +267,11 @@ export function DiffEditor({
         <div className="gutterbar">
           <b>中间工具条</b>
           <button className={choice === "right" ? "on" : ""} onClick={() => choose("right")}>用右边</button>
-          <button className={choice === "left" ? "on" : ""} disabled={blocked} title={blocked ? BLOCKED_MERGE_HINT : undefined} onClick={() => choose("left")}>保留左边</button>
+          <button className={choice === "left" ? "on" : ""} onClick={() => choose("left")}>保留左边</button>
           <button className={choice === "both" ? "on" : ""} disabled={blocked} title={blocked ? BLOCKED_MERGE_HINT : undefined} onClick={() => choose("both")}>都保留</button>
+          {blocked && <span className="soon">下一版支持</span>}
+          {blocked && <button type="button" disabled title={BLOCKED_MERGE_HINT}>编辑</button>}
+          {blocked && <span className="soon">下一版支持</span>}
           <button onClick={reset}>恢复</button>
           {choice === "both" && !blocked && (
             <div className="bothorder" role="group" aria-label="都保留的先后">

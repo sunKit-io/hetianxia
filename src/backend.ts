@@ -36,6 +36,11 @@ export function appBakDir() {
   return invoke<string>("app_bak_dir");
 }
 
+/** 在 Finder（或其他系统的文件管理器）里显示备份文件。只接受 bak 目录里的路径。 */
+export function revealBackup(path: string) {
+  return invoke<void>("reveal_backup", { path });
+}
+
 export type SavedConnection = {
   id: string;
   name: string;
