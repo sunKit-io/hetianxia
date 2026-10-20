@@ -69,6 +69,8 @@ export type ExecPlan = {
     contentHash: string | null;
     size: number | null;
     source: PackageSource | null;
+    /** 编辑或合并后的内容。没有这项时按升级包流式读取，不在这里放包内原始字节。 */
+    bytes?: number[] | null;
     expect: PlannedFile["expect"];
     mode: null;
     sourceMtimeMs: number | null;

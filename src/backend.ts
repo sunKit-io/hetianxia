@@ -4,7 +4,7 @@ import type { ResumeChoice, RollbackChoice } from "./choices";
 import { parseResume, type ExecReport, type RecoveryOffer, type ResumeView } from "./engine";
 import type { ExecuteConfirm } from "./confirmExecute";
 import type { ExecPlan, SideText, TextDoc } from "./localPlan";
-import type { RemoteBatchReport } from "./remoteWrite";
+import type { RemoteBatchFile, RemoteBatchReport } from "./remoteWrite";
 
 export function rollbackRun(execId: string, choice: RollbackChoice) {
   return invoke<ExecReport>("rollback_run", { execId, choice });
@@ -102,7 +102,7 @@ export function deleteSshSecret(account: string) {
   return invoke<void>("delete_ssh_secret", { account });
 }
 
-export function remoteWritePrompt(connectionId: string, files: { remotePath: string; content: number[] }[]) {
+export function remoteWritePrompt(connectionId: string, files: RemoteBatchFile[]) {
   return invoke<RemoteWritePrompt>("remote_write_prompt", { connectionId, files });
 }
 

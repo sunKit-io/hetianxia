@@ -11,7 +11,7 @@ use hetianxia_core::scan::{self, ScanOptions, ScanOutput};
 use hetianxia_core::secrets::{self, KeyringStore, SecretStatus, SecretStore};
 use hetianxia_core::connections::{self, SavedConnection};
 use hetianxia_core::remote_browse;
-use hetianxia_core::remote_write::{self, BatchFileInput, BatchPromptInput, RemoteBatchReport, RemoteWritePrompt};
+use hetianxia_core::remote_write::{self, RemoteBatchReport, RemoteWritePrompt, UploadBatch, UploadFile};
 use hetianxia_core::sftp::{self, ProbeReport, ProbeRequest};
 use hetianxia_core::vfs::LocalFs;
 use std::path::{Path, PathBuf};
@@ -603,7 +603,15 @@ pub fn read_ssh_config() -> Result<Vec<ImportedHost>, Error> {
 #[serde(rename_all = "camelCase")]
 pub struct RemotePromptFile {
     pub remote_path: String,
-    pub content: Vec<u8>,
+    pub path: String,
+    #[serde(default)]
+    pub bytes: Option<Vec<u8>>,
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default)]
+    pub source: Option<hetianxia_core::model::ContentSource>,
 }
 
 #[tauri::command]
@@ -628,15 +636,18 @@ pub fn remote_write_prompt(
         return Err(Error::new(ErrorCode::InvalidState, "至少选一个文件"));
     }
     let mut normalized = Vec::new();
-    for file in &files {
+    for file in files {
         let remote_path = connections::path_inside_remote_root(saved.remote_root.as_deref(), &file.remote_path)?;
-        normalized.push((remote_path, file.content.clone()));
+        normalized.push(UploadFile {
+            remote_path,
+            path: file.path,
+            bytes: file.bytes,
+            content_hash: file.content_hash,
+            size: file.size,
+            source: file.source,
+        });
     }
-    let batch: Vec<BatchFileInput<'_>> = normalized
-        .iter()
-        .map(|(remote_path, content)| BatchFileInput { remote_path, content, content_sha256: None })
-        .collect();
-    let input = BatchPromptInput {
+    let input = UploadBatch {
         host: &saved.host,
         port: saved.port,
         user: &saved.user,
@@ -644,9 +655,9 @@ pub fn remote_write_prompt(
         fingerprint: &saved.fingerprint,
         account: Some(saved.id.as_str()),
         key_path: key_path.as_deref(),
-        files: &batch,
+        files: &normalized,
     };
-    remote_write::issue_batch_prompt(&app_data, &input)
+    remote_write::issue_upload(&app_data, &input)
 }
 
 #[derive(serde::Serialize)]

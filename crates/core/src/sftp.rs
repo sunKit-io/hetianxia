@@ -578,6 +578,7 @@ impl RemoteSession {
             return Err(Error::new(ErrorCode::InvalidState, "写入确认和主机不一致"));
         }
         lock_commit_fingerprint(req, &granted.fingerprint);
+        let db_path = req.db_path.clone();
         let host = granted.host.clone();
         let user = granted.user.clone();
         let port = granted.port;
@@ -595,6 +596,13 @@ impl RemoteSession {
             let mut failed = None;
             let mut backed_up = vec![false; paths.len()];
             for (index, file) in granted.files.into_iter().enumerate() {
+                let file = match exec::open_db(Path::new(&db_path)).and_then(|db| crate::remote_write::materialize_batch_file(&db, file)) {
+                    Ok(file) => file,
+                    Err(err) => {
+                        failed = Some((index, err.code_str().to_string()));
+                        break;
+                    }
+                };
                 let write = match crate::remote_write::request_from_stored(
                     exec_id,
                     &app_data_dir,

@@ -98,6 +98,7 @@ test("currentRemotePlan joins remoteRoot with the relative path and keeps edits"
 });
 
 function planned(path: string, text: string, kind: PlannedFile["kind"] = "overwrite"): PlannedFile {
+  const size = new TextEncoder().encode(text).length;
   return {
     path,
     kind,
@@ -107,11 +108,13 @@ function planned(path: string, text: string, kind: PlannedFile["kind"] = "overwr
     binary: false,
     leftText: "old\n",
     rightText: text,
-    bytes: Array.from(new TextEncoder().encode(text)),
     from: null,
     expect: null,
     sourceMtimeMs: null,
     keepSource: false,
+    contentHash: kind === "delete" ? null : "ab".repeat(32),
+    size: kind === "delete" ? null : size,
+    source: kind === "delete" ? null : { scanId: "scan-1", kind: "dir", entry: path },
   };
 }
 
@@ -127,10 +130,17 @@ test("remotePlanFiles sends every checked file and the failure list stops at the
   const all = remotePlanFiles(plan, new Set(["a.txt", "b.txt", "c.txt"]));
   assert.equal(all.error, null);
   assert.deepEqual(all.files.map((file) => file.remotePath), ["/srv/site/a.txt", "/srv/site/b.txt", "/srv/site/c.txt"]);
+  assert.equal(all.files.every((file) => file.bytes == null), true);
+  assert.equal(all.files[0]?.contentHash, "ab".repeat(32));
+  assert.equal(all.files[0]?.size, 2);
+  assert.deepEqual(all.files[0]?.source, { scanId: "scan-1", kind: "dir", entry: "a.txt" });
   assert.equal(currentRemotePlan()?.remotePath, "/srv/site/a.txt");
   rememberEdit("b.txt", "edited\n", "B\n");
   const edited = remotePlanFiles(plan, new Set(["b.txt"]));
-  assert.deepEqual(edited.files[0]?.content, Array.from(new TextEncoder().encode("edited\n")));
+  assert.deepEqual(edited.files[0]?.bytes, Array.from(new TextEncoder().encode("edited\n")));
+  assert.equal(edited.files[0]?.contentHash, null);
+  const carried = remotePlanFiles(plan, new Set(["b.txt"]), { "b.txt": [9, 9, 9] });
+  assert.deepEqual(carried.files[0]?.bytes, [9, 9, 9]);
   const skipped = remotePlanFiles(plan, new Set(["a.txt", "c.txt"]));
   assert.deepEqual(skipped.files.map((file) => file.remotePath), ["/srv/site/a.txt", "/srv/site/c.txt"]);
   const blocked = remotePlanFiles(plan, new Set(["a.txt", "gone.txt"]));
@@ -199,7 +209,12 @@ test("remotePlanFiles sends every checked file and the failure list stops at the
   assert.equal(remoteFileMark(report.files[2]), "未开始");
   assert.equal(remoteBatchFailure({ ...report, failedIndex: null, failedPath: null }), null);
   const app = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
-  assert.match(app, /remotePlanFiles\(plan, pickedPaths\)/);
+  assert.match(app, /remotePlanFiles\(source, pickedPaths, carried\)/);
+  const writeStart = app.indexOf("onRemoteWrite");
+  const writeSlice = app.slice(writeStart, app.indexOf('page === "history"', writeStart));
+  assert.equal(writeSlice.includes("readSide"), false);
+  assert.equal(writeSlice.includes("TextEncoder"), false);
+  assert.match(writeSlice, /execPlanFor\(source, edits, decisionMap\(\), mergeTexts, "remote"\)/);
   assert.match(app, /remoteWritePrompt\(selected\.id, pickedFiles\.files\)/);
   assert.match(app, /remoteBatchFailure\(report\)/);
   assert.match(app, /remoteFileMark\(file\)/);

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Server, ShieldAlert, KeyRound, AlertTriangle } from "lucide-react";
-import { appBakDir, clearConnectionFingerprint, commitRemoteOverwrite, confirmExecute, deleteConnection, deleteSshSecret, executeLocal, journalRuns, listConnections, listRemoteDirs, loadFilePicks, mergeTexts, pickProjectDirectory, pickUpgradeDirectory, pickUpgradeZip, readSide, remoteWritePrompt, rollbackPreview, rollbackRun, resumeRun, saveConnection, saveFilePicks, saveSshSecret, scanPair, sshSecretStatus, startupFailure, startupOffers, testConnection, type JournalRun, type ProbeReport, type SavedConnection } from "./backend";
+import { appBakDir, clearConnectionFingerprint, commitRemoteOverwrite, confirmExecute, deleteConnection, deleteSshSecret, executeLocal, journalRuns, listConnections, listRemoteDirs, loadFilePicks, mergeTexts, pickProjectDirectory, pickUpgradeDirectory, pickUpgradeZip, remoteWritePrompt, rollbackPreview, rollbackRun, resumeRun, saveConnection, saveFilePicks, saveSshSecret, scanPair, sshSecretStatus, startupFailure, startupOffers, testConnection, type JournalRun, type ProbeReport, type SavedConnection } from "./backend";
 import { browseCrumbs, joinChild } from "./remoteBrowse";
 import { invertPicked, pickedFromSkipped, skippedOf } from "./filePicks";
 import { confirmExecuteBody, settleExecuteConfirm, type ExecuteConfirm } from "./confirmExecute";
@@ -412,24 +412,26 @@ export function App() {
             onRemoteWrite={() => {
               const source = plan;
               void (async () => {
-              const plan = source && packagePath ? {
-                ...source,
-                files: await Promise.all(source.files.map(async (file) => {
-                  if (file.bytes || file.kind === "delete" || !pickedPaths.has(file.path.replace(/\\/g, "/"))) return file;
-                  try {
-                    const side = await readSide(packagePath, file.path);
-                    if (!side.present || side.binary) return file;
-                    return { ...file, rightText: side.text, bytes: Array.from(new TextEncoder().encode(side.text)) };
-                  } catch {
-                    return file;
-                  }
-                })),
-              } : source;
-              const pickedFiles = remotePlanFiles(plan, pickedPaths);
               if (!selected) {
                 setStatus("先保存并选择一个连接");
                 return;
               }
+              if (!source) {
+                setStatus("还没有选中的计划文件");
+                return;
+              }
+              const edits = editedContents();
+              let carried: Record<string, number[]> = {};
+              try {
+                const exec = await execPlanFor(source, edits, decisionMap(), mergeTexts, "remote");
+                for (const op of exec.ops) {
+                  if (op.bytes != null) carried[op.path.replace(/\\/g, "/")] = op.bytes;
+                }
+              } catch (err) {
+                setStatus(formatEngineError(err));
+                return;
+              }
+              const pickedFiles = remotePlanFiles(source, pickedPaths, carried);
               if (pickedFiles.error) {
                 setStatus(pickedFiles.error);
                 return;

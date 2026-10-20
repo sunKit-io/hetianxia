@@ -1,4 +1,4 @@
-import { editedContents, shownFilePayload, type LocalPlan } from "./localPlan.ts";
+import { editedContents, shownFilePayload, type LocalPlan, type PackageSource } from "./localPlan.ts";
 
 export const DIALOG_TITLE = "远程写入暂不支持回滚";
 export const CANCEL_LABEL = "取消";
@@ -132,7 +132,12 @@ export function currentRemotePlan(): RemotePlanFile | null {
 
 export type RemoteBatchFile = {
   remotePath: string;
-  content: number[];
+  path: string;
+  /** 编辑或合并后的内容。未编辑是 null，后端按路径、哈希和大小从升级包流式读取。 */
+  bytes: number[] | null;
+  contentHash: string | null;
+  size: number | null;
+  source: PackageSource | null;
 };
 
 export type RemoteFileOutcome = {
@@ -152,8 +157,14 @@ export type RemoteBatchReport = {
   files: RemoteFileOutcome[];
 };
 
-/** 勾选的计划文件全部送去写。打开中的那一个文件不再代表整份计划。 */
-export function remotePlanFiles(plan: LocalPlan | null, picked: ReadonlySet<string>): { files: RemoteBatchFile[]; error: string | null } {
+/** 勾选的计划文件全部送去写。打开中的那一个文件不再代表整份计划。
+ * `carried` 是执行计划里已经带上的编辑或合并内容，和 `execPlanFor` 的 `bytes` 是同一项。
+ */
+export function remotePlanFiles(
+  plan: LocalPlan | null,
+  picked: ReadonlySet<string>,
+  carried?: Readonly<Record<string, number[]>>,
+): { files: RemoteBatchFile[]; error: string | null } {
   if (!plan) return { files: [], error: null };
   const edited = editedContents();
   const files: RemoteBatchFile[] = [];
@@ -163,13 +174,29 @@ export function remotePlanFiles(plan: LocalPlan | null, picked: ReadonlySet<stri
     if (file.kind === "delete") return { files: [], error: `远程写入还不能删除：${rel}` };
     const remotePath = joinRemote(remoteRoot, rel);
     if (!remotePath) return { files: [], error: `远程路径越出了远程目录：${rel}` };
-    const content = Object.prototype.hasOwnProperty.call(edited, file.path)
-      ? Array.from(new TextEncoder().encode(edited[file.path]))
-      : file.bytes
-        ? file.bytes.slice()
-        : null;
-    if (!content) return { files: [], error: `远程写入还没有读到 ${rel} 的内容` };
-    files.push({ remotePath, content });
+    const fromPlan = carried?.[rel] ?? carried?.[file.path];
+    const bytes = fromPlan != null
+      ? fromPlan.slice()
+      : Object.prototype.hasOwnProperty.call(edited, file.path)
+        ? Array.from(new TextEncoder().encode(edited[file.path]))
+        : Object.prototype.hasOwnProperty.call(edited, rel)
+          ? Array.from(new TextEncoder().encode(edited[rel]))
+          : null;
+    if (bytes) {
+      files.push({ remotePath, path: rel, bytes, contentHash: null, size: bytes.length, source: null });
+      continue;
+    }
+    if (!file.contentHash || file.size == null || !file.source) {
+      return { files: [], error: `计划里没有 ${rel} 的哈希或大小，请重新扫描` };
+    }
+    files.push({
+      remotePath,
+      path: rel,
+      bytes: null,
+      contentHash: file.contentHash,
+      size: file.size,
+      source: file.source,
+    });
   }
   return { files, error: null };
 }
