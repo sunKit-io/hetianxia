@@ -705,7 +705,7 @@ function PreviewPage({
   onRemoteWrite: () => void;
 }) {
   const [target, setTarget] = useState<"local" | "remote">("local");
-  const counts = useMemo(() => previewCounts(plan?.files ?? [], allowReadonly), [plan, allowReadonly]);
+  const counts = useMemo(() => previewCounts(plan ? selectedPlan(plan, picked).files : [], allowReadonly), [plan, picked, allowReadonly]);
   const summary = selectionSummary(plan?.files ?? [], picked);
   const allPaths = (plan?.files ?? []).map((file) => file.path.replace(/\\/g, "/"));
   const allState = checkState(allPaths, picked);

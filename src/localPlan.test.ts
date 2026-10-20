@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { applyCheck, buildLocalPlan, checkState, execPlanFor, filePathsUnder, planListRows, previewCounts, selectedPlan, selectionSummary, textDocToString, textsFromDiff, type ScanFile, type SideText } from "./localPlan.ts";
 
@@ -154,4 +155,34 @@ test("directory checks include nested files and the stored plan keeps one move r
   assert.equal(exec.summary.moveCount, 1);
   assert.equal(exec.summary.create, 0);
   assert.equal(exec.summary.overwrite, 0);
+});
+
+test("preview header counts follow the checked plan", async () => {
+  const plan = await buildLocalPlan({
+    projectRoot: "/work/demo",
+    packagePath: "/tmp/pkg",
+    files: [
+      { rel: "new.txt", status: "added" },
+      { rel: "app.txt", status: "modified" },
+      { rel: "old.txt", status: "moved", message: "move-source", movedTo: "renamed.txt" },
+      { rel: "renamed.txt", status: "moved", movedFrom: "old.txt" },
+    ],
+    async read() {
+      return side("same\n");
+    },
+    async mergeText(_left, right) {
+      return { text: right };
+    },
+  });
+  const all = previewCounts(plan.files, false);
+  assert.equal(all.create, 1);
+  assert.equal(all.overwrite, 1);
+  assert.equal(all.move, 1);
+  const checked = previewCounts(selectedPlan(plan, new Set(["new.txt", "renamed.txt"])).files, false);
+  assert.equal(checked.create, 1);
+  assert.equal(checked.overwrite, 0);
+  assert.equal(checked.move, 1);
+  const app = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+  const preview = app.slice(app.indexOf("function PreviewPage"), app.indexOf("function ExecuteConfirmSheet"));
+  assert.match(preview, /previewCounts\(plan \? selectedPlan\(plan, picked\)\.files : \[\]/);
 });
