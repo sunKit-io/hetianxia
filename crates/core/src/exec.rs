@@ -2386,12 +2386,14 @@ pub fn rollback(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: 
         if !op_touched(row) {
             continue;
         }
-        // 新增和移动的 written 还没记下时，不能一律跳过。
+        // 新增，以及「移动（保留旧文件）」：written 还没记下时不能一律跳过。
         // 目标不在：这次没写出来，记成已回滚。
         // 目标和计划的大小、哈希一致：改名已经落地、只是还没来得及记 written。先备份到
         // conflict-current，再删掉，回滚才能结束。备份失败就不删。
         // 目标对不上：那是用户的文件，绝不删除，并在结果里写明保留原因。
-        if !row.written && matches!(op.kind, OpKind::Create | OpKind::Move) {
+        // 普通移动不走这里。目标上的文件就是用户原来的文件，删掉它不会把原路径写回来。
+        // 交给 undo_move：目标在就改回原路径；目标不在、原路径还在，就当作还没做完。
+        if !row.written && (op.kind == OpKind::Create || (op.kind == OpKind::Move && op.keep_source)) {
             match unwritten_placed_file(fsys, op)? {
                 UnwrittenTarget::Missing => {
                     mark_rollback_done(db, exec_id, op.index)?;
@@ -6780,6 +6782,33 @@ mod tests {
             assert_eq!(fs::read(proj.join("src/a.ts")).unwrap(), b"AAA");
             let saved = dir.path().join("bak").join(&moved.id).join("conflict-current").join("pkg/c.ts");
             assert_eq!(fs::read(saved).unwrap(), b"AAA");
+        }
+    }
+
+    /// 普通移动已经把文件改到新路径，written 还没记下：回滚把文件改回原路径，不删成只留在备份里。
+    #[test]
+    fn rollback_plain_move_renamed_before_written_flag_restores_the_source() {
+        for streamed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let proj = dir.path().join("proj");
+            fs::create_dir_all(proj.join("src")).unwrap();
+            fs::write(proj.join("src/a.ts"), b"AAA").unwrap();
+            let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+            let fsys = LocalFs::new(&proj);
+            let mut op = move_op("src/a.ts", "pkg/c.ts", b"AAA");
+            if streamed {
+                op = as_streamed(op);
+            }
+            let p = plan(vec![op]);
+            execute(&db, &fsys, &p, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
+            fs::create_dir_all(proj.join("pkg")).unwrap();
+            fs::rename(proj.join("src/a.ts"), proj.join("pkg/c.ts")).unwrap();
+            assert!(!proj.join("src/a.ts").exists());
+            let back = rollback(&db, &fsys, &p.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+            assert_eq!(back.state, "ROLLED_BACK", "streamed={streamed} {:?}", back.files);
+            assert_eq!(journal_state(&db, &p.id), "ROLLED_BACK");
+            assert_eq!(fs::read(proj.join("src/a.ts")).unwrap(), b"AAA");
+            assert!(!proj.join("pkg/c.ts").exists());
         }
     }
 
