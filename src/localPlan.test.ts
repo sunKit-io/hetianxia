@@ -168,3 +168,22 @@ test("preview header counts follow the checked plan", async () => {
   const preview = app.slice(app.indexOf("function PreviewPage"), app.indexOf("function ExecuteConfirmSheet"));
   assert.match(preview, /previewCounts\(plan \? selectedPlan\(plan, picked\)\.files : \[\]/);
 });
+
+test("move source and destination reject dotdot and absolute paths", async () => {
+  const base = {
+    projectRoot: "/work/demo",
+    packagePath: "/tmp/pkg",
+    scanId: "scan-move",
+    packageKind: "dir" as const,
+  };
+  for (const rel of ["../escape.txt", "/tmp/escape.txt", "a/../../b.txt"]) {
+    assert.throws(() => buildLocalPlan({ ...base, files: [scanned(rel, "moved", { movedFrom: "old.txt" })] }), /路径穿越|非法路径/);
+  }
+  for (const from of ["../old.txt", "/etc/passwd", "a\\..\\x"]) {
+    assert.throws(() => buildLocalPlan({ ...base, files: [scanned("new.txt", "moved", { movedFrom: from })] }), /路径穿越|非法路径/);
+  }
+  const plan = buildLocalPlan({ ...base, files: [scanned("dir/new.txt", "moved", { movedFrom: "dir/old.txt" })] });
+  assert.equal(plan.files[0]?.from, "dir/old.txt");
+  plan.files[0]!.from = "../old.txt";
+  await assert.rejects(() => execPlanFor(plan, {}, {}, async () => ({ text: "" }), "bad-move"), /路径穿越/);
+});

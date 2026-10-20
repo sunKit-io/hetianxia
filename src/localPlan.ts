@@ -313,6 +313,30 @@ export function firstTextFile(plan: LocalPlan): string | null {
   return text?.path ?? plan.files[0]?.path ?? null;
 }
 
+/** 和执行器的相对路径规则一致：拒绝 `..`、绝对路径和盘符。 */
+export function movePathProblem(raw: string): string | null {
+  const text = raw.trim();
+  if (!text) return "空路径";
+  if (text.startsWith("/") || text.startsWith("~") || text.includes("\\") || text.includes("\0") || text.includes(":")) {
+    return `非法路径 ${raw}`;
+  }
+  const trimmed = text.replace(/^\/+|\/+$/g, "");
+  if (!trimmed) return "空路径";
+  for (const part of trimmed.split("/")) {
+    if (part === "" || part === "." || part === "..") return `路径穿越 ${raw}`;
+  }
+  return null;
+}
+
+function assertMovePaths(path: string, from: string | null) {
+  const dest = movePathProblem(path);
+  if (dest) throw new Error(dest);
+  if (from != null && from !== "") {
+    const src = movePathProblem(from);
+    if (src) throw new Error(src);
+  }
+}
+
 function expectOf(file: ScanFile, kind: PlannedFile["kind"]): PlannedFile["expect"] {
   if (kind === "create") return null;
   if (file.leftSize == null || !file.leftSha256) return null;
@@ -332,6 +356,7 @@ export function buildLocalPlan(args: {
     if (file.message === "move-source") continue;
     if (file.status === "same" || file.status === "symlink" || file.status === "error" || file.status === "extra") continue;
     const kind = file.status === "added" ? "create" : file.status === "moved" ? "move" : file.status === "delete" ? "delete" : "overwrite";
+    if (kind === "move") assertMovePaths(file.rel, file.movedFrom ?? null);
     const entry = file.entryName || file.rel;
     const source = kind === "delete" || !args.scanId ? null : { scanId: args.scanId, kind: args.packageKind, entry };
     const label = kind === "create" ? "升级包" : kind === "move" ? "移动（保留旧文件）" : kind === "delete" ? "删除" : "覆盖";
@@ -370,6 +395,7 @@ export async function execPlanFor(
 ): Promise<ExecPlan> {
   const ops: ExecPlan["ops"] = [];
   for (const [index, file] of plan.files.entries()) {
+    if (file.kind === "move") assertMovePaths(file.path, file.from);
     ops.push({
       index: index + 1,
       kind: file.kind,

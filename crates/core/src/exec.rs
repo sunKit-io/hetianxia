@@ -1259,7 +1259,22 @@ pub fn begin_run(db: &Connection, _passed_root: &LocalFs, data_dir: &Path) -> Re
     }
 }
 
+/// 移动的源路径和目标路径都走 `RelPath`：拒绝 `..` 和绝对路径。在写日志和动文件之前调用。
+fn reject_unsafe_move_paths(plan: &ExecPlan) -> Result<()> {
+    for op in &plan.ops {
+        if op.kind != OpKind::Move {
+            continue;
+        }
+        RelPath::parse(&op.path)?;
+        if let Some(from) = &op.from {
+            RelPath::parse(from)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn execute(db: &Connection, fsys: &LocalFs, plan: &ExecPlan, opts: &ExecOpts, fault: FaultPlan) -> Result<ExecReport> {
+    reject_unsafe_move_paths(plan)?;
     if opts.remote {
         return Err(crate::remote::remote_write_unsupported());
     }
@@ -1955,6 +1970,7 @@ pub fn occupied_targets(fsys: &LocalFs, ops: &[PlanOp], allow_readonly: bool) ->
 
 /// 记下一次性确认令牌。不创建备份目录，也不写项目文件。
 pub fn issue_execute_confirm(db: &Connection, backup_root: &Path, fsys: &LocalFs, plan: &ExecPlan, allow_readonly: bool) -> Result<ExecuteConfirm> {
+    reject_unsafe_move_paths(plan)?;
     if plan.id.trim().is_empty() {
         return Err(Error::new(ErrorCode::InvalidState, "执行编号是空的"));
     }
@@ -5333,6 +5349,36 @@ mod tests {
             readonly: false,
             label: "移动".into(),
         }
+    }
+
+    #[test]
+    fn move_source_and_destination_reject_dotdot_and_absolute_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"old").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let cases = [
+            ("../escape.txt", "a.txt"),
+            ("/tmp/escape.txt", "a.txt"),
+            ("a/../../b.txt", "a.txt"),
+            ("b.txt", "../a.txt"),
+            ("b.txt", "/etc/passwd"),
+            ("b.txt", r"a\..\x"),
+        ];
+        for (path, from) in cases {
+            let mut op = move_op("a.txt", "b.txt", b"old");
+            op.path = path.into();
+            op.from = Some(from.into());
+            op.keep_source = true;
+            let p = plan(vec![op]);
+            let err = execute(&db, &fsys, &p, &opts_at(dir.path()), FaultPlan::default()).unwrap_err();
+            assert_eq!(err.code, ErrorCode::ZipSlip, "{path} <- {from}: {err}");
+            assert!(pending(&db).unwrap().is_empty(), "{path} <- {from}");
+            let confirm = issue_execute_confirm(&db, dir.path(), &fsys, &p, false).unwrap_err();
+            assert_eq!(confirm.code, ErrorCode::ZipSlip, "{path} <- {from}: {confirm}");
+        }
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"old");
+        assert!(!dir.path().join("b.txt").exists());
     }
 
     #[test]
