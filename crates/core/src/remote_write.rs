@@ -522,6 +522,21 @@ fn grant_from_upload(input: &UploadBatch<'_>, now: i64) -> Result<BatchGrant> {
     })
 }
 
+/// 编辑或合并后的内容如果来自二进制、超过 1MB、或读不出来的升级包文件，在写入前拒绝。
+/// 没有内联内容的文件仍按哈希和大小流式读取，这里不拦。
+pub fn reject_merged_upload(db: &rusqlite::Connection, file: &UploadFile) -> Result<()> {
+    if file.bytes.is_none() {
+        return Ok(());
+    }
+    let Some(source) = &file.source else {
+        return Ok(());
+    };
+    if crate::pkg::source_unmergeable(db, source)? {
+        return Err(crate::error::unreadable_merge(&file.path));
+    }
+    Ok(())
+}
+
 fn stored_upload(file: &UploadFile) -> Result<StoredBatchFile> {
     if let Some(bytes) = &file.bytes {
         let content_sha256 = sha256_hex(bytes);
@@ -955,6 +970,44 @@ fn join_remote(dir: &str, name: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn merged_upload_refuses_png_and_oversized_package_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let package = dir.path().join("package");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&package).unwrap();
+        std::fs::write(package.join("logo.png"), b"\x89PNG\r\n\x1a\n\x00").unwrap();
+        std::fs::write(package.join("big.bin"), vec![b'Q'; 1024 * 1024 + 1]).unwrap();
+        std::fs::write(package.join("note.txt"), b"hello\n").unwrap();
+        let db = crate::exec::open_db(&dir.path().join("t.sqlite")).unwrap();
+        let scanned = crate::pkg::scan_recorded(&db, &project, &package).unwrap();
+        let source_for = |name: &str| {
+            let file = scanned.files.iter().find(|item| item.rel == name).unwrap();
+            crate::model::ContentSource {
+                scan_id: scanned.scan_id.clone(),
+                kind: scanned.package_kind.clone(),
+                entry: file.entry_name.clone().unwrap(),
+                path: String::new(),
+            }
+        };
+        let upload = |name: &str, bytes: Option<Vec<u8>>| UploadFile {
+            remote_path: format!("/srv/{name}"),
+            path: name.into(),
+            bytes,
+            content_hash: None,
+            size: None,
+            source: Some(source_for(name)),
+        };
+        let png_err = reject_merged_upload(&db, &upload("logo.png", Some(Vec::new()))).unwrap_err();
+        assert_eq!(png_err.message, "logo.png 无法合并：没有读到文件内容，这一项没有写入。");
+        let big_err = reject_merged_upload(&db, &upload("big.bin", Some(b"x".to_vec()))).unwrap_err();
+        assert_eq!(big_err.message, "big.bin 无法合并：没有读到文件内容，这一项没有写入。");
+        reject_merged_upload(&db, &upload("note.txt", Some(b"edited\n".to_vec()))).unwrap();
+        reject_merged_upload(&db, &upload("logo.png", None)).unwrap();
+        reject_merged_upload(&db, &upload("big.bin", None)).unwrap();
+    }
 
     struct Mem {
         files: BTreeMap<String, Vec<u8>>,

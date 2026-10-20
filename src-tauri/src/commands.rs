@@ -70,6 +70,7 @@ pub fn merge(left: String, right: String, decision: String) -> Result<Rendered, 
     let decision = match decision.as_str() {
         "keepLeft" => Decision::KeepLeft,
         "both" => Decision::Both { right_first: false },
+        "bothRight" => Decision::Both { right_first: true },
         _ => Decision::TakeRight,
     };
     merge::set_all(&mut state, decision, true).map_err(|_| {
@@ -646,6 +647,9 @@ pub fn remote_write_prompt(
             size: file.size,
             source: file.source,
         });
+    }
+    for file in &normalized {
+        remote_write::reject_merged_upload(&db, file)?;
     }
     let input = UploadBatch {
         host: &saved.host,

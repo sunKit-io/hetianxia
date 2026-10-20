@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
-import { clearFileNotes, noteShownFile, rememberEdit, type LocalPlan, type PlannedFile } from "./localPlan.ts";
+import { clearFileNotes, mergeRefusedMessage, noteShownFile, rememberEdit, type LocalPlan, type PlannedFile } from "./localPlan.ts";
 import { connectionRemoteRoot, currentRemotePlan, isAbsoluteRemoteRoot, isFilesystemRemoteRoot, joinRemote, noteRemoteRoot, remoteBatchFailure, remoteFileMark, remotePlanFiles, remoteWriteBody, settleRemoteWrite, verifyFailureBody, type RemoteBatchReport } from "./remoteWrite.ts";
 
 test("dialog copy uses the runtime backup path and cancel writes nothing", () => {
@@ -117,6 +117,31 @@ function planned(path: string, text: string, kind: PlannedFile["kind"] = "overwr
     source: kind === "delete" ? null : { scanId: "scan-1", kind: "dir", entry: path },
   };
 }
+
+test("remote write refuses a merged png or a file over 1MB and still streams the package", () => {
+  noteRemoteRoot("/srv/site");
+  const png = planned("logo.png", "");
+  png.binary = true;
+  png.size = 32;
+  const big = planned("big.bin", "");
+  big.binary = true;
+  big.size = 1024 * 1024 + 1;
+  const plan: LocalPlan = {
+    projectRoot: "/work/app",
+    packagePath: "/tmp/pkg",
+    projectKey: "/work/app",
+    files: [png, big],
+  };
+  const refused = remotePlanFiles(plan, new Set(["logo.png", "big.bin"]), { "logo.png": [0] });
+  assert.equal(refused.files.length, 0);
+  assert.equal(refused.error, mergeRefusedMessage("logo.png"));
+  const streamed = remotePlanFiles(plan, new Set(["logo.png", "big.bin"]));
+  assert.equal(streamed.error, null);
+  assert.equal(streamed.files.length, 2);
+  assert.equal(streamed.files.every((file) => file.bytes == null), true);
+  assert.equal(streamed.files[0]?.contentHash, "ab".repeat(32));
+  clearFileNotes();
+});
 
 test("remotePlanFiles sends every checked file and the failure list stops at the error", () => {
   const plan: LocalPlan = {

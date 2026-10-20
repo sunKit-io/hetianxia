@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { clearFileNotes, rememberEdit, type LocalPlan, type PlannedFile } from "./localPlan.ts";
+import { clearFileNotes, mergeRefusedMessage, rememberEdit, type LocalPlan, type PlannedFile } from "./localPlan.ts";
 import { noteRemoteRoot, remotePlanFiles } from "./remoteWrite.ts";
 
 function planned(path: string, size: number): PlannedFile {
@@ -30,7 +30,7 @@ test("unedited package files send path, hash and size, and edits stay as bytes",
     projectRoot: "/work/app",
     packagePath: "/tmp/extracted",
     projectKey: "/work/app",
-    files: [planned("bin.dat", 5), planned("wide.bin", 5 * 1024 * 1024), planned("gbk.txt", 4)],
+    files: [planned("bin.dat", 5), planned("wide.bin", 5 * 1024 * 1024), { ...planned("gbk.txt", 4), binary: false }],
   };
   noteRemoteRoot("/srv/site");
   const streamed = remotePlanFiles(plan, new Set(["bin.dat", "wide.bin", "gbk.txt"]));
@@ -47,9 +47,10 @@ test("unedited package files send path, hash and size, and edits stay as bytes",
   rememberEdit("gbk.txt", "用户改过\n", "");
   const edited = remotePlanFiles(plan, new Set(["gbk.txt"]));
   assert.deepEqual(edited.files[0]?.bytes, Array.from(new TextEncoder().encode("用户改过\n")));
-  assert.equal(edited.files[0]?.source, null);
+  assert.deepEqual(edited.files[0]?.source, { scanId: "scan-pkg", kind: "dir", entry: "gbk.txt" });
   const carried = remotePlanFiles(plan, new Set(["bin.dat"]), { "bin.dat": [7, 8] });
-  assert.deepEqual(carried.files[0]?.bytes, [7, 8]);
+  assert.equal(carried.files.length, 0);
+  assert.equal(carried.error, mergeRefusedMessage("bin.dat"));
   const missing = remotePlanFiles(
     { ...plan, files: [{ ...plan.files[0], contentHash: null }] },
     new Set(["bin.dat"]),

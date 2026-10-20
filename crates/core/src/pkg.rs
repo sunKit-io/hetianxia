@@ -361,6 +361,41 @@ fn load_entry(db: &Connection, source: &ContentSource) -> Result<RecordedEntry> 
     })
 }
 
+/// 升级包里的这个文件不能当文本合并：超过 1MB、含有空字节，或读不出来。
+pub fn source_unmergeable(db: &Connection, source: &ContentSource) -> Result<bool> {
+    let recorded = load_entry(db, source)?;
+    if recorded.size > 1024 * 1024 {
+        return Ok(true);
+    }
+    if recorded.kind == "zip" {
+        return match zipfs::with_entry(&recorded.path, &source.entry, |reader, _declared| {
+            let mut buf = [0u8; 8192];
+            let n = std::io::Read::read(reader, &mut buf).unwrap_or(0);
+            Ok(buf[..n].contains(&0))
+        }) {
+            Ok(binary) => Ok(binary),
+            Err(_) => Ok(true),
+        };
+    }
+    let Ok(rel) = RelPath::parse(&source.entry) else {
+        return Ok(true);
+    };
+    let mut path = recorded.path.clone();
+    for part in rel.as_str().split('/') {
+        path.push(part);
+    }
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(_) => return Ok(true),
+    };
+    let mut buf = [0u8; 8192];
+    let n = match file.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return Ok(true),
+    };
+    Ok(buf[..n].contains(&0))
+}
+
 /// 按扫描记录把一个文件流式写到 `dest`。哈希或大小和计划不一致就删掉 `dest` 并返回错误。
 pub fn stream_plan_file(db: &Connection, op: &PlanOp, dest: &Path) -> Result<()> {
     let source = op.source.as_ref().ok_or_else(|| Error::new(ErrorCode::InvalidState, "计划缺少升级包来源，不能写入"))?;

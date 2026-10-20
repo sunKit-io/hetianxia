@@ -1,4 +1,4 @@
-import { editedContents, shownFilePayload, type LocalPlan, type PackageSource } from "./localPlan.ts";
+import { editedContents, isBlockedFile, mergeRefusedMessage, shownFilePayload, type LocalPlan, type PackageSource } from "./localPlan.ts";
 
 export const DIALOG_TITLE = "远程写入暂不支持回滚";
 export const CANCEL_LABEL = "取消";
@@ -182,8 +182,11 @@ export function remotePlanFiles(
         : Object.prototype.hasOwnProperty.call(edited, rel)
           ? Array.from(new TextEncoder().encode(edited[rel]))
           : null;
+    if (bytes && isBlockedFile(file)) {
+      return { files: [], error: mergeRefusedMessage(rel) };
+    }
     if (bytes) {
-      files.push({ remotePath, path: rel, bytes, contentHash: null, size: bytes.length, source: null });
+      files.push({ remotePath, path: rel, bytes, contentHash: null, size: bytes.length, source: file.source });
       continue;
     }
     if (!file.contentHash || file.size == null || !file.source) {

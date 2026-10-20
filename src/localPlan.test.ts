@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { applyCheck, buildLocalPlan, checkState, execPlanFor, filePathsUnder, planListRows, previewCounts, selectedPlan, selectionSummary, textDocToString, textsFromDiff, type ScanFile } from "./localPlan.ts";
+import { applyCheck, BLOCKED_MERGE_HINT, BLOCKED_PREVIEW, buildLocalPlan, checkState, execPlanFor, filePathsUnder, mergeRefusedMessage, noteBlockedFile, planListRows, previewCounts, selectedPlan, selectionSummary, textDocToString, textsFromDiff, type ScanFile } from "./localPlan.ts";
 
 test("text comes from the diff document, not the raw sample", () => {
   const shown = textsFromDiff({
@@ -146,6 +146,65 @@ test("两边都要 writes the merged text into the plan", async () => {
   assert.equal(exec.ops[0].merged, true);
   assert.equal(exec.ops[0].sourceMtimeMs, null);
   assert.equal(new TextDecoder().decode(new Uint8Array(exec.ops[0].bytes ?? [])), "L\nR\n");
+});
+
+test("都保留·右边在上 writes the right side first", async () => {
+  const plan = buildLocalPlan({
+    projectRoot: "/proj",
+    packagePath: "/pkg",
+    scanId: "scan-order",
+    packageKind: "dir",
+    files: [scanned("a.txt", "modified")],
+  });
+  plan.files[0].leftText = "LEFT\n";
+  plan.files[0].rightText = "RIGHT\n";
+  const exec = await execPlanFor(plan, {}, { "a.txt": "bothRight" }, async (left, right, decision) => {
+    assert.equal(left, "LEFT\n");
+    assert.equal(right, "RIGHT\n");
+    assert.equal(decision, "bothRight");
+    return { text: `${right}${left}` };
+  }, "both-right");
+  assert.equal(new TextDecoder().decode(new Uint8Array(exec.ops[0].bytes ?? [])), "RIGHT\nLEFT\n");
+});
+
+test("png and files over 1MB are not merged into the plan", async () => {
+  const huge = buildLocalPlan({
+    projectRoot: "/proj",
+    packagePath: "/pkg",
+    scanId: "scan-big",
+    packageKind: "dir",
+    files: [scanned("big.txt", "modified", { rightSize: 1024 * 1024 + 1 })],
+  });
+  assert.equal(huge.files[0].binary, true);
+  await assert.rejects(
+    () => execPlanFor(huge, {}, { "big.txt": "both" }, async () => ({ text: "" }), "big"),
+    new RegExp(mergeRefusedMessage("big.txt").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+  );
+  const png = buildLocalPlan({
+    projectRoot: "/proj",
+    packagePath: "/pkg",
+    scanId: "scan-png",
+    packageKind: "dir",
+    files: [scanned("logo.png", "modified", { rightSize: 32 })],
+  });
+  assert.equal(png.files[0].binary, false);
+  png.files[0].binary = true;
+  noteBlockedFile("logo.png");
+  await assert.rejects(
+    () => execPlanFor(png, {}, { "logo.png": "keepLeft" }, async () => ({ text: "" }), "png"),
+    /logo\.png 无法合并/,
+  );
+  const streamed = await execPlanFor(png, {}, { "logo.png": "takeRight" }, async () => {
+    throw new Error("should not merge");
+  }, "png-right");
+  assert.equal(streamed.ops[0].bytes, undefined);
+  assert.equal(streamed.ops[0].merged, false);
+  assert.equal(BLOCKED_MERGE_HINT, "二进制文件或超过 1MB 的文件无法在这里编辑或合并，只能选「用左边」或「用右边」");
+  assert.equal(BLOCKED_PREVIEW, "这个文件无法预览（二进制或超过 1MB）");
+  const editor = readFileSync(new URL("./editor.tsx", import.meta.url), "utf8");
+  assert.match(editor, /title=\{blocked \? BLOCKED_MERGE_HINT/);
+  assert.match(editor, /\{BLOCKED_PREVIEW\}/);
+  assert.match(editor, /bothRight/);
 });
 
 test("directory checks include nested files and the stored plan keeps one move row", async () => {

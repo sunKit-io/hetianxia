@@ -6,7 +6,7 @@ import { EditorState } from "@codemirror/state";
 import { EditorView, drawSelection, keymap, lineNumbers } from "@codemirror/view";
 import { diffTexts, readSide } from "./backend";
 import { formatEngineError } from "./engine";
-import { editedContents, fileDecision, rememberDecision, rememberEdit, rememberShownText, rememberSideText, reportFlowStatus, textsFromDiff, type MergeDecision } from "./localPlan";
+import { BLOCKED_MERGE_HINT, BLOCKED_PREVIEW, editedContents, fileDecision, noteBlockedFile, rememberDecision, rememberEdit, rememberShownText, rememberSideText, reportFlowStatus, textsFromDiff, type MergeDecision } from "./localPlan";
 import { Text } from "./plain";
 import { lineHunks, mapDocY, screenCorrection, type Anchor, type Hunk } from "./syncScroll";
 
@@ -74,9 +74,9 @@ async function loadFileTexts(projectRoot: string, packagePath: string, rel: stri
   return textsFromDiff(diff);
 }
 
-function decisionOf(choice: "left" | "right" | "both"): MergeDecision {
+function decisionOf(choice: "left" | "right" | "both", order: "left-top" | "right-top"): MergeDecision {
   if (choice === "left") return "keepLeft";
-  if (choice === "both") return "both";
+  if (choice === "both") return order === "right-top" ? "bothRight" : "both";
   return "takeRight";
 }
 
@@ -102,6 +102,7 @@ export function DiffEditor({
   const hunks = useMemo(() => lineHunks(leftText, rightBase), [leftText, rightBase]);
   const [choice, setChoice] = useState<"left" | "right" | "both">("right");
   const [bothOrder, setBothOrder] = useState<"left-top" | "right-top">("left-top");
+  const [blocked, setBlocked] = useState(false);
   const [active, setActive] = useState(0);
 
   useEffect(() => {
@@ -109,23 +110,32 @@ export function DiffEditor({
       setLeftText("");
       setRightBase("");
       setEdited(false);
+      setBlocked(false);
       return;
     }
     const file = currentFile;
     let cancel = false;
+    setBlocked(false);
     void loadFileTexts(projectRoot, packagePath, file).then((texts) => {
       if (cancel) return;
+      setBlocked(false);
       setLeftText(texts.left);
       setRightBase(texts.right);
       rememberShownText(file, texts.right);
       rememberSideText(file, texts.left, texts.right);
       const saved = editedContents()[file];
       setEdited(saved != null && saved !== texts.right);
-      setChoice(fileDecision(file) === "keepLeft" ? "left" : fileDecision(file) === "both" ? "both" : "right");
+      const decision = fileDecision(file);
+      setChoice(decision === "keepLeft" ? "left" : decision === "both" || decision === "bothRight" ? "both" : "right");
+      setBothOrder(decision === "bothRight" ? "right-top" : "left-top");
     }).catch((err) => {
       if (cancel) return;
       setLeftText("");
       setRightBase("");
+      setBlocked(true);
+      setChoice("right");
+      noteBlockedFile(file);
+      rememberDecision(file, "takeRight");
       reportFlowStatus(formatEngineError(err));
     });
     return () => {
@@ -212,8 +222,14 @@ export function DiffEditor({
   };
 
   const choose = (next: "left" | "right" | "both") => {
+    if (blocked && next !== "right") return;
     setChoice(next);
-    if (currentFile) rememberDecision(currentFile, decisionOf(next));
+    if (currentFile) rememberDecision(currentFile, decisionOf(next, bothOrder));
+  };
+  const pickOrder = (order: "left-top" | "right-top") => {
+    if (blocked) return;
+    setBothOrder(order);
+    if (currentFile && choice === "both") rememberDecision(currentFile, decisionOf("both", order));
   };
   const choiceLabel = choice === "left" ? "保留左边" : choice === "both" ? (bothOrder === "left-top" ? "都保留，左边在上" : "都保留，右边在上") : "用右边";
   const reset = () => {
@@ -240,25 +256,25 @@ export function DiffEditor({
     <div className="editorwrap" data-merge={choice} data-order={bothOrder}>
       <div className="filebar">
         <button className={choice === "right" ? "on" : ""} onClick={() => choose("right")}>全部用右边</button>
-        <button className={choice === "left" ? "on" : ""} onClick={() => choose("left")}>全部保留左边</button>
+        <button className={choice === "left" ? "on" : ""} disabled={blocked} title={blocked ? BLOCKED_MERGE_HINT : undefined} onClick={() => choose("left")}>全部保留左边</button>
         <button onClick={reset}>全部恢复</button>
       </div>
       <div className="editor">
-        <div className="pane" ref={leftHost} data-pane="left" />
+        {blocked ? <p className="empty-hint" data-blocked="1">{BLOCKED_PREVIEW}</p> : <div className="pane" ref={leftHost} data-pane="left" />}
         <div className="gutterbar">
           <b>中间工具条</b>
           <button className={choice === "right" ? "on" : ""} onClick={() => choose("right")}>用右边</button>
-          <button className={choice === "left" ? "on" : ""} onClick={() => choose("left")}>保留左边</button>
-          <button className={choice === "both" ? "on" : ""} onClick={() => choose("both")}>都保留</button>
+          <button className={choice === "left" ? "on" : ""} disabled={blocked} title={blocked ? BLOCKED_MERGE_HINT : undefined} onClick={() => choose("left")}>保留左边</button>
+          <button className={choice === "both" ? "on" : ""} disabled={blocked} title={blocked ? BLOCKED_MERGE_HINT : undefined} onClick={() => choose("both")}>都保留</button>
           <button onClick={reset}>恢复</button>
-          {choice === "both" && (
+          {choice === "both" && !blocked && (
             <div className="bothorder" role="group" aria-label="都保留的先后">
-              <button className={bothOrder === "left-top" ? "on" : ""} onClick={() => setBothOrder("left-top")}>左边在上</button>
-              <button className={bothOrder === "right-top" ? "on" : ""} onClick={() => setBothOrder("right-top")}>右边在上</button>
+              <button className={bothOrder === "left-top" ? "on" : ""} onClick={() => pickOrder("left-top")}>左边在上</button>
+              <button className={bothOrder === "right-top" ? "on" : ""} onClick={() => pickOrder("right-top")}>右边在上</button>
             </div>
           )}
         </div>
-        <div className="pane" ref={rightHost} data-pane="right" />
+        {blocked ? null : <div className="pane" ref={rightHost} data-pane="right" />}
       </div>
       <div className="difflist">
         <h2>差异列表</h2>

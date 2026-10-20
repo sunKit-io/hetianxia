@@ -27,7 +27,7 @@
 //! 删除开关关闭时，移动变成复制，界面文案是「移动（保留旧文件）」。
 //! 直接覆盖保留升级包的 mtime；合并结果用写入时刻。
 
-use crate::error::{occupied_after_preview, Error, ErrorCode, Result, ATTR_RESTORE_FAILED};
+use crate::error::{occupied_after_preview, unreadable_merge, Error, ErrorCode, Result, ATTR_RESTORE_FAILED};
 use crate::fault::{FaultPlan, FaultRuntime};
 #[cfg(feature = "fault-inject")]
 use crate::fault::Stage;
@@ -79,7 +79,7 @@ pub struct FileResult {
     pub state: String,
     pub error: Option<String>,
     pub code: Option<String>,
-    /// 普通移动回滚时，目标上的用户文件存到 conflict-current 的完整路径。
+    /// 备份到 conflict-current 之后的完整路径。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_path: Option<String>,
 }
@@ -1308,6 +1308,43 @@ pub fn begin_run(db: &Connection, _passed_root: &LocalFs, data_dir: &Path) -> Re
     }
 }
 
+/// 编辑或合并过的文件必须能读出文本。二进制、超过 1MB、读失败都在写盘之前拒绝。
+fn reject_unmergeable_ops(db: &Connection, fsys: &LocalFs, plan: &ExecPlan) -> Result<()> {
+    for op in &plan.ops {
+        if !op.merged || !matches!(op.kind, OpKind::Create | OpKind::Overwrite) {
+            continue;
+        }
+        if op.bytes.is_none() || side_unmergeable(fsys, &op.path)? {
+            return Err(unreadable_merge(&op.path));
+        }
+        if let Some(source) = &op.source {
+            if crate::pkg::source_unmergeable(db, source)? {
+                return Err(unreadable_merge(&op.path));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn side_unmergeable(fsys: &LocalFs, rel: &str) -> Result<bool> {
+    let Ok(parsed) = RelPath::parse(rel) else {
+        return Ok(true);
+    };
+    match fsys.stat(&parsed) {
+        Err(err) if err.code == ErrorCode::NotFound => Ok(false),
+        Err(_) => Ok(true),
+        Ok(stat) => {
+            if stat.kind != crate::vfs::EntryKind::File || stat.size > 1024 * 1024 {
+                return Ok(true);
+            }
+            match fsys.read(&parsed) {
+                Ok(bytes) => Ok(bytes.iter().take(8192).any(|byte| *byte == 0)),
+                Err(_) => Ok(true),
+            }
+        }
+    }
+}
+
 /// 移动的源路径和目标路径都走 `RelPath`：拒绝 `..` 和绝对路径。在写日志和动文件之前调用。
 fn reject_unsafe_move_paths(plan: &ExecPlan) -> Result<()> {
     for op in &plan.ops {
@@ -1324,6 +1361,7 @@ fn reject_unsafe_move_paths(plan: &ExecPlan) -> Result<()> {
 
 pub fn execute(db: &Connection, fsys: &LocalFs, plan: &ExecPlan, opts: &ExecOpts, fault: FaultPlan) -> Result<ExecReport> {
     reject_unsafe_move_paths(plan)?;
+    reject_unmergeable_ops(db, fsys, plan)?;
     if opts.remote {
         return Err(crate::remote::remote_write_unsupported());
     }
@@ -2020,6 +2058,7 @@ pub fn occupied_targets(fsys: &LocalFs, ops: &[PlanOp], allow_readonly: bool) ->
 /// 记下一次性确认令牌。不创建备份目录，也不写项目文件。
 pub fn issue_execute_confirm(db: &Connection, backup_root: &Path, fsys: &LocalFs, plan: &ExecPlan, allow_readonly: bool) -> Result<ExecuteConfirm> {
     reject_unsafe_move_paths(plan)?;
+    reject_unmergeable_ops(db, fsys, plan)?;
     if plan.id.trim().is_empty() {
         return Err(Error::new(ErrorCode::InvalidState, "执行编号是空的"));
     }
@@ -2537,8 +2576,7 @@ pub fn rollback(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: 
                     break;
                 }
                 if op.kind == OpKind::Move && !op.keep_source && hit.path == op.path {
-                    let full = backup.join("conflict-current").join(rel.as_str());
-                    plain_move_saved.insert(op.index, full.display().to_string());
+                    remember_conflict_backup(&mut plain_move_saved, op.index, &backup, &rel);
                 }
             }
             if !saved {
@@ -2699,6 +2737,11 @@ fn restore_one(db: &Connection, exec_id: &str, fsys: &LocalFs, backup: &Path, op
     }
 }
 
+fn remember_conflict_backup(saved: &mut HashMap<u32, String>, index: u32, backup: &Path, rel: &RelPath) {
+    let full = backup.join("conflict-current").join(rel.as_str());
+    saved.insert(index, full.display().to_string());
+}
+
 /// 把冲突文件的当前内容写到 `conflict-current/<path>`，同步所在目录，再核对哈希。
 /// 哈希不一致就返回错误，调用方不得接着删除或覆盖这个文件。
 fn save_conflict_current(fsys: &LocalFs, backup: &Path, rel: &RelPath) -> Result<()> {
@@ -2791,7 +2834,9 @@ fn backup_and_remove_our_target(
         }
     }
     mark_rollback_done(db, exec_id, op.index)?;
-    files.push(fr(op, "rolled-back", None, None));
+    let mut done = fr(op, "rolled-back", None, None);
+    done.saved_path = Some(backup.join("conflict-current").join(rel.as_str()).display().to_string());
+    files.push(done);
     Ok(true)
 }
 
@@ -3974,6 +4019,56 @@ mod tests {
             keep_source: false,
             readonly: false,
             label: "新增".into(),
+        }
+    }
+
+    #[test]
+    fn merged_png_and_oversized_file_are_refused_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = b"\x89PNG\r\n\x1a\n\x00rest";
+        fs::write(dir.path().join("logo.png"), png).unwrap();
+        let big = vec![b'Z'; 1024 * 1024 + 1];
+        fs::write(dir.path().join("big.txt"), &big).unwrap();
+        let package = dir.path().join("package");
+        fs::create_dir(&package).unwrap();
+        fs::write(package.join("fresh.png"), png).unwrap();
+        fs::write(package.join("wide.bin"), &big).unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+
+        let mut png_op = ov(1, "logo.png", png, b"", None);
+        png_op.merged = true;
+        png_op.bytes = Some(Vec::new());
+        let err = execute(&db, &fsys, &plan(vec![png_op]), &opts_at(dir.path()), FaultPlan::default()).unwrap_err();
+        assert_eq!(err.message, "logo.png 无法合并：没有读到文件内容，这一项没有写入。");
+        assert_eq!(fs::read(dir.path().join("logo.png")).unwrap(), png);
+        let journal: i64 = db.query_row("SELECT COUNT(*) FROM exec_journal", [], |row| row.get(0)).unwrap();
+        assert_eq!(journal, 0);
+
+        let mut big_op = ov(1, "big.txt", &big, b"x", None);
+        big_op.merged = true;
+        big_op.bytes = Some(b"x".to_vec());
+        let err = execute(&db, &fsys, &plan(vec![big_op]), &opts_at(dir.path()), FaultPlan::default()).unwrap_err();
+        assert_eq!(err.message, "big.txt 无法合并：没有读到文件内容，这一项没有写入。");
+        assert_eq!(fs::read(dir.path().join("big.txt")).unwrap(), big);
+
+        let scanned = crate::pkg::scan_recorded(&db, dir.path(), &package).unwrap();
+        for name in ["fresh.png", "wide.bin"] {
+            let file = scanned.files.iter().find(|item| item.rel == name).unwrap();
+            let mut created = create_op(1, name, b"");
+            created.merged = true;
+            created.bytes = Some(Vec::new());
+            created.content_hash = file.content_sha256.clone();
+            created.size = file.right_size;
+            created.source = Some(crate::model::ContentSource {
+                scan_id: scanned.scan_id.clone(),
+                kind: scanned.package_kind.clone(),
+                entry: file.entry_name.clone().unwrap(),
+                path: String::new(),
+            });
+            let err = execute(&db, &fsys, &plan(vec![created]), &opts_at(dir.path()), FaultPlan::default()).unwrap_err();
+            assert_eq!(err.message, format!("{name} 无法合并：没有读到文件内容，这一项没有写入。"));
+            assert!(!dir.path().join(name).exists(), "{name}");
         }
     }
 
@@ -6972,7 +7067,9 @@ mod tests {
             assert_eq!(journal_state(&db, &created.id), "ROLLED_BACK");
             assert!(!proj.join("pkg/new.ts").exists());
             let saved = dir.path().join("bak").join(&created.id).join("conflict-current").join("pkg/new.ts");
-            assert_eq!(fs::read(saved).unwrap(), b"body");
+            assert_eq!(fs::read(&saved).unwrap(), b"body");
+            let hit = back.files.iter().find(|file| file.path == "pkg/new.ts").unwrap();
+            assert_eq!(hit.saved_path.as_deref(), Some(saved.display().to_string().as_str()));
 
             let proj = dir.path().join("proj-move");
             fs::create_dir_all(proj.join("src")).unwrap();
@@ -6991,7 +7088,9 @@ mod tests {
             assert!(!proj.join("pkg/c.ts").exists());
             assert_eq!(fs::read(proj.join("src/a.ts")).unwrap(), b"AAA");
             let saved = dir.path().join("bak").join(&moved.id).join("conflict-current").join("pkg/c.ts");
-            assert_eq!(fs::read(saved).unwrap(), b"AAA");
+            assert_eq!(fs::read(&saved).unwrap(), b"AAA");
+            let hit = back.files.iter().find(|file| file.path == "pkg/c.ts").unwrap();
+            assert_eq!(hit.saved_path.as_deref(), Some(saved.display().to_string().as_str()));
         }
     }
 
@@ -7132,6 +7231,9 @@ mod tests {
             assert_eq!(fs::read(proj.join("src/a.ts")).unwrap(), b"AAA");
             let saved = dir.path().join("bak").join(&p.id).join("conflict-current").join("pkg/c.ts");
             assert_eq!(fs::read(&saved).unwrap(), b"AAA");
+            let hit = back.files.iter().find(|file| file.path == "pkg/c.ts").unwrap();
+            assert_eq!(hit.saved_path.as_deref(), Some(saved.display().to_string().as_str()));
+            assert_eq!(hit.state, "rolled-back");
         }
     }
 

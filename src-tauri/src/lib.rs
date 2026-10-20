@@ -447,6 +447,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn both_right_on_top_writes_the_right_side_first() {
+        let merged = commands::merge("LEFT\n".into(), "RIGHT\n".into(), "bothRight".into()).unwrap();
+        let right_at = merged.text.find("RIGHT").unwrap();
+        let left_at = merged.text.find("LEFT").unwrap();
+        assert!(right_at < left_at, "{}", merged.text);
+        assert!(merged.text.starts_with("RIGHT\n"), "{}", merged.text);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"LEFT\n").unwrap();
+        let mut plan = overwrite_plan("exec-both-right", merged.text.as_bytes());
+        plan.ops[0].merged = true;
+        let report = execute_ok(&dir.path().join("t.sqlite"), dir.path(), &dir.path().join("bak"), plan, false);
+        assert_eq!(report.history_result, "成功");
+        let body = std::fs::read(dir.path().join("a.txt")).unwrap();
+        assert!(body.starts_with(b"RIGHT\n"), "{}", String::from_utf8_lossy(&body));
+        assert!(body.windows(4).position(|chunk| chunk == b"RIGHT") < body.windows(4).position(|chunk| chunk == b"LEFT"));
+    }
+
     /// A 执行后再在 B 执行。回滚 A 必须改 A，不能改 B。
     /// 已回滚再调 rollback_run、已结束再调 resume_run，都只观察是否再写文件。
     #[test]

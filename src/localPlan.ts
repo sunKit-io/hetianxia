@@ -98,7 +98,22 @@ export type PreviewCounts = {
   merged: number;
 };
 
-export type MergeDecision = "keepLeft" | "takeRight" | "both";
+export type MergeDecision = "keepLeft" | "takeRight" | "both" | "bothRight";
+
+/** 和 read_side 一致：超过 1MB 不能当文本打开。正好 1MB 仍可以。 */
+export const TEXT_FILE_LIMIT = 1024 * 1024;
+
+export const BLOCKED_MERGE_HINT = "二进制文件或超过 1MB 的文件无法在这里编辑或合并，只能选「用左边」或「用右边」";
+
+export const BLOCKED_PREVIEW = "这个文件无法预览（二进制或超过 1MB）";
+
+export function mergeRefusedMessage(path: string): string {
+  return `${path} 无法合并：没有读到文件内容，这一项没有写入。`;
+}
+
+export function fileTooBig(size: number | null | undefined): boolean {
+  return (size ?? 0) > TEXT_FILE_LIMIT;
+}
 
 export type TextDoc = {
   lines: string[];
@@ -113,6 +128,7 @@ let shownPlan: LocalPlan | null = null;
 let shownPath: string | null = null;
 const shownText: Record<string, string> = {};
 const sideText: Record<string, { left: string; right: string }> = {};
+const blockedPaths = new Set<string>();
 
 /** 预演当前选中的文件。远程写入在点击时读这份，所以编辑不用再走一轮渲染。 */
 export function noteShownFile(plan: LocalPlan | null, path: string | null) {
@@ -156,6 +172,16 @@ export function clearFileNotes() {
   for (const key of Object.keys(decisions)) delete decisions[key];
   for (const key of Object.keys(shownText)) delete shownText[key];
   for (const key of Object.keys(sideText)) delete sideText[key];
+  blockedPaths.clear();
+}
+
+/** 编辑器打不开的文件。执行计划用它拒绝空文本合并。 */
+export function noteBlockedFile(path: string) {
+  if (path) blockedPaths.add(path);
+}
+
+export function isBlockedFile(file: { path: string; binary: boolean; size?: number | null }): boolean {
+  return file.binary || blockedPaths.has(file.path) || fileTooBig(file.size);
 }
 
 /** 编辑器打开文件时记下左右文本。只有真正编辑或改合并选择的文件才会写进计划。 */
@@ -376,7 +402,7 @@ export function buildLocalPlan(args: {
       label,
       readonly: Boolean(file.readonly),
       merged: false,
-      binary: false,
+      binary: fileTooBig(file.leftSize) || fileTooBig(file.rightSize),
       leftText: "",
       rightText: "",
       from: kind === "move" ? file.movedFrom ?? null : null,
@@ -419,7 +445,11 @@ export async function execPlanFor(
     let merged = file.merged;
     let sourceMtimeMs = file.sourceMtimeMs;
     let bytes: number[] | undefined;
-    if (!file.binary && (file.kind === "overwrite" || file.kind === "create") && (edited || decision !== "takeRight")) {
+    const wantsMerge = edited || (decision !== "takeRight" && decision !== undefined);
+    if ((file.kind === "overwrite" || file.kind === "create") && wantsMerge && isBlockedFile(file)) {
+      throw new Error(mergeRefusedMessage(file.path));
+    }
+    if (!isBlockedFile(file) && (file.kind === "overwrite" || file.kind === "create") && wantsMerge) {
       const sides = sidesOf(file);
       const right = edited ? edits[file.path] : sides.right;
       const rendered = await mergeText(sides.left, right, decision);
