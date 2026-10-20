@@ -39,7 +39,7 @@ pub struct PlanOp {
     pub path: String,
     /// 移动的旧路径。
     pub from: Option<String>,
-    /// 引擎内部测试仍可直接带内容。界面计划不能带这个字段，见 `parse_client_plan`。
+    /// 引擎测试，以及编辑/合并后的最终内容。没标 merged 的字节数组仍拒绝。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<Vec<u8>>,
     pub expect: Option<Snapshot>,
@@ -76,7 +76,10 @@ fn plan_embeds_bytes(value: &serde_json::Value) -> bool {
     let Some(ops) = value.get("ops").and_then(|item| item.as_array()) else {
         return false;
     };
-    ops.iter().any(|op| matches!(op.get("bytes"), Some(serde_json::Value::Array(_))))
+    // 编辑或合并结果可以内联，体积小，并且标了 merged。没合并却带字节数组是旧格式。
+    ops.iter().any(|op| {
+        matches!(op.get("bytes"), Some(serde_json::Value::Array(_))) && op.get("merged").and_then(|flag| flag.as_bool()) != Some(true)
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

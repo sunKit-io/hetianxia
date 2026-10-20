@@ -10,7 +10,7 @@ export type HistoryContinue = {
 
 export type HistoryStatusLabel = "已完成" | "部分失败" | "未完成" | "已回滚" | "部分回滚" | "未知状态";
 
-/** 设计 19。日志里的原始状态只在这里换成界面文案。 */
+/** 设计 19。日志里的原始状态只在这里换成界面文案。部分回滚的展示文案见 historyResultText。 */
 export function historyStatusLabel(status: string): HistoryStatusLabel {
   switch (status) {
     case "COMMITTED":
@@ -36,6 +36,12 @@ export function historyRowButtons(label: HistoryStatusLabel): { rollback: boolea
   if (label === "未完成" || label === "部分失败") return { rollback: true, resume: true };
   if (label === "已完成" || label === "部分回滚") return { rollback: true, resume: false };
   return { rollback: false, resume: false };
+}
+
+/** 部分回滚的结果列。k 是后端记下的冲突项数。 */
+export function historyResultText(status: string, conflictCount = 0): string {
+  if (status === "ROLLBACK_PARTIAL") return `部分回滚（跳过 ${conflictCount} 个冲突文件）`;
+  return historyStatusLabel(status);
 }
 
 export function historyContinue(execId: string): HistoryContinue {

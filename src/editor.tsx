@@ -6,7 +6,7 @@ import { EditorState } from "@codemirror/state";
 import { EditorView, drawSelection, keymap, lineNumbers } from "@codemirror/view";
 import { diffTexts, readSide } from "./backend";
 import { formatEngineError } from "./engine";
-import { editedContents, fileDecision, rememberDecision, rememberEdit, rememberShownText, reportFlowStatus, textsFromDiff, type MergeDecision } from "./localPlan";
+import { editedContents, fileDecision, rememberDecision, rememberEdit, rememberShownText, rememberSideText, reportFlowStatus, textsFromDiff, type MergeDecision } from "./localPlan";
 import { Text } from "./plain";
 import { lineHunks, mapDocY, screenCorrection, type Anchor, type Hunk } from "./syncScroll";
 
@@ -118,6 +118,7 @@ export function DiffEditor({
       setLeftText(texts.left);
       setRightBase(texts.right);
       rememberShownText(file, texts.right);
+      rememberSideText(file, texts.left, texts.right);
       const saved = editedContents()[file];
       setEdited(saved != null && saved !== texts.right);
       setChoice(fileDecision(file) === "keepLeft" ? "left" : fileDecision(file) === "both" ? "both" : "right");

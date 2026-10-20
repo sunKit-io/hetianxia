@@ -9,7 +9,12 @@ export type FileResult = {
   state: string;
   error?: string | null;
   code?: string | null;
+  savedPath?: string | null;
 };
+
+export function keptFileNote(savedPath: string): string {
+  return `你的文件已存到 ${savedPath}`;
+}
 
 export type ExecReport = {
   execId: string;
@@ -110,19 +115,22 @@ const FILE_STATE: Record<string, string> = {
 };
 
 /** 执行结果列表：状态用中文，错误码原样保留。 */
-export function formatFileResult(file: Pick<FileResult, "state" | "code" | "error">): string {
+export function formatFileResult(file: Pick<FileResult, "state" | "code" | "error" | "savedPath">): string {
   const state = FILE_STATE[file.state] ?? file.state;
-  return [state, file.code, file.error].filter(Boolean).join(" · ");
+  const kept = file.savedPath ? keptFileNote(file.savedPath) : "";
+  return [state, file.code, file.error, kept].filter(Boolean).join(" · ");
 }
 
 export function formatReport(report: ExecReport): string {
   const head = report.historyResult ? `${report.state} · ${report.historyResult}` : report.state;
   const lines = [head];
   for (const file of report.files) {
-    if (!file.code && !file.error) continue;
+    const kept = file.savedPath ? keptFileNote(file.savedPath) : "";
+    if (!file.code && !file.error && !kept) continue;
     const bits = [file.path];
     if (file.code) bits.push(engineCode(file.code));
     if (file.error) bits.push(file.error);
+    if (kept) bits.push(kept);
     lines.push(bits.join(" · "));
   }
   return lines.join("\n");

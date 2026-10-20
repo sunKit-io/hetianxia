@@ -29,7 +29,7 @@ import {
   type ExecPlan,
   type LocalPlan,
 } from "./localPlan";
-import { formatFileCounts, formatRunTime, historyContinue, historyRowButtons, historyStatusLabel, REMOTE_ROLLBACK_TITLE, type HistoryContinue } from "./historyRows";
+import { formatFileCounts, formatRunTime, historyContinue, historyResultText, historyRowButtons, historyStatusLabel, REMOTE_ROLLBACK_TITLE, type HistoryContinue } from "./historyRows";
 import { Text } from "./plain";
 import { remoteRootFieldError } from "./remoteRoot";
 import { VERIFY_FAILED_BUTTON, VERIFY_FAILED_TITLE, connectionRemoteRoot, currentRemotePlan, isAbsoluteRemoteRoot, isFilesystemRemoteRoot, noteRemoteRoot, remoteBatchFailure, remoteFileMark, remotePlanFiles, settleRemoteWrite, type PendingRemoteWrite, type RemoteBatchReport } from "./remoteWrite";
@@ -1051,12 +1051,13 @@ function HistoryPage({ refreshToken, onRollback, onContinue }: { refreshToken: n
           {runs.map((run) => {
             const label = historyStatusLabel(run.status);
             const buttons = historyRowButtons(label);
+            const result = historyResultText(run.status, run.conflictCount);
             return (
             <tr key={run.execId}>
               <td><Text value={formatRunTime(run.startedAt)} /></td>
               <td><Text value={run.projectRoot ?? ""} /></td>
               <td><Text value={formatFileCounts(run)} /></td>
-              <td><Text value={label} /></td>
+              <td><Text value={result} /></td>
               <td>
                 {run.remote ? (
                   <button type="button" disabled title={REMOTE_ROLLBACK_TITLE}>回滚</button>

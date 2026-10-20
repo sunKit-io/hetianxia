@@ -79,6 +79,9 @@ pub struct FileResult {
     pub state: String,
     pub error: Option<String>,
     pub code: Option<String>,
+    /// 普通移动回滚时，目标上的用户文件存到 conflict-current 的完整路径。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2114,6 +2117,7 @@ fn fr(op: &PlanOp, state: &str, code: Option<&str>, error: Option<&str>) -> File
         state: state.into(),
         error: error.map(|s| s.to_string()),
         code: code.map(|s| s.to_string()),
+        saved_path: None,
     }
 }
 
@@ -2432,6 +2436,7 @@ pub fn rollback(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: 
     let mut fault = FaultRuntime::new(fault);
     let mut files = Vec::new();
     let mut any_fail = false;
+    let mut plain_move_saved: HashMap<u32, String> = HashMap::new();
     // 已写入的文件都要还原，包括改名之后才失败、状态被标成 failed 的。未执行的 Create 不能删目标。
     for op in plan.ops.iter().rev() {
         let Some(row) = states.get(&op.index) else { continue };
@@ -2534,6 +2539,10 @@ pub fn rollback(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: 
                     saved = false;
                     break;
                 }
+                if op.kind == OpKind::Move && !op.keep_source && hit.path == op.path {
+                    let full = backup.join("conflict-current").join(rel.as_str());
+                    plain_move_saved.insert(op.index, full.display().to_string());
+                }
             }
             if !saved {
                 continue;
@@ -2608,6 +2617,11 @@ pub fn rollback(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: 
                     files.push(fr(op, "rollback-failed", Some(e.code_str()), Some(&e.message)));
                 }
             }
+        }
+    }
+    for file in &mut files {
+        if let Some(saved) = plain_move_saved.get(&file.index) {
+            file.saved_path = Some(saved.clone());
         }
     }
     let _ = any_fail;
@@ -5662,7 +5676,10 @@ mod tests {
         assert_eq!(back.history_result, "已回滚");
         assert_eq!(fs::read(dir.path().join("old.ts")).unwrap(), b"body");
         assert!(!dir.path().join("new.ts").exists());
-        assert_eq!(fs::read(dir.path().join("bak").join(&p.id).join("conflict-current").join("new.ts")).unwrap(), b"user-edit");
+        let saved = dir.path().join("bak").join(&p.id).join("conflict-current").join("new.ts");
+        assert_eq!(fs::read(&saved).unwrap(), b"user-edit");
+        let hit = back.files.iter().find(|file| file.path == "new.ts").unwrap();
+        assert_eq!(hit.saved_path.as_deref(), Some(saved.display().to_string().as_str()));
     }
 
     #[test]

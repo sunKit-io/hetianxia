@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { afterResume, engineCode, formatEngineError, formatFileResult, formatOffer, formatReport, parseResume, type ExecReport } from "./engine.ts";
+import { afterResume, engineCode, formatEngineError, formatFileResult, formatOffer, formatReport, keptFileNote, parseResume, type ExecReport } from "./engine.ts";
 
 const stopped: ExecReport = {
   execId: "exec-1",
@@ -59,6 +59,20 @@ test("file results use Chinese states and keep the error code", () => {
   assert.equal(formatFileResult({ state: "skipped", code: "E_PERMISSION", error: null }), "已跳过 · E_PERMISSION");
   assert.equal(formatFileResult({ state: "failed", code: "E_IO", error: "写入失败" }), "失败 · E_IO · 写入失败");
   assert.equal(formatFileResult({ state: "doing", code: null, error: null }), "进行中");
+  assert.equal(keptFileNote("/bak/id/conflict-current/new.ts"), "你的文件已存到 /bak/id/conflict-current/new.ts");
+  assert.equal(
+    formatFileResult({ state: "rolled-back", code: null, error: null, savedPath: "/bak/id/conflict-current/new.ts" }),
+    "rolled-back · 你的文件已存到 /bak/id/conflict-current/new.ts",
+  );
+  assert.match(
+    formatReport({
+      ...stopped,
+      state: "ROLLED_BACK",
+      historyResult: "已回滚",
+      files: [{ index: 1, path: "new.ts", kind: "move", state: "rolled-back", savedPath: "/bak/id/conflict-current/new.ts" }],
+    }),
+    /new\.ts · 你的文件已存到 \/bak\/id\/conflict-current\/new\.ts/,
+  );
 });
 
 test("startup offer shows the state and code", () => {

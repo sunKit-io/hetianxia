@@ -112,6 +112,7 @@ let statusSink: ((message: string | null) => void) | null = null;
 let shownPlan: LocalPlan | null = null;
 let shownPath: string | null = null;
 const shownText: Record<string, string> = {};
+const sideText: Record<string, { left: string; right: string }> = {};
 
 /** 预演当前选中的文件。远程写入在点击时读这份，所以编辑不用再走一轮渲染。 */
 export function noteShownFile(plan: LocalPlan | null, path: string | null) {
@@ -154,6 +155,13 @@ export function clearFileNotes() {
   for (const key of Object.keys(edits)) delete edits[key];
   for (const key of Object.keys(decisions)) delete decisions[key];
   for (const key of Object.keys(shownText)) delete shownText[key];
+  for (const key of Object.keys(sideText)) delete sideText[key];
+}
+
+/** 编辑器打开文件时记下左右文本。只有真正编辑或改合并选择的文件才会写进计划。 */
+export function rememberSideText(path: string, left: string, right: string) {
+  if (!path) return;
+  sideText[path] = { left, right };
 }
 
 export function rememberEdit(path: string, text: string, base: string) {
@@ -388,32 +396,55 @@ export function buildLocalPlan(args: {
   };
 }
 
+function sidesOf(file: PlannedFile): { left: string; right: string } {
+  const remembered = sideText[file.path];
+  return {
+    left: file.leftText || remembered?.left || "",
+    right: file.rightText || remembered?.right || "",
+  };
+}
+
 export async function execPlanFor(
   plan: LocalPlan,
-  _edits: Record<string, string>,
-  _choices: Record<string, MergeDecision>,
-  _mergeText: (left: string, right: string, decision: string) => Promise<{ text: string }>,
+  edits: Record<string, string>,
+  choices: Record<string, MergeDecision>,
+  mergeText: (left: string, right: string, decision: string) => Promise<{ text: string }>,
   id: string,
 ): Promise<ExecPlan> {
   const ops: ExecPlan["ops"] = [];
   for (const [index, file] of plan.files.entries()) {
     if (file.kind === "move") assertMovePaths(file.path, file.from);
-    ops.push({
+    const decision = choices[file.path] ?? "takeRight";
+    const edited = Object.prototype.hasOwnProperty.call(edits, file.path);
+    let merged = file.merged;
+    let sourceMtimeMs = file.sourceMtimeMs;
+    let bytes: number[] | undefined;
+    if (!file.binary && (file.kind === "overwrite" || file.kind === "create") && (edited || decision !== "takeRight")) {
+      const sides = sidesOf(file);
+      const right = edited ? edits[file.path] : sides.right;
+      const rendered = await mergeText(sides.left, right, decision);
+      bytes = Array.from(new TextEncoder().encode(rendered.text));
+      merged = true;
+      sourceMtimeMs = null;
+    }
+    const op: ExecPlan["ops"][number] = {
       index: index + 1,
       kind: file.kind,
       path: file.path,
       from: file.from,
       contentHash: file.kind === "delete" ? null : file.contentHash,
-      size: file.kind === "delete" ? null : file.size,
+      size: file.kind === "delete" ? null : bytes ? bytes.length : file.size,
       source: file.kind === "delete" ? null : file.source,
       expect: file.expect,
       mode: null,
-      sourceMtimeMs: file.sourceMtimeMs,
-      merged: file.merged,
+      sourceMtimeMs,
+      merged,
       keepSource: file.keepSource,
       readonly: file.readonly,
       label: file.label,
-    });
+    };
+    if (bytes) op.bytes = bytes;
+    ops.push(op);
   }
   const summary = { create: 0, overwrite: 0, moveCount: 0, delete: 0, merged: 0, moveKeepSource: 0 };
   for (const op of ops) {

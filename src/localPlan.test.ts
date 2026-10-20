@@ -73,27 +73,79 @@ test("scan metadata builds create, overwrite, and move ops without file bytes", 
   assert.equal(allowed.skipReadonly, 0);
 });
 
-test("execute plan keeps the package hash and does not carry bytes", async () => {
+test("编辑后的内容就是执行写入的内容", async () => {
   const plan = buildLocalPlan({
     projectRoot: "/proj",
     packagePath: "/pkg.zip",
     scanId: "scan-zip",
     packageKind: "zip",
-    files: [scanned("a.txt", "modified", { entryName: "a.txt", contentSha256: "abc", rightSize: 8, rightMtimeMs: 11 })],
+    files: [
+      scanned("a.txt", "modified", { entryName: "a.txt", contentSha256: "abc", rightSize: 8, rightMtimeMs: 11 }),
+      scanned("b.txt", "modified", { entryName: "b.txt", contentSha256: "sha:b.txt", rightSize: 4 }),
+    ],
   });
-  const exec = await execPlanFor(plan, { "a.txt": "edited\n" }, { "a.txt": "takeRight" }, async () => {
-    throw new Error("plan must not read or merge file bytes");
+  plan.files[0].leftText = "L\n";
+  plan.files[0].rightText = "R\n";
+  const exec = await execPlanFor(plan, { "a.txt": "edited\n" }, { "a.txt": "takeRight" }, async (left, right, decision) => {
+    assert.equal(left, "L\n");
+    assert.equal(right, "edited\n");
+    assert.equal(decision, "takeRight");
+    return { text: "edited\n" };
   }, "exec-test");
   assert.equal(exec.id, "exec-test");
   assert.equal(exec.projectKey, "/proj");
-  assert.equal(exec.ops[0].merged, false);
-  assert.equal(exec.ops[0].sourceMtimeMs, 11);
-  assert.equal(exec.ops[0].contentHash, "abc");
-  assert.equal(exec.ops[0].size, 8);
-  assert.deepEqual(exec.ops[0].source, { scanId: "scan-zip", kind: "zip", entry: "a.txt" });
-  assert.equal(JSON.stringify(exec).includes('"bytes"'), false);
-  assert.equal(exec.summary.overwrite, 1);
-  assert.equal(exec.summary.merged, 0);
+  assert.equal(exec.ops[0].merged, true);
+  assert.equal(exec.ops[0].sourceMtimeMs, null);
+  assert.equal(new TextDecoder().decode(new Uint8Array(exec.ops[0].bytes ?? [])), "edited\n");
+  assert.equal(exec.ops[0].size, "edited\n".length);
+  assert.equal(exec.summary.overwrite, 2);
+  assert.equal(exec.summary.merged, 1);
+  assert.equal(exec.ops[1].bytes, undefined);
+  assert.equal(exec.ops[1].merged, false);
+  assert.equal(exec.ops[1].contentHash, "sha:b.txt");
+  assert.equal(JSON.stringify(exec.ops[1]).includes('"bytes"'), false);
+});
+
+test("保留我的 writes the left side into the plan", async () => {
+  const plan = buildLocalPlan({
+    projectRoot: "/proj",
+    packagePath: "/pkg",
+    scanId: "scan-left",
+    packageKind: "dir",
+    files: [scanned("a.txt", "modified")],
+  });
+  plan.files[0].leftText = "mine\n";
+  plan.files[0].rightText = "theirs\n";
+  const exec = await execPlanFor(plan, {}, { "a.txt": "keepLeft" }, async (left, right, decision) => {
+    assert.equal(left, "mine\n");
+    assert.equal(right, "theirs\n");
+    assert.equal(decision, "keepLeft");
+    return { text: left };
+  }, "keep-left");
+  assert.equal(exec.ops[0].merged, true);
+  assert.equal(exec.ops[0].sourceMtimeMs, null);
+  assert.equal(new TextDecoder().decode(new Uint8Array(exec.ops[0].bytes ?? [])), "mine\n");
+});
+
+test("两边都要 writes the merged text into the plan", async () => {
+  const plan = buildLocalPlan({
+    projectRoot: "/proj",
+    packagePath: "/pkg",
+    scanId: "scan-both",
+    packageKind: "dir",
+    files: [scanned("a.txt", "modified")],
+  });
+  plan.files[0].leftText = "L\n";
+  plan.files[0].rightText = "R\n";
+  const exec = await execPlanFor(plan, {}, { "a.txt": "both" }, async (left, right, decision) => {
+    assert.equal(left, "L\n");
+    assert.equal(right, "R\n");
+    assert.equal(decision, "both");
+    return { text: `${left}${right}` };
+  }, "keep-both");
+  assert.equal(exec.ops[0].merged, true);
+  assert.equal(exec.ops[0].sourceMtimeMs, null);
+  assert.equal(new TextDecoder().decode(new Uint8Array(exec.ops[0].bytes ?? [])), "L\nR\n");
 });
 
 test("directory checks include nested files and the stored plan keeps one move row", async () => {

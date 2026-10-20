@@ -691,6 +691,53 @@ mod tests {
     }
 
     #[test]
+    fn merged_inline_bytes_are_accepted_and_other_files_still_stream() {
+        let raw = serde_json::json!({
+            "id": "mix",
+            "projectKey": "p",
+            "ops": [{
+                "index": 1,
+                "kind": "overwrite",
+                "path": "a.txt",
+                "from": null,
+                "bytes": [69, 68, 73, 84],
+                "expect": null,
+                "mode": null,
+                "sourceMtimeMs": null,
+                "merged": true,
+                "keepSource": false,
+                "readonly": false,
+                "label": "合并结果"
+            }],
+            "summary": { "create": 0, "overwrite": 1, "moveCount": 0, "delete": 0, "merged": 1, "moveKeepSource": 0 }
+        });
+        let parsed = crate::model::parse_client_plan(raw).unwrap();
+        assert_eq!(parsed.ops[0].bytes.as_deref(), Some(b"EDIT".as_slice()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        let package = dir.path().join("pkg");
+        write_tree(&project, &[("a.txt", b"old-a"), ("b.txt", b"old-b")]);
+        write_tree(&package, &[("a.txt", b"pkg-a"), ("b.txt", b"pkg-b")]);
+        let db = exec::open_db(&dir.path().join("t.sqlite")).unwrap();
+        let scan = scan_recorded(&db, &project, &package).unwrap();
+        let mut plan = plan_from(&scan, "mix-1");
+        let inline = plan.ops.iter_mut().find(|op| op.path == "a.txt").unwrap();
+        inline.bytes = Some(b"EDITED".to_vec());
+        inline.merged = true;
+        let report = exec::execute(&db, &LocalFs::new(&project), &plan, &opts(dir.path()), FaultPlan::default()).unwrap();
+        assert_eq!(report.state, "COMMITTED", "{:?}", report.files);
+        assert_eq!(fs::read(project.join("a.txt")).unwrap(), b"EDITED");
+        assert_eq!(fs::read(project.join("b.txt")).unwrap(), b"pkg-b");
+        let stored: ExecPlan = serde_json::from_str(&journal_plan(&db, "mix-1")).unwrap();
+        let inline = stored.ops.iter().find(|op| op.path == "a.txt").unwrap();
+        let streamed = stored.ops.iter().find(|op| op.path == "b.txt").unwrap();
+        assert_eq!(inline.bytes.as_deref(), Some(b"EDITED".as_slice()));
+        assert!(streamed.bytes.is_none());
+        assert!(streamed.content_hash.as_deref().unwrap_or("").len() == 64);
+    }
+
+    #[test]
     fn listed_zip_names_do_not_include_directories() {
         let dir = tempfile::tempdir().unwrap();
         let zip_path = dir.path().join("names.zip");
