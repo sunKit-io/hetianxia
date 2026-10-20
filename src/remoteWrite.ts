@@ -31,10 +31,7 @@ export type RemotePlanFile = {
   content: string;
 };
 
-/**
- * fd82620 的 SavedConnection 没有远程目录。keyPath 是本机私钥。
- * 写入许可上的 remote_path 由「连接远程根 + 计划文件相对路径」拼成；根为空时路径就是相对路径。
- */
+/** 选中连接的 remoteRoot。空字符串表示还没填，或这版连接对象上还没有该字段。 */
 let remoteRoot = "";
 
 export type RemoteConnection = {
@@ -46,24 +43,64 @@ export type RemoteConnection = {
   auth: string;
   keyPath: string;
   fingerprint: string;
+  remoteRoot?: string | null;
 };
 
-export function connectionRemoteRoot(connection: RemoteConnection | null): string {
-  if (!connection) return "";
-  return "";
+export function connectionRemoteRoot(connection: { remoteRoot?: string | null } | null): string {
+  const value = connection?.remoteRoot;
+  return typeof value === "string" ? value : "";
+}
+
+/** 绝对 POSIX 目录。含 `..` 且逃出根、或不是以 / 开头，都不算。 */
+export function isAbsoluteRemoteRoot(root: string): boolean {
+  if (!root.startsWith("/") || root.includes("\\") || root.includes("\0") || root.split("/").includes("..")) return false;
+  return posixSegments(root) != null;
 }
 
 export function noteRemoteRoot(root: string) {
   remoteRoot = root;
 }
 
+function posixSegments(path: string): string[] | null {
+  if (path.includes("\\") || path.includes("\0")) return null;
+  const out: string[] = [];
+  for (const part of path.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (out.length === 0) return null;
+      out.pop();
+      continue;
+    }
+    out.push(part);
+  }
+  return out;
+}
+
+/** 把远程目录和计划相对路径按 POSIX 拼起来。逃出根、绝对相对路径、或根不是绝对路径时返回空字符串。 */
 export function joinRemote(root: string, rel: string): string {
-  const file = rel.replace(/\\/g, "/").replace(/^\/+/, "");
-  if (!file || file.split("/").some((part) => part === "" || part === "." || part === "..")) return "";
-  const base = root.replace(/\\/g, "/").replace(/\/+$/, "");
-  if (!base) return file;
-  if (base.split("/").some((part) => part === "." || part === "..")) return "";
-  return `${base}/${file}`;
+  if (!isAbsoluteRemoteRoot(root)) return "";
+  const relPosix = rel.replace(/\\/g, "/");
+  if (!relPosix || relPosix.startsWith("/") || relPosix.includes("\0")) return "";
+  const rootSeg = posixSegments(root);
+  if (!rootSeg) return "";
+  const stack = [...rootSeg];
+  let added = 0;
+  for (const part of relPosix.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (added === 0) return "";
+      stack.pop();
+      added -= 1;
+      continue;
+    }
+    stack.push(part);
+    added += 1;
+  }
+  if (added <= 0) return "";
+  for (let i = 0; i < rootSeg.length; i += 1) {
+    if (stack[i] !== rootSeg[i]) return "";
+  }
+  return `/${stack.join("/")}`;
 }
 
 export function currentRemotePlan(): RemotePlanFile | null {

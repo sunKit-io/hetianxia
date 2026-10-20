@@ -3,7 +3,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 import { clearFileNotes, noteShownFile, rememberEdit, type LocalPlan } from "./localPlan.ts";
-import { connectionRemoteRoot, currentRemotePlan, joinRemote, noteRemoteRoot, remoteWriteBody, settleRemoteWrite, verifyFailureBody } from "./remoteWrite.ts";
+import { connectionRemoteRoot, currentRemotePlan, isAbsoluteRemoteRoot, joinRemote, noteRemoteRoot, remoteWriteBody, settleRemoteWrite, verifyFailureBody } from "./remoteWrite.ts";
 
 test("dialog copy uses the runtime backup path and cancel writes nothing", () => {
   const dir = "/var/lib/hetianxia/bak/tx-100";
@@ -54,8 +54,8 @@ function samplePlan(text: string): LocalPlan {
   };
 }
 
-test("currentRemotePlan returns the selected file, joined to the remote root, including edits", () => {
-  assert.equal(connectionRemoteRoot({
+test("currentRemotePlan joins remoteRoot with the relative path and keeps edits", () => {
+  const connection = {
     id: "1",
     name: "edge",
     host: "10.0.0.8",
@@ -64,18 +64,42 @@ test("currentRemotePlan returns the selected file, joined to the remote root, in
     auth: "key",
     keyPath: "/home/ops/.ssh/id_ed25519",
     fingerprint: "SHA256:aa",
-  }), "");
+    remoteRoot: "/srv/site",
+  };
+  assert.equal(connectionRemoteRoot({ ...connection, remoteRoot: undefined }), "");
+  assert.equal(connectionRemoteRoot(connection), "/srv/site");
+  assert.equal(connectionRemoteRoot({ ...connection, remoteRoot: "srv/site" }), "srv/site");
+  assert.equal(isAbsoluteRemoteRoot(""), false);
+  assert.equal(isAbsoluteRemoteRoot("srv/site"), false);
+  assert.equal(isAbsoluteRemoteRoot("/srv/site"), true);
   assert.equal(currentRemotePlan(), null);
   noteShownFile(samplePlan("next\n"), "src/app.js");
-  assert.deepEqual(currentRemotePlan(), { remotePath: "src/app.js", content: "next\n" });
+  noteRemoteRoot("");
+  assert.equal(currentRemotePlan(), null);
+  noteRemoteRoot("srv/site");
+  assert.equal(currentRemotePlan(), null);
+  noteRemoteRoot("/srv/site");
+  assert.deepEqual(currentRemotePlan(), { remotePath: "/srv/site/src/app.js", content: "next\n" });
   rememberEdit("src/app.js", "edited\n", "next\n");
   assert.equal(currentRemotePlan()?.content, "edited\n");
-  noteRemoteRoot("/srv/site");
   assert.equal(currentRemotePlan()?.remotePath, "/srv/site/src/app.js");
-  assert.equal(joinRemote("/srv/site/", "src/app.js"), "/srv/site/src/app.js");
   clearFileNotes();
   noteShownFile(null, null);
   noteRemoteRoot("");
+});
+
+test("joinRemote stays inside an absolute POSIX root", () => {
+  assert.equal(joinRemote("/srv/site/", "src/app.js"), "/srv/site/src/app.js");
+  assert.equal(joinRemote("/srv/site", "./src/app.js"), "/srv/site/src/app.js");
+  assert.equal(joinRemote("/srv/site", "src/../app.js"), "/srv/site/app.js");
+  assert.equal(joinRemote("/srv/site", "../etc/passwd"), "");
+  assert.equal(joinRemote("/srv/site", "foo/../../etc/passwd"), "");
+  assert.equal(joinRemote("/srv/site", "/etc/passwd"), "");
+  assert.equal(joinRemote("/srv", "site-extra/a"), "/srv/site-extra/a");
+  assert.equal(joinRemote("/srv/site", "site-extra"), "/srv/site/site-extra");
+  assert.equal(joinRemote("srv/site", "a"), "");
+  assert.equal(joinRemote("", "src/app.js"), "");
+  assert.equal(joinRemote("/srv/../etc", "passwd"), "");
 });
 
 test("the frontend has no baked home or product backup path", () => {

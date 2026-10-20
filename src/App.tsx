@@ -21,7 +21,7 @@ import {
 import { formatFileCounts, formatRunTime, historyContinue, historyRowButtons, historyStatusLabel, REMOTE_ROLLBACK_TITLE, type HistoryContinue } from "./historyRows";
 import { Text } from "./plain";
 import { remoteRootFieldError } from "./remoteRoot";
-import { VERIFY_FAILED_BUTTON, VERIFY_FAILED_TITLE, connectionRemoteRoot, currentRemotePlan, noteRemoteRoot, settleRemoteWrite, type PendingRemoteWrite } from "./remoteWrite";
+import { VERIFY_FAILED_BUTTON, VERIFY_FAILED_TITLE, connectionRemoteRoot, currentRemotePlan, isAbsoluteRemoteRoot, noteRemoteRoot, settleRemoteWrite, type PendingRemoteWrite } from "./remoteWrite";
 import {
   DETAIL_DELETED,
   OVERWRITE_PENDING,
@@ -287,6 +287,7 @@ export function App() {
             onExecute={() => { void backupAndExecute(editedContents()); }}
             onOpenFile={(path) => { setCurrentFile(path); setPage("edit"); }}
             connectionSelected={selected != null}
+            remoteRootReady={isAbsoluteRemoteRoot(connectionRemoteRoot(selected))}
             onRemoteWrite={() => {
               const plan = currentRemotePlan();
               if (!selected) {
@@ -606,6 +607,7 @@ function PreviewPage({
   onExecute,
   onOpenFile,
   connectionSelected,
+  remoteRootReady,
   onRemoteWrite,
 }: {
   allowReadonly: boolean;
@@ -622,12 +624,13 @@ function PreviewPage({
   onExecute: () => void;
   onOpenFile: (path: string) => void;
   connectionSelected: boolean;
+  remoteRootReady: boolean;
   onRemoteWrite: () => void;
 }) {
   const [target, setTarget] = useState<"local" | "remote">("local");
   const counts = useMemo(() => previewCounts(plan?.files ?? [], allowReadonly), [plan, allowReadonly]);
   const localReady = Boolean(plan) && !scanning && !running;
-  const remoteReady = connectionSelected && currentRemotePlan() != null;
+  const remoteReady = connectionSelected && remoteRootReady && currentRemotePlan() != null;
   const localSub = projectRoot && packagePath ? `${baseName(projectRoot)} · ${projectRoot} ← ${baseName(packagePath)}` : "";
   const readonlyFiles = (plan?.files ?? []).filter((file) => file.readonly && (file.kind === "overwrite" || file.kind === "delete"));
   return (
@@ -686,6 +689,7 @@ function PreviewPage({
         )}
         {running && <p role="status">正在备份并执行…</p>}
         <p className="bak">执行前备份到 {bakDir ? <Text value={bakDir} /> : "…"}</p>
+        {target === "remote" && !remoteRootReady && <p>先在连接里填远程目录</p>}
         <footer>
           <button className="primary" disabled={target === "local" ? !localReady : !remoteReady} onClick={() => { if (target === "remote") onRemoteWrite(); else onExecute(); }}>{target === "remote" ? "写入远程" : "备份并执行"}</button>
         </footer>
