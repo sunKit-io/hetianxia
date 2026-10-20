@@ -24,5 +24,7 @@ test("the editor and screens do not inject HTML", () => {
     assert.equal(/\.innerHTML\s*=/.test(src), false);
   }
   const editor = readFileSync(new URL("./editor.tsx", import.meta.url), "utf8");
-  assert.match(editor, /EditorState\.create\(\{ doc: LEFT/);
+  assert.equal(editor.includes("doc: LEFT"), false);
+  assert.match(editor, /EditorState\.create\(\{ doc: leftText/);
+  assert.match(editor, /doc: rightDoc/);
 });

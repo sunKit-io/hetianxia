@@ -248,6 +248,71 @@ fn free_bytes(dest: &Path) -> Result<u64> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZipListed {
+    pub name: String,
+    pub size: u64,
+}
+
+/// 只读中央目录。不把条目内容读进内存。路径穿越或压缩炸弹拒绝整个包。
+pub fn list_files(zip_path: &Path) -> Result<Vec<ZipListed>> {
+    let file = File::open(zip_path)?;
+    let mut archive = ZipArchive::new(file).map_err(|e| Error::new(ErrorCode::Io, e.to_string()))?;
+    let mut stats = Vec::new();
+    let mut slips = Vec::new();
+    let mut listed = Vec::new();
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i).map_err(|e| Error::new(ErrorCode::Io, e.to_string()))?;
+        let name = entry_name(zip_path, &entry)?;
+        let is_dir = name.ends_with('/');
+        stats.push(EntryStat {
+            uncompressed: entry.size(),
+            compressed: entry.compressed_size(),
+            is_dir,
+        });
+        if is_zip_slip(&name) {
+            slips.push(name);
+            continue;
+        }
+        if is_dir || is_symlink(entry.unix_mode()) {
+            continue;
+        }
+        listed.push(ZipListed { name, size: entry.size() });
+    }
+    if !slips.is_empty() {
+        return Err(Error::new(
+            ErrorCode::ZipSlip,
+            format!("升级包里有 {} 条路径穿越，已拒绝整个包", slips.len()),
+        )
+        .with_paths(slips));
+    }
+    if let Some(reason) = bomb_reason(&stats) {
+        let message = match reason {
+            Bomb::Entries(n) => format!("条目总数 {n} 超过 {MAX_ENTRIES}"),
+            Bomb::Total(n) => format!("解压后总大小 {n} 字节超过 {MAX_UNCOMPRESSED}"),
+            Bomb::Ratio { uncompressed, compressed } => format!("压缩比超过 {MAX_RATIO} 倍（{uncompressed}/{compressed}）"),
+        };
+        return Err(Error::new(ErrorCode::ZipBomb, message));
+    }
+    Ok(listed)
+}
+
+/// 按条目名流式读一个文件。调用方自己限制缓冲区。
+pub fn with_entry<T>(zip_path: &Path, name: &str, body: impl FnOnce(&mut dyn Read, u64) -> Result<T>) -> Result<T> {
+    let file = File::open(zip_path)?;
+    let mut archive = ZipArchive::new(file).map_err(|e| Error::new(ErrorCode::Io, e.to_string()))?;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| Error::new(ErrorCode::Io, e.to_string()))?;
+        let entry_name = entry_name(zip_path, &entry)?;
+        if entry_name != name {
+            continue;
+        }
+        let declared = entry.size();
+        return body(&mut entry, declared);
+    }
+    Err(Error::new(ErrorCode::NotFound, format!("升级包里没有 {name}")))
+}
+
 pub fn copy_capped(reader: &mut impl Read, declared: u64, out: &mut impl Write) -> Result<u64> {
     let mut buf = [0u8; 8192];
     let mut written = 0u64;

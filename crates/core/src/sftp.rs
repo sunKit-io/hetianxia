@@ -8,7 +8,7 @@ use std::time::Duration;
 use russh::client::Handler;
 use russh::keys::PrivateKeyWithHashAlg;
 use russh_sftp::client::RawSftpSession;
-use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
+use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags, StatusCode};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
@@ -374,6 +374,42 @@ impl RemoteSession {
         Err(remote::remote_write_unsupported())
     }
 
+    /// 先 lstat。符号链接不当成目录打开，避免顺着链接走出远程目录。
+    pub async fn list_child_entries(&self, path: &str) -> Result<Vec<crate::remote_browse::RawEntry>> {
+        let stat = self.sftp.lstat(path).await.map_err(map_sftp)?;
+        let kind = stat.attrs.file_type();
+        if kind.is_symlink() {
+            return Err(Error::new(ErrorCode::SymlinkRefused, "这是符号链接"));
+        }
+        if !kind.is_dir() {
+            return Err(Error::new(ErrorCode::InvalidLocation, "这不是文件夹"));
+        }
+        let opened = self.sftp.opendir(path).await.map_err(map_sftp)?;
+        let mut entries = Vec::new();
+        loop {
+            match self.sftp.readdir(&opened.handle).await {
+                Ok(name) => {
+                    for file in name.files {
+                        let kind = match file.attrs.file_type() {
+                            FileType::Dir => crate::remote_browse::EntryKind::Dir,
+                            FileType::File => crate::remote_browse::EntryKind::File,
+                            FileType::Symlink => crate::remote_browse::EntryKind::Link,
+                            FileType::Other => crate::remote_browse::EntryKind::Other,
+                        };
+                        entries.push(crate::remote_browse::RawEntry { name: file.filename, kind });
+                    }
+                }
+                Err(russh_sftp::client::error::Error::Status(status)) if status.status_code == StatusCode::Eof => break,
+                Err(err) => {
+                    let _ = self.sftp.close(&opened.handle).await;
+                    return Err(map_sftp(err));
+                }
+            }
+        }
+        self.sftp.close(&opened.handle).await.map_err(map_sftp)?;
+        Ok(entries)
+    }
+
     pub async fn exists(&self, path: &str) -> Result<bool> {
         match self.sftp.lstat(path).await {
             Ok(_) => Ok(true),
@@ -522,6 +558,99 @@ impl RemoteSession {
         }
         req.secret.zeroize();
         result.and_then(|inner| inner)
+    }
+
+    /// 同一个连接里按顺序写。某一项失败就停，后面的文件保持原样。
+    pub fn commit_batch_blocking(
+        req: &mut ProbeRequest,
+        exec_id: &str,
+        app_data_dir: PathBuf,
+    ) -> Result<crate::remote_write::RemoteBatchReport> {
+        let granted = match crate::remote_write::take_batch(exec_id, crate::remote_write::now_ms()) {
+            Ok(granted) => granted,
+            Err(err) => {
+                req.secret.zeroize();
+                return Err(err);
+            }
+        };
+        if granted.host != req.host || granted.port != req.port || granted.user != req.user {
+            req.secret.zeroize();
+            return Err(Error::new(ErrorCode::InvalidState, "写入确认和主机不一致"));
+        }
+        lock_commit_fingerprint(req, &granted.fingerprint);
+        let db_path = req.db_path.clone();
+        let host = granted.host.clone();
+        let user = granted.user.clone();
+        let port = granted.port;
+        let paths: Vec<String> = granted.files.iter().map(|file| file.remote_path.clone()).collect();
+        let backup_dir = crate::remote_write::tx_backup_dir(&app_data_dir, exec_id)?.display().to_string();
+        let result = block_on(async {
+            let connected = RemoteSession::connect(req).await;
+            let mut session = match connected {
+                Ok(session) => session,
+                Err(err) => {
+                    let failed = if paths.is_empty() { None } else { Some((0, err.code_str().to_string())) };
+                    return Ok(crate::remote_write::assemble_report(&backup_dir, &paths, failed, &[]));
+                }
+            };
+            let mut failed = None;
+            let mut backed_up = vec![false; paths.len()];
+            for (index, file) in granted.files.into_iter().enumerate() {
+                let file = match exec::open_db(Path::new(&db_path)).and_then(|db| crate::remote_write::materialize_batch_file(&db, file)) {
+                    Ok(file) => file,
+                    Err(err) => {
+                        failed = Some((index, err.code_str().to_string()));
+                        break;
+                    }
+                };
+                let write = match crate::remote_write::request_from_stored(
+                    exec_id,
+                    &app_data_dir,
+                    true,
+                    index as u32,
+                    &host,
+                    port,
+                    &user,
+                    file,
+                ) {
+                    Ok(write) => write,
+                    Err(err) => {
+                        failed = Some((index, err.code_str().to_string()));
+                        break;
+                    }
+                };
+                match session.commit_overwrite(write).await {
+                    Ok(crate::remote_write::CommitResult::Written(staged)) => {
+                        backed_up[index] = staged.backup_file.is_some();
+                    }
+                    Err(err) => {
+                        failed = Some((index, err.code_str().to_string()));
+                        break;
+                    }
+                }
+            }
+            let _ = session.close().await;
+            Ok(crate::remote_write::assemble_report(&backup_dir, &paths, failed, &backed_up))
+        });
+        req.secret.zeroize();
+        result.and_then(|inner| inner)
+    }
+
+    /// 列出当前目录下的文件夹。`root` 是连接里的远程目录，`path` 不能走到它外面。
+    pub fn list_dirs_blocking(req: &mut ProbeRequest, root: &str, path: &str) -> Result<Vec<String>> {
+        let current = crate::remote_browse::directory_inside(root, path)?;
+        let result = block_on(async {
+            let session = match RemoteSession::connect(req).await {
+                Ok(session) => session,
+                Err(err) => return Err(err),
+            };
+            let listed = session.list_child_entries(&current).await;
+            let _ = session.close().await;
+            listed
+        });
+        req.secret.zeroize();
+        let entries = result.and_then(|inner| inner)?;
+        crate::remote_browse::directory_names(root, &current, &entries)
     }
 
     async fn write_new(&self, path: &str, bytes: &[u8]) -> Result<()> {

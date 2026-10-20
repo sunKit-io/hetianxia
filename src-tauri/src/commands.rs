@@ -1,4 +1,6 @@
 use hetianxia_core::error::{Error, ErrorCode};
+use hetianxia_core::hashutil::sha256_hex;
+use hetianxia_core::pathutil::RelPath;
 use tauri::Manager;
 use hetianxia_core::exec::{self, ExecOpts, ExecReport, HistoryRow, ResumeChoice, ResumeOutcome, RollbackChoice};
 use hetianxia_core::model::ExecPlan;
@@ -8,7 +10,8 @@ use hetianxia_core::remote::{self, ImportedHost};
 use hetianxia_core::scan::{self, ScanOptions, ScanOutput};
 use hetianxia_core::secrets::{self, KeyringStore, SecretStatus, SecretStore};
 use hetianxia_core::connections::{self, SavedConnection};
-use hetianxia_core::remote_write::{self, RemoteWritePrompt, WritePromptInput};
+use hetianxia_core::remote_browse;
+use hetianxia_core::remote_write::{self, RemoteBatchReport, RemoteWritePrompt, UploadBatch, UploadFile};
 use hetianxia_core::sftp::{self, ProbeReport, ProbeRequest};
 use hetianxia_core::vfs::LocalFs;
 use std::path::{Path, PathBuf};
@@ -37,16 +40,22 @@ fn ready(session: &crate::Session) -> Result<(), Error> {
     Ok(())
 }
 
-#[tauri::command]
-pub fn scan(left: String, right: String) -> Result<ScanOutput, Error> {
+pub fn scan_paths(left: String, right: String) -> Result<ScanOutput, Error> {
     let left = LocalFs::new(left);
     let right = LocalFs::new(right);
-    scan::scan_local(&left, &right, &Ignore::defaults(), &ScanOptions::default())
+    scan::run_scan(&left, &right, &Ignore::defaults(), &ScanOptions::default())
+}
+
+#[tauri::command]
+pub fn scan(session: tauri::State<crate::Session>, left: String, right: String) -> Result<ScanOutput, Error> {
+    ready(&session)?;
+    let db = exec::open_db(&session.db_path)?;
+    hetianxia_core::pkg::scan_recorded(&db, Path::new(&left), Path::new(&right))
 }
 
 #[tauri::command]
 pub fn compare(left: String, right: String) -> Result<ScanOutput, Error> {
-    scan(left, right)
+    scan_paths(left, right)
 }
 
 #[tauri::command]
@@ -61,6 +70,7 @@ pub fn merge(left: String, right: String, decision: String) -> Result<Rendered, 
     let decision = match decision.as_str() {
         "keepLeft" => Decision::KeepLeft,
         "both" => Decision::Both { right_first: false },
+        "bothRight" => Decision::Both { right_first: true },
         _ => Decision::TakeRight,
     };
     merge::set_all(&mut state, decision, true).map_err(|_| {
@@ -69,7 +79,121 @@ pub fn merge(left: String, right: String, decision: String) -> Result<Rendered, 
     Ok(merge::render(&file, &state))
 }
 
-pub fn execute_in(db_path: &Path, root: &Path, backup_root: &Path, mut plan: ExecPlan, allow_readonly: bool) -> Result<ExecReport, Error> {
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SideText {
+    pub present: bool,
+    pub binary: bool,
+    pub text: String,
+    pub bytes: Vec<u8>,
+    pub size: u64,
+    pub mtime_ms: Option<i64>,
+    pub sha256: String,
+}
+
+fn text_of(doc: &merge::TextDoc) -> String {
+    let mut text = doc.lines.join(&doc.newline);
+    if doc.ends_with_newline {
+        text.push_str(&doc.newline);
+    }
+    text
+}
+
+/// 只读。缺文件时 present 为 false，不改磁盘。
+/// 不把文件字节交回界面。超过 1MB 的文件只返回哈希和大小。
+#[tauri::command]
+pub fn read_side(root: String, rel: String) -> Result<SideText, Error> {
+    let fs = LocalFs::new(&root);
+    let parsed = RelPath::parse(&rel)?;
+    let stat = match fs.stat(&parsed) {
+        Err(err) if err.code == ErrorCode::NotFound => {
+            return Ok(SideText {
+                present: false,
+                binary: false,
+                text: String::new(),
+                bytes: Vec::new(),
+                size: 0,
+                mtime_ms: None,
+                sha256: sha256_hex(b""),
+            });
+        }
+        Err(err) => return Err(err),
+        Ok(stat) => stat,
+    };
+    if stat.kind != hetianxia_core::vfs::EntryKind::File || stat.size > 1024 * 1024 {
+        let sha = if stat.kind == hetianxia_core::vfs::EntryKind::File {
+            fs.hash(&parsed, true)?
+        } else {
+            sha256_hex(b"")
+        };
+        return Ok(SideText {
+            present: true,
+            binary: true,
+            text: String::new(),
+            bytes: Vec::new(),
+            size: stat.size,
+            mtime_ms: stat.mtime_ms,
+            sha256: sha,
+        });
+    }
+    let bytes = fs.read(&parsed)?;
+    let doc = merge::decode(&bytes);
+    Ok(SideText {
+        present: true,
+        binary: doc.binary,
+        text: if doc.binary { String::new() } else { text_of(&doc) },
+        size: stat.size,
+        mtime_ms: stat.mtime_ms,
+        sha256: sha256_hex(&bytes),
+        bytes: Vec::new(),
+    })
+}
+
+/// scan 的右边必须是目录。zip 先解到临时目录，目录原样返回。
+#[tauri::command]
+pub fn prepare_package(path: String) -> Result<String, Error> {
+    let target = PathBuf::from(&path);
+    if target.is_dir() {
+        return Ok(path);
+    }
+    let zip = target
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
+    if zip && target.is_file() {
+        let temp = std::env::temp_dir().join("hetianxia-packages");
+        std::fs::create_dir_all(&temp)?;
+        let extracted = hetianxia_core::zipfs::extract_to_temp(&target, &temp)?;
+        return Ok(extracted.dir.display().to_string());
+    }
+    Err(Error::new(ErrorCode::NotFound, "升级包需要是目录或 zip 文件"))
+}
+
+pub fn confirm_execute_in(
+    db_path: &Path,
+    backup_root: &Path,
+    root: &Path,
+    plan: &ExecPlan,
+    allow_readonly: bool,
+) -> Result<exec::ExecuteConfirm, Error> {
+    let db = exec::open_db(db_path)?;
+    let fsys = LocalFs::new(root);
+    exec::issue_execute_confirm(&db, backup_root, &fsys, plan, allow_readonly)
+}
+
+/// 先核销一次性确认令牌。没确认就返回，不记项目目录，也不调用执行。
+pub fn execute_in(
+    db_path: &Path,
+    root: &Path,
+    backup_root: &Path,
+    mut plan: ExecPlan,
+    allow_readonly: bool,
+    token: &str,
+) -> Result<ExecReport, Error> {
+    {
+        let db = exec::open_db(db_path)?;
+        exec::consume_execute_confirm(&db, &plan.id, token)?;
+    }
     remember_project_root(db_path, root);
     plan.project_root = root.display().to_string();
     let db = exec::open_db(db_path)?;
@@ -80,19 +204,35 @@ pub fn execute_in(db_path: &Path, root: &Path, backup_root: &Path, mut plan: Exe
 }
 
 #[tauri::command]
-pub fn execute(
+pub fn confirm_execute(
     session: tauri::State<crate::Session>,
     root: String,
     plan: ExecPlan,
     allow_readonly: bool,
+) -> Result<exec::ExecuteConfirm, Error> {
+    ready(&session)?;
+    if !session.backup_root.is_absolute() {
+        return Err(Error::new(ErrorCode::InvalidState, "本机备份目录还没准备好"));
+    }
+    confirm_execute_in(&session.db_path, &session.backup_root, Path::new(&root), &plan, allow_readonly)
+}
+
+#[tauri::command]
+pub fn execute(
+    session: tauri::State<crate::Session>,
+    root: String,
+    plan: serde_json::Value,
+    allow_readonly: bool,
+    token: String,
 ) -> Result<ExecReport, Error> {
     ready(&session)?;
+    let plan = hetianxia_core::model::parse_client_plan(plan)?;
     let project = PathBuf::from(&root);
     {
         let mut saved = session.project_root.lock().map_err(|_| Error::new(ErrorCode::Internal, "项目目录锁被占用"))?;
         *saved = project.clone();
     }
-    execute_in(&session.db_path, &project, &session.backup_root, plan, allow_readonly)
+    execute_in(&session.db_path, &project, &session.backup_root, plan, allow_readonly, &token)
 }
 
 pub fn rollback_in(db_path: &Path, root: &Path, exec_id: &str, choice: RollbackChoice) -> Result<ExecReport, Error> {
@@ -302,6 +442,28 @@ pub fn remote_rename_plan(posix_rename: bool) -> Vec<String> {
     sftp::rename_steps(posix_rename).iter().map(|s| (*s).to_string()).collect()
 }
 
+pub fn load_file_picks_in(db_path: &Path, project_root: &str, package_path: &str) -> Result<Vec<String>, Error> {
+    let db = exec::open_db(db_path)?;
+    hetianxia_core::picks::load_skipped(&db, project_root, package_path)
+}
+
+pub fn save_file_picks_in(db_path: &Path, project_root: &str, package_path: &str, skipped: &[String]) -> Result<(), Error> {
+    let db = exec::open_db(db_path)?;
+    hetianxia_core::picks::save_skipped(&db, project_root, package_path, skipped)
+}
+
+#[tauri::command]
+pub fn load_file_picks(session: tauri::State<crate::Session>, project_root: String, package_path: String) -> Result<Vec<String>, Error> {
+    ready(&session)?;
+    load_file_picks_in(&session.db_path, &project_root, &package_path)
+}
+
+#[tauri::command]
+pub fn save_file_picks(session: tauri::State<crate::Session>, project_root: String, package_path: String, skipped: Vec<String>) -> Result<(), Error> {
+    ready(&session)?;
+    save_file_picks_in(&session.db_path, &project_root, &package_path, &skipped)
+}
+
 #[tauri::command]
 pub fn app_bak_dir(session: tauri::State<crate::Session>) -> Result<String, Error> {
     ready(&session)?;
@@ -438,14 +600,27 @@ pub fn read_ssh_config() -> Result<Vec<ImportedHost>, Error> {
     Ok(hosts)
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemotePromptFile {
+    pub remote_path: String,
+    pub path: String,
+    #[serde(default)]
+    pub bytes: Option<Vec<u8>>,
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default)]
+    pub source: Option<hetianxia_core::model::ContentSource>,
+}
+
 #[tauri::command]
 pub fn remote_write_prompt(
     app: tauri::AppHandle,
     session: tauri::State<crate::Session>,
     connection_id: String,
-    remote_path: String,
-    content: Vec<u8>,
-    content_sha256: Option<String>,
+    files: Vec<RemotePromptFile>,
 ) -> Result<RemoteWritePrompt, Error> {
     ready(&session)?;
     let app_data = app.path().app_data_dir().map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
@@ -458,28 +633,65 @@ pub fn remote_write_prompt(
         return Err(Error::new(ErrorCode::Unsupported, "ssh-agent 这一版还不能用来连接"));
     }
     let key_path = if saved.key_path.is_empty() { None } else { Some(saved.key_path.clone()) };
-    let remote_path = connections::path_inside_remote_root(saved.remote_root.as_deref(), &remote_path)?;
-    let input = WritePromptInput {
+    if files.is_empty() {
+        return Err(Error::new(ErrorCode::InvalidState, "至少选一个文件"));
+    }
+    let mut normalized = Vec::new();
+    for file in files {
+        let remote_path = connections::path_inside_remote_root(saved.remote_root.as_deref(), &file.remote_path)?;
+        normalized.push(UploadFile {
+            remote_path,
+            path: file.path,
+            bytes: file.bytes,
+            content_hash: file.content_hash,
+            size: file.size,
+            source: file.source,
+        });
+    }
+    for file in &normalized {
+        remote_write::reject_merged_upload(&db, file)?;
+    }
+    let input = UploadBatch {
         host: &saved.host,
         port: saved.port,
         user: &saved.user,
         auth: &saved.auth,
         fingerprint: &saved.fingerprint,
-        remote_path: &remote_path,
-        content: &content,
-        content_sha256: content_sha256.as_deref(),
         account: Some(saved.id.as_str()),
         key_path: key_path.as_deref(),
+        files: &normalized,
     };
-    remote_write::issue_write_prompt(&app_data, &input)
+    remote_write::issue_upload(&app_data, &input)
 }
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RemoteWriteOutcome {
-    pub exec_id: String,
-    pub remote_path: String,
-    pub backup_path: Option<String>,
+pub struct RemoteDirListing {
+    pub path: String,
+    pub dirs: Vec<String>,
+}
+
+#[tauri::command]
+pub fn list_remote_dirs(
+    app: tauri::AppHandle,
+    session: tauri::State<crate::Session>,
+    connection_id: String,
+    path: String,
+) -> Result<RemoteDirListing, Error> {
+    ready(&session)?;
+    let app_data = app.path().app_data_dir().map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
+    let db = exec::open_db(&session.db_path)?;
+    let saved = connections::get(&db, &connection_id)?;
+    if saved.auth == "agent" {
+        return Err(Error::new(ErrorCode::Unsupported, "ssh-agent 这一版还不能用来连接"));
+    }
+    let root = saved.remote_root.as_deref().map(str::trim).filter(|value| !value.is_empty()).ok_or_else(|| {
+        Error::new(ErrorCode::InvalidState, "先在连接里填远程目录")
+    })?;
+    let current = remote_browse::directory_inside(root, &path)?;
+    let mut probe = probe_for_saved(&saved, &app_data, &session, false, None)?;
+    let dirs = sftp::RemoteSession::list_dirs_blocking(&mut probe, root, &current)?;
+    Ok(RemoteDirListing { path: current, dirs })
 }
 
 #[tauri::command]
@@ -487,13 +699,13 @@ pub fn commit_remote_overwrite(
     app: tauri::AppHandle,
     session: tauri::State<crate::Session>,
     exec_id: String,
-) -> Result<RemoteWriteOutcome, Error> {
+) -> Result<RemoteBatchReport, Error> {
     ready(&session)?;
     let app_data = app.path().app_data_dir().map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
     if crate::app_backup_root(&app_data) != session.backup_root {
         return Err(Error::new(ErrorCode::InvalidState, "备份目录和本次运行不一致"));
     }
-    let stored = remote_write::borrow_granted_connection(&exec_id, remote_write::now_ms())?;
+    let stored = remote_write::borrow_batch(&exec_id, remote_write::now_ms())?;
     let mut probe = ProbeRequest {
         host: stored.host.clone(),
         port: stored.port,
@@ -506,7 +718,7 @@ pub fn commit_remote_overwrite(
         known_hosts_path: app_data.join("known_hosts").display().to_string(),
         db_path: session.db_path.display().to_string(),
         accept_new: !stored.fingerprint.is_empty(),
-        confirmed_fingerprint: if stored.fingerprint.is_empty() { None } else { Some(stored.fingerprint) },
+        confirmed_fingerprint: if stored.fingerprint.is_empty() { None } else { Some(stored.fingerprint.clone()) },
         strict_fingerprint: None,
     };
     probe.secret.clear();
@@ -517,13 +729,60 @@ pub fn commit_remote_overwrite(
             }
         }
     }
-    let remote_path = stored.remote_path.clone();
-    let committed = sftp::RemoteSession::commit_overwrite_blocking(&mut probe, &exec_id, app_data)?;
-    let remote_write::CommitResult::Written(staged) = committed;
-    Ok(RemoteWriteOutcome {
-        exec_id,
-        remote_path,
-        backup_path: staged.backup_file.map(|path| path.display().to_string()),
-    })
+    sftp::RemoteSession::commit_batch_blocking(&mut probe, &exec_id, app_data)
+}
+
+/// 备份路径必须落在本次运行的 bak 目录里。解析符号链接后再比较，避免指到目录外面。
+pub(crate) fn backup_contains(backup: &Path, target: &Path) -> Result<PathBuf, Error> {
+    let root = backup.canonicalize().map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
+    if !target.exists() {
+        return Err(Error::new(ErrorCode::NotFound, "备份文件不在了"));
+    }
+    let canon = target.canonicalize().map_err(|err| Error::new(ErrorCode::Io, err.to_string()))?;
+    if !canon.starts_with(&root) {
+        return Err(Error::new(ErrorCode::InvalidLocation, "只能显示备份目录里的文件"));
+    }
+    Ok(canon)
+}
+
+fn reveal_in_file_manager(path: &Path) -> Result<(), Error> {
+    let status = reveal_command(path)
+        .status()
+        .map_err(|err| Error::new(ErrorCode::Io, format!("无法在文件管理器中显示：{err}")))?;
+    if !status.success() {
+        return Err(Error::new(ErrorCode::Io, "无法在文件管理器中显示"));
+    }
+    Ok(())
+}
+
+fn reveal_command(path: &Path) -> std::process::Command {
+    // 和 tauri-plugin-opener 的 reveal_item_in_dir 一样：macOS 用 Finder 的 open -R。
+    // 不挂 shell / opener 插件，能力表里也就没有 shell: 或 fs:。调用方先用 backup_contains 收窄路径。
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = std::process::Command::new("open");
+        cmd.arg("-R").arg(path);
+        return cmd;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = std::process::Command::new("explorer");
+        cmd.arg(format!("/select,{}", path.display()));
+        return cmd;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let mut cmd = std::process::Command::new("xdg-open");
+        let parent = path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(path);
+        cmd.arg(parent);
+        cmd
+    }
+}
+
+#[tauri::command]
+pub fn reveal_backup(session: tauri::State<crate::Session>, path: String) -> Result<(), Error> {
+    ready(&session)?;
+    let canon = backup_contains(&session.backup_root, Path::new(&path))?;
+    reveal_in_file_manager(&canon)
 }
 

@@ -16,6 +16,8 @@ serde = { version = "=1.0.214", features = ["derive"] }
 serde_json = "=1.0.132"
 tauri = "=2.1.1"
 tauri-plugin-single-instance = "=2.0.1"
+# 2.2.2 仍可用 Rust 1.83 / Tauri 2.1。Linux 上走 rfd 的 GTK 文件对话框。
+tauri-plugin-dialog = "=2.2.2"
 # 插件在 Linux 上用 zbus 4。不钉的话会拉到需要 Rust 1.85 的传递依赖。
 zbus = "=4.3.1"
 proc-macro-crate = "=3.1.0"
@@ -40,3 +42,4 @@ tauri-utils = "=2.1.0"
 
 [dev-dependencies]
 tempfile = "=3.14.0"
+zip = { version = "=2.6.1", default-features = false, features = ["deflate"] }

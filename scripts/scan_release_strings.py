@@ -28,18 +28,26 @@ NEEDLES = (b"UPG_FAULT", b"sftp-disconnect", b"HTX_FAULT_INJECT_ENABLED", b"fsyn
 STAGE = re.compile(
     rb"(?:backup|write|verify-pre|verify-post|rename|rollback|log|log-probe|fsync-dir|sftp-disconnect):[0-9a-z]"
 )
-# 只留不容易撞上正式二进制的名字。Backup / Rename / Rollback / Log 会命中 brotli 词典和 log::Log。
-# Write 会命中 std::io::Write。阶段语法仍由 STAGE 抓住，例如 backup:1、log:1。LogProbe 要留下。
+# Stage 变体名，外加 Item::LogProbe。按标识符边界匹配，避免撞上 core::fmt::Write 这类符号。
+# `Write` 不放进裸名字：正式二进制里有 `std::io::Write`。
+# `Log` 也不放：Tauri 带进来的 log::Log 会命中。阶段语法 `write:N` / `log:N` 仍在 STAGE 里。
 STAGE_NAMES = (
+    b"Backup",
     b"VerifyPre",
     b"VerifyPost",
+    b"Rename",
+    b"Rollback",
     b"LogProbe",
     b"SftpDisconnect",
     b"FsyncDir",
 )
 STAGE_NAME_RE = re.compile(rb"(?<![A-Za-z0-9_])(?:" + b"|".join(STAGE_NAMES) + rb")(?![A-Za-z0-9_])")
+# 第三方库 russh_sftp 反序列化报错的整句。扫描名单前只剔除这一句的完整出现。
+# 不做子串宽松匹配，也不放宽大小写。其他位置的 Rename、Backup、Rollback 仍要报。
+EXACT_THIRD_PARTY_STRINGS = (b"struct Rename with 3 elements",)
 SENTINEL = b"HTX_FAULT_INJECT_ENABLED"
 LINKCHECK = "hetianxia-linkcheck"
+CONTEXT_RADIUS = 64
 
 
 def is_rlib(path: pathlib.Path) -> bool:
@@ -49,7 +57,7 @@ def is_rlib(path: pathlib.Path) -> bool:
 def app_executables(root: pathlib.Path):
     found = []
     for macos in root.rglob("Contents/MacOS"):
-        # .../Name.app/Contents/MacOS，.app 是 MacOS 的祖父目录，不是 Contents。
+        # .../Name.app/Contents/MacOS — the .app is the grandparent, not Contents.
         if macos.parent.parent.suffix != ".app":
             continue
         for child in macos.iterdir():
@@ -58,7 +66,12 @@ def app_executables(root: pathlib.Path):
     return found
 
 
+def _member(root: pathlib.Path, path: pathlib.Path) -> str:
+    return path.relative_to(root).as_posix()
+
+
 def dmg_executables(dmg: pathlib.Path):
+    """返回 (dmg 内相对路径, 字节)。选哪些文件的规则不变。"""
     extracted = []
     with tempfile.TemporaryDirectory(prefix="htx-dmg-") as tmp:
         dest = pathlib.Path(tmp)
@@ -70,7 +83,10 @@ def dmg_executables(dmg: pathlib.Path):
                 check=True,
             )
             try:
-                extracted = [p.read_bytes() for p in app_executables(mount)]
+                for path in app_executables(mount):
+                    data = path.read_bytes()
+                    print(f"scan {path} ({len(data)} bytes)")
+                    extracted.append((_member(mount, path), data))
             finally:
                 subprocess.run(["hdiutil", "detach", str(mount)], check=False)
             return extracted
@@ -79,13 +95,16 @@ def dmg_executables(dmg: pathlib.Path):
             sys.exit(f"{dmg} is present but neither hdiutil nor 7z can read it")
         subprocess.run([tool, "x", f"-o{dest}", str(dmg)], check=True, capture_output=True)
         for path in app_executables(dest):
-            extracted.append(path.read_bytes())
+            data = path.read_bytes()
+            print(f"scan {path} ({len(data)} bytes)")
+            extracted.append((_member(dest, path), data))
         if not extracted:
             for path in dest.rglob("*"):
                 if path.is_file() and not is_rlib(path) and path.suffix not in {".plist", ".xml", ".txt"}:
                     blob = path.read_bytes()
                     if blob[:4] in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\x7fELF") or blob[:2] == b"MZ":
-                        extracted.append(blob)
+                        print(f"scan {path} ({len(blob)} bytes)")
+                        extracted.append((_member(dest, path), blob))
     if not extracted:
         sys.exit(f"no executable inside {dmg}")
     return extracted
@@ -101,7 +120,38 @@ def linkcheck_bins(root: pathlib.Path):
     return found
 
 
+def hex_ascii_context(blob: bytes, offset: int, length: int) -> str:
+    """命中点前 64 字节到命中结束后 64 字节。不可见字节的 ASCII 列用 `.`。"""
+    start = max(0, offset - CONTEXT_RADIUS)
+    end = min(len(blob), offset + length + CONTEXT_RADIUS)
+    window = blob[start:end]
+    lines = []
+    for row in range(0, len(window), 16):
+        chunk = window[row : row + 16]
+        hexpart = " ".join(f"{byte:02x}" for byte in chunk)
+        text = "".join(chr(byte) if 32 <= byte <= 126 else "." for byte in chunk)
+        lines.append(f"{start + row:08x}  {hexpart:<47}  {text}")
+    return "\n".join(lines)
+
+
+def report_hit(label: str, blob: bytes, offset: int, length: int, detail: str) -> None:
+    print(f"{label} contains {detail} at {offset}")
+    print(f"{label} offset {offset}")
+    print(hex_ascii_context(blob, offset, length))
+
+
+def without_exact_third_party(blob: bytes) -> bytes:
+    """用等长空字节盖住白名单整句，后面的偏移仍对得上原文件。"""
+    skipped = blob
+    for phrase in EXACT_THIRD_PARTY_STRINGS:
+        skipped = skipped.replace(phrase, b"\x00" * len(phrase))
+    return skipped
+
+
 def forbid_blobs(blobs):
+    print(f"scanning {len(blobs)} target(s)")
+    for label, blob in blobs:
+        print(f"scan {label} ({len(blob)} bytes)")
     failed = 0
     for label, blob in blobs:
         if is_rlib(pathlib.Path(label)):
@@ -109,18 +159,20 @@ def forbid_blobs(blobs):
             failed += 1
             continue
         for needle in NEEDLES:
-            idx = blob.find(needle)
-            if idx >= 0:
-                print(f"{label} contains {needle.decode()} at {idx}")
+            start = 0
+            while True:
+                idx = blob.find(needle, start)
+                if idx < 0:
+                    break
+                report_hit(label, blob, idx, len(needle), needle.decode())
                 failed += 1
+                start = idx + len(needle)
         for match in STAGE.finditer(blob):
-            print(f"{label} contains {match.group()!r} at {match.start()}")
+            report_hit(label, blob, match.start(), len(match.group()), repr(match.group()))
             failed += 1
-            break
-        for match in STAGE_NAME_RE.finditer(blob):
-            print(f"{label} contains {match.group().decode()} at {match.start()}")
+        for match in STAGE_NAME_RE.finditer(without_exact_third_party(blob)):
+            report_hit(label, blob, match.start(), len(match.group()), match.group().decode())
             failed += 1
-            break
     return failed
 
 
@@ -133,8 +185,8 @@ def collect_forbid(root: pathlib.Path):
     for path in app_executables(root):
         blobs.append((str(path), path.read_bytes()))
     for dmg in sorted(root.rglob("*.dmg")):
-        for index, blob in enumerate(dmg_executables(dmg)):
-            blobs.append((f"{dmg}#{index}", blob))
+        for index, (member, blob) in enumerate(dmg_executables(dmg)):
+            blobs.append((f"{dmg}#{index} {member}", blob))
     for path in linkcheck_bins(root):
         blobs.append((str(path), path.read_bytes()))
     if not blobs:
@@ -152,8 +204,10 @@ def require_sentinel(root: pathlib.Path) -> int:
         targets = linkcheck_bins(root)
         if not targets:
             sys.exit(f"no {LINKCHECK} under {root}; refusing to scan an rlib")
+    print(f"scanning {len(targets)} target(s)")
     for path in targets:
         blob = path.read_bytes()
+        print(f"scan {path} ({len(blob)} bytes)")
         if SENTINEL in blob:
             print(f"sentinel present in {path}")
             return 0

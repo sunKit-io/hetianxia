@@ -51,6 +51,7 @@ button, input { font: inherit; }
 .auth span.on { background: #e5e5ea; }
 .auth span.off { color: #8e8e93; cursor: default; }
 .savekey, footer, .hosthead { display: flex; align-items: center; gap: 8px; }
+.pickrow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .ok { color: #248a3d; margin-left: auto; }
 .keyhint, .sub, .ro p { color: #6e6e73; margin: 0; }
 .banner { background: #fff4e5; color: #8a4b08; border-radius: 8px; padding: 10px 12px; display: flex; gap: 8px; align-items: flex-start; }
@@ -81,6 +82,10 @@ footer { margin-top: auto; }
 .sheet.small { width: min(520px, 92vw); }
 .err { color: #d70015; white-space: pre-wrap; }
 .status { white-space: pre-wrap; margin: 0; padding: 8px 14px; background: white; border-bottom: 1px solid #ececf1; }
+.status p { margin: 0; }
+.saved-note { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.saved-note code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; word-break: break-all; }
+.saved-note button { border: 1px solid #d2d2d7; background: white; border-radius: 6px; padding: 2px 8px; }
 .history table { width: 100%; border-collapse: collapse; background: white; border-radius: 10px; overflow: hidden; }
 .history th, .history td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #f2f2f7; }
 .history .ok { color: #248a3d; }
@@ -109,6 +114,8 @@ footer { margin-top: auto; }
 .difflist ul { list-style: none; margin: 8px 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .difflist li { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .difflist em { color: #6e6e73; font-style: normal; }
+.difflist em.edited { color: #7c3aed; font-weight: 600; }
+.empty-hint { margin: 24px 16px; color: #1d1d1f; }
 @media (max-width: 800px) {
   .desktop { padding: 8px; }
   .window { min-height: 0; border-radius: 0; }

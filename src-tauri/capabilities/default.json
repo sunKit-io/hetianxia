@@ -8,7 +8,11 @@
     "allow-compare",
     "allow-diff",
     "allow-merge",
+    "allow-read-side",
+    "allow-prepare-package",
+    "allow-confirm-execute",
     "allow-execute",
+    "dialog:allow-open",
     "allow-rollback-run",
     "allow-resume-run",
     "allow-history",
@@ -23,7 +27,6 @@
     "allow-delete-ssh-secret",
     "allow-host-key-status",
     "allow-clear-host-fingerprint",
-    "allow-trust-host-fingerprint",
     "allow-remote-backup-path",
     "allow-remote-rename-plan",
     "allow-list-connections",
@@ -33,8 +36,11 @@
     "allow-test-connection",
     "allow-remote-write-prompt",
     "allow-commit-remote-overwrite",
+    "allow-list-remote-dirs",
     "allow-app-bak-dir",
-    "allow-probe-remote",
-    "allow-read-ssh-config"
+    "allow-load-file-picks",
+    "allow-save-file-picks",
+    "allow-read-ssh-config",
+    "allow-reveal-backup"
   ]
 }

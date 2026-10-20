@@ -31,6 +31,10 @@ ignore = [
     { id = "RUSTSEC-2026-0371", reason = "临时忽略：zbus_names 3.0.0，经 zbus 由 tauri-plugin-single-instance 带入；停维护告警非漏洞；2026-10-20 随 813d61d 评审一起处理" },
     # 临时忽略：zvariant_derive 4.1.2，经 zvariant/zbus 由 tauri-plugin-single-instance 带入；停维护告警非漏洞；2026-10-20 随 813d61d 评审一起处理
     { id = "RUSTSEC-2026-0372", reason = "临时忽略：zvariant_derive 4.1.2，经 zvariant/zbus 由 tauri-plugin-single-instance 带入；停维护告警非漏洞；2026-10-20 随 813d61d 评审一起处理" },
+    # russh 0.54.6 是最后一版能在 Rust 1.83 上编译的。修复线 >=0.60.3 要 edition 2024。
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 经 russh 0.54.6 进入。公告写明没有可升级版本；russh 不能升到需要 Rust 1.85 的版本。" },
+    { id = "RUSTSEC-2026-0154", reason = "russh 0.54.6 钉死在 Rust 1.83。修复在 >=0.60.3，该线需要 edition 2024。" },
+    { id = "RUSTSEC-2026-0153", reason = "russh-cryptovec 0.52.0 随 russh 0.54.6。修复在 >=0.60.3，该线需要 edition 2024。" },
 ]
 
 [licenses]

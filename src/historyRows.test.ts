@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { formatFileCounts, historyContinue, historyRowButtons, historyStatusLabel, REMOTE_ROLLBACK_TITLE } from "./historyRows.ts";
+import { formatFileCounts, historyContinue, historyResultText, historyRowButtons, historyStatusLabel, REMOTE_ROLLBACK_TITLE } from "./historyRows.ts";
 
 test("history status labels and buttons follow the journal state", () => {
   assert.equal(historyStatusLabel("COMMITTED"), "已完成");
@@ -30,6 +30,10 @@ test("history status labels and buttons follow the journal state", () => {
   assert.notEqual(first.execId, second.execId);
   assert.equal(REMOTE_ROLLBACK_TITLE, "远程写入暂不支持回滚");
   assert.equal(formatFileCounts({ fileCount: 4, doneCount: 2, failedCount: 1 }), "共 4 · 已写 2 · 失败 1");
+  assert.equal(formatFileCounts({ fileCount: 4, doneCount: 2, failedCount: 0, conflictCount: 2 }), "共 4 · 已写 2 · 失败 0 · 冲突 2");
+  assert.equal(historyResultText("ROLLBACK_PARTIAL", 3), "部分回滚（跳过 3 个冲突文件）");
+  assert.equal(historyResultText("ROLLBACK_PARTIAL", 0), "部分回滚（跳过 0 个冲突文件）");
+  assert.equal(historyResultText("ROLLED_BACK", 1), "已回滚");
 });
 
 test("history rollback opens the sheet for that row and does not call rollback_run", () => {
@@ -44,6 +48,13 @@ test("history rollback opens the sheet for that row and does not call rollback_r
   assert.match(app, /onRollback\(run\.execId\)/);
   assert.match(app, /historyContinue\(run\.execId\)/);
   assert.match(app, /historyStatusLabel\(run\.status\)/);
+  assert.match(app, /historyResultText\(run\.status, run\.conflictCount\)/);
+  const history = app.slice(app.indexOf("function HistoryPage"), app.indexOf("function VerifyFailedSheet"));
+  assert.match(history, /\[refreshToken\]/);
+  const rollbackStart = app.indexOf("async function applyRollback");
+  const rollback = app.slice(rollbackStart, app.indexOf("return (", rollbackStart));
+  assert.match(rollback, /setHistoryToken\(\(token\) => token \+ 1\)/);
+  assert.ok(rollback.indexOf("rollbackRun") < rollback.indexOf("setHistoryToken"));
   assert.match(app, /title=\{REMOTE_ROLLBACK_TITLE\}/);
   assert.match(app, /applyResume\(offer\.execId/);
   assert.match(app, /applyRollback\(offer\.execId/);

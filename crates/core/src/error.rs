@@ -102,6 +102,16 @@ impl Error {
 /// 内容已经回到备份，但权限或修改时间没有恢复。不算未恢复，也不单独变成「部分回滚」。
 pub const ATTR_RESTORE_FAILED: &str = "内容已恢复，权限 / 修改时间未恢复";
 
+/// 预演之后目标上出现了文件。确认框和执行器共用这一句，避免两处文案不一致。
+pub fn occupied_after_preview(path: &str) -> Error {
+    Error::new(ErrorCode::Conflict, format!("{path} 在预演后被新建或修改过，为了不覆盖你的文件，这一项没有写入。"))
+}
+
+/// 编辑或合并时读不到文本，或文件是二进制、超过 1MB。确认和执行共用这一句，并且还没写盘。
+pub fn unreadable_merge(path: &str) -> Error {
+    Error::new(ErrorCode::Unsupported, format!("{path} 无法合并：没有读到文件内容，这一项没有写入。"))
+}
+
 /// 设计文档 12.11 的错误码。界面按这些码出文案。
 pub const SPEC_CODES: &[&str] = &[
     "E_NOT_FOUND",

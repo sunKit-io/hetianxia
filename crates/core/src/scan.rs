@@ -6,7 +6,7 @@ use crate::hashutil::{sha256_hex, xxh128_hex};
 use crate::pathutil::Ignore;
 use crate::vfs::{Entry, EntryKind, LocalFs};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +51,15 @@ pub struct FileRec {
     pub message: Option<String>,
     pub readonly: bool,
     pub link_target: Option<String>,
+    /// 升级包一侧的 SHA-256。扫描比较用的哈希可能是 xxh，写计划用这一项。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
+    /// 目录里的相对路径，或 zip 条目名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_name: Option<String>,
+    /// 项目一侧的 SHA-256，给执行前的变动检测用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +67,12 @@ pub struct FileRec {
 pub struct ScanOutput {
     pub files: Vec<FileRec>,
     pub case_sensitive: bool,
+    /// 扫描记录 id。执行只认数据库里这个 id 对应的升级包路径。
+    #[serde(default)]
+    pub scan_id: String,
+    /// `dir` 或 `zip`。
+    #[serde(default)]
+    pub package_kind: String,
 }
 
 pub fn scan_local(left: &LocalFs, right: &LocalFs, ignore: &Ignore, opt: &ScanOptions) -> Result<ScanOutput> {
@@ -121,6 +136,9 @@ fn compare_entries(left: &[Entry], right: &[Entry], lfs: &LocalFs, rfs: &LocalFs
                         message: Some("符号链接只提示，不覆盖、不删除、不新建".into()),
                         readonly: true,
                         link_target: l.link_target.clone().or(r.link_target.clone()),
+                        content_sha256: None,
+                        entry_name: None,
+                        left_sha256: None,
                     });
                     continue;
                 }
@@ -179,17 +197,20 @@ fn compare_entries(left: &[Entry], right: &[Entry], lfs: &LocalFs, rfs: &LocalFs
                     message: None,
                     readonly: l.readonly,
                     link_target: None,
+                    content_sha256: None,
+                    entry_name: None,
+                    left_sha256: None,
                 });
             }
             (None, None) => {}
         }
     }
-    // 移动：非空、哈希相同、一对一；一对多按文件名再按目录距离。
+    // 哈希还没填。移动配对在 run_scan 里填完哈希后做。
     attach_moves(&mut added, &mut extra);
     files.extend(added);
     files.extend(extra);
     files.sort_by(|a, b| a.rel.cmp(&b.rel));
-    ScanOutput { files, case_sensitive }
+    ScanOutput { files, case_sensitive, scan_id: String::new(), package_kind: String::new() }
 }
 
 fn rec_one(e: &Entry, status: FileStatus, left: bool) -> FileRec {
@@ -210,6 +231,9 @@ fn rec_one(e: &Entry, status: FileStatus, left: bool) -> FileRec {
             message: Some("符号链接只提示，不处理".into()),
             readonly: true,
             link_target: e.link_target.clone(),
+            content_sha256: None,
+            entry_name: None,
+            left_sha256: None,
         };
     }
     FileRec {
@@ -228,12 +252,14 @@ fn rec_one(e: &Entry, status: FileStatus, left: bool) -> FileRec {
         message: None,
         readonly: e.readonly,
         link_target: None,
+        content_sha256: None,
+        entry_name: None,
+        left_sha256: None,
     }
 }
 
 fn attach_moves(_added: &mut Vec<FileRec>, _extra: &mut Vec<FileRec>) {
-    // 哈希在 compare 里对 only-one-side 还没算。调用方应先填哈希。
-    // 这里假定 hash 字段已填；scan_local 在下面补。
+    // 单侧文件的哈希要等 fill_side_hashes。配对在 detect_moves。
 }
 
 pub fn fill_side_hashes(files: &mut [FileRec], left: Option<&LocalFs>, right: Option<&LocalFs>) {
@@ -252,37 +278,32 @@ pub fn fill_side_hashes(files: &mut [FileRec], left: Option<&LocalFs>, right: Op
     }
 }
 
+/// 旧路径在目标（左侧项目）里被删、新路径在升级包（右侧）里是新增，且内容哈希相同，记成一次移动。
+///
+/// 配对只看内容，不看文件名像不像。进入同一组的条件是：哈希非空、大小大于 0、两侧大小相等。
+/// 空文件不参与，即使空内容的哈希相同。
+///
+/// 同一组里，旧路径和新路径都按相对路径的字典序（字节序）排序，然后按下标配对：
+/// 第 i 个旧路径对第 i 个新路径。一侧更长时只配到较短的那一侧，多出来的保持 Extra 或 Added。
+/// 一对多、多对一都走这一条，不另选「最像」的路径。
 pub fn detect_moves(files: &mut Vec<FileRec>) {
-    let mut added_idx = Vec::new();
-    let mut extra_idx = Vec::new();
+    let mut groups: BTreeMap<(String, u64), (Vec<usize>, Vec<usize>)> = BTreeMap::new();
     for (i, f) in files.iter().enumerate() {
-        if f.status == FileStatus::Added && f.hash.as_ref().map(|h| !h.is_empty()).unwrap_or(false) && f.right_size.unwrap_or(0) > 0 {
-            added_idx.push(i);
-        } else if f.status == FileStatus::Extra && f.hash.as_ref().map(|h| !h.is_empty()).unwrap_or(false) && f.left_size.unwrap_or(0) > 0 {
-            extra_idx.push(i);
+        let Some(hash) = f.hash.as_ref().filter(|h| !h.is_empty()) else { continue };
+        if f.status == FileStatus::Extra && f.left_size.unwrap_or(0) > 0 {
+            groups.entry((hash.clone(), f.left_size.unwrap_or(0))).or_default().0.push(i);
+        } else if f.status == FileStatus::Added && f.right_size.unwrap_or(0) > 0 {
+            groups.entry((hash.clone(), f.right_size.unwrap_or(0))).or_default().1.push(i);
         }
     }
-    let mut used_a = vec![false; added_idx.len()];
-    let mut pairs: Vec<(usize, usize)> = Vec::new();
-    for (ei, &e) in extra_idx.iter().enumerate() {
-        let mut cands = Vec::new();
-        for (ai, &a) in added_idx.iter().enumerate() {
-            if used_a[ai] { continue; }
-            if files[e].hash == files[a].hash && files[e].left_size == files[a].right_size {
-                cands.push(ai);
-            }
+    let mut pairs = Vec::new();
+    for (_key, (mut extras, mut addeds)) in groups {
+        extras.sort_by(|&a, &b| files[a].rel.cmp(&files[b].rel).then(a.cmp(&b)));
+        addeds.sort_by(|&a, &b| files[a].rel.cmp(&files[b].rel).then(a.cmp(&b)));
+        let n = extras.len().min(addeds.len());
+        for k in 0..n {
+            pairs.push((extras[k], addeds[k]));
         }
-        if cands.is_empty() { continue; }
-        let ename = files[e].rel.rsplit('/').next().unwrap_or("");
-        let best = cands.iter().copied().min_by_key(|&ai| {
-            let aname = files[added_idx[ai]].rel.rsplit('/').next().unwrap_or("");
-            let name_penalty = if aname == ename { 0 } else { 1000 };
-            name_penalty + edit_dist(parent(&files[e].rel), parent(&files[added_idx[ai]].rel))
-        }).unwrap();
-        // 一对多：只配最像的一个，其余保持新增/多余
-        used_a[best] = true;
-        pairs.push((e, added_idx[best]));
-        let _ = ei;
     }
     for (e, a) in pairs {
         let from = files[e].rel.clone();
@@ -304,25 +325,6 @@ pub fn detect_moves(files: &mut Vec<FileRec>) {
 /// 关闭「允许删除」时，移动等于复制，预演文案固定为这一句。
 pub fn move_preview_label(allow_delete: bool) -> &'static str {
     if allow_delete { "移动" } else { "移动（保留旧文件）" }
-}
-
-fn parent(p: &str) -> &str {
-    p.rfind('/').map(|i| &p[..i]).unwrap_or("")
-}
-
-fn edit_dist(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let mut dp = vec![vec![0; b.len() + 1]; a.len() + 1];
-    for i in 0..=a.len() { dp[i][0] = i; }
-    for j in 0..=b.len() { dp[0][j] = j; }
-    for i in 1..=a.len() {
-        for j in 1..=b.len() {
-            let c = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            dp[i][j] = (dp[i - 1][j] + 1).min(dp[i][j - 1] + 1).min(dp[i - 1][j - 1] + c);
-        }
-    }
-    dp[a.len()][b.len()]
 }
 
 fn looks_text(b: &[u8]) -> bool {
@@ -398,5 +400,126 @@ mod tests {
         fs::write(r.path().join("b.txt"), b"").unwrap();
         let out = run_scan(&LocalFs::new(l.path()), &LocalFs::new(r.path()), &Ignore::defaults(), &ScanOptions::default()).unwrap();
         assert!(out.files.iter().all(|f| f.status != FileStatus::Moved));
+        assert_eq!(status_of(&out, "a.txt"), FileStatus::Extra);
+        assert_eq!(status_of(&out, "b.txt"), FileStatus::Added);
+    }
+
+    #[test]
+    fn rename_is_a_move_from_old_path_to_new_path() {
+        let (l, r) = pair_roots();
+        fs::write(l.path().join("old.ts"), b"body").unwrap();
+        fs::write(r.path().join("new.ts"), b"body").unwrap();
+        let out = scan_pair(&l, &r);
+        let dest = file_of(&out, "new.ts");
+        assert_eq!(dest.status, FileStatus::Moved);
+        assert_eq!(dest.moved_from.as_deref(), Some("old.ts"));
+        assert_eq!(dest.moved_to.as_deref(), Some("new.ts"));
+        let src = file_of(&out, "old.ts");
+        assert_eq!(src.status, FileStatus::Moved);
+        assert_eq!(src.message.as_deref(), Some("move-source"));
+        assert!(out.files.iter().all(|f| f.status != FileStatus::Added && f.status != FileStatus::Extra));
+    }
+
+    #[test]
+    fn cross_directory_move_keeps_both_relative_paths() {
+        let (l, r) = pair_roots();
+        fs::create_dir(l.path().join("src")).unwrap();
+        fs::write(l.path().join("src/old.ts"), b"body").unwrap();
+        fs::create_dir(r.path().join("pkg")).unwrap();
+        fs::write(r.path().join("pkg/new.ts"), b"body").unwrap();
+        let out = scan_pair(&l, &r);
+        let dest = file_of(&out, "pkg/new.ts");
+        assert_eq!(dest.status, FileStatus::Moved);
+        assert_eq!(dest.moved_from.as_deref(), Some("src/old.ts"));
+        assert_eq!(file_of(&out, "src/old.ts").message.as_deref(), Some("move-source"));
+    }
+
+    #[test]
+    fn same_content_pairs_by_sorted_path_and_leaves_the_rest() {
+        let (l, r) = pair_roots();
+        // 字典序：旧 a.txt、c.txt；新 b.txt、d.txt。按下标配成 a→b、c→d。
+        for name in ["a.txt", "c.txt"] {
+            fs::write(l.path().join(name), b"same").unwrap();
+        }
+        for name in ["b.txt", "d.txt"] {
+            fs::write(r.path().join(name), b"same").unwrap();
+        }
+        let out = scan_pair(&l, &r);
+        assert_eq!(file_of(&out, "b.txt").moved_from.as_deref(), Some("a.txt"));
+        assert_eq!(file_of(&out, "d.txt").moved_from.as_deref(), Some("c.txt"));
+        assert!(out.files.iter().all(|f| f.status == FileStatus::Moved));
+
+        // 一对多：旧路径只有 m.txt，新路径 a.txt、z.txt。只配排序后的第一个新路径。
+        let (l, r) = pair_roots();
+        fs::write(l.path().join("m.txt"), b"same").unwrap();
+        fs::write(r.path().join("z.txt"), b"same").unwrap();
+        fs::write(r.path().join("a.txt"), b"same").unwrap();
+        let out = scan_pair(&l, &r);
+        assert_eq!(file_of(&out, "a.txt").moved_from.as_deref(), Some("m.txt"));
+        assert_eq!(status_of(&out, "z.txt"), FileStatus::Added);
+
+        // 多对一：旧路径 a.txt、z.txt，新路径只有 m.txt。只配排序后的第一个旧路径。
+        let (l, r) = pair_roots();
+        fs::write(l.path().join("z.txt"), b"same").unwrap();
+        fs::write(l.path().join("a.txt"), b"same").unwrap();
+        fs::write(r.path().join("m.txt"), b"same").unwrap();
+        let out = scan_pair(&l, &r);
+        assert_eq!(file_of(&out, "m.txt").moved_from.as_deref(), Some("a.txt"));
+        assert_eq!(status_of(&out, "z.txt"), FileStatus::Extra);
+    }
+
+    #[test]
+    fn empty_files_stay_unpaired_beside_a_real_move() {
+        let (l, r) = pair_roots();
+        fs::write(l.path().join("empty-old.txt"), b"").unwrap();
+        fs::write(r.path().join("empty-new.txt"), b"").unwrap();
+        fs::write(l.path().join("old.ts"), b"body").unwrap();
+        fs::write(r.path().join("new.ts"), b"body").unwrap();
+        let out = scan_pair(&l, &r);
+        assert_eq!(status_of(&out, "empty-old.txt"), FileStatus::Extra);
+        assert_eq!(status_of(&out, "empty-new.txt"), FileStatus::Added);
+        assert_eq!(file_of(&out, "new.ts").moved_from.as_deref(), Some("old.ts"));
+    }
+
+    #[test]
+    fn changed_content_is_not_a_move() {
+        let (l, r) = pair_roots();
+        fs::write(l.path().join("old.ts"), b"before").unwrap();
+        fs::write(r.path().join("old.ts"), b"after").unwrap();
+        let out = scan_pair(&l, &r);
+        assert_eq!(status_of(&out, "old.ts"), FileStatus::Modified);
+        assert!(out.files.iter().all(|f| f.status != FileStatus::Moved));
+
+        let (l, r) = pair_roots();
+        fs::write(l.path().join("old.ts"), b"before").unwrap();
+        fs::write(r.path().join("new.ts"), b"after").unwrap();
+        let out = scan_pair(&l, &r);
+        assert_eq!(status_of(&out, "old.ts"), FileStatus::Extra);
+        assert_eq!(status_of(&out, "new.ts"), FileStatus::Added);
+
+        // 同路径内容变了，旁边同哈希的新文件也不把这条改动当成移动。
+        let (l, r) = pair_roots();
+        fs::write(l.path().join("old.ts"), b"before").unwrap();
+        fs::write(r.path().join("old.ts"), b"after").unwrap();
+        fs::write(r.path().join("new.ts"), b"before").unwrap();
+        let out = scan_pair(&l, &r);
+        assert_eq!(status_of(&out, "old.ts"), FileStatus::Modified);
+        assert_eq!(status_of(&out, "new.ts"), FileStatus::Added);
+    }
+
+    fn pair_roots() -> (tempfile::TempDir, tempfile::TempDir) {
+        (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap())
+    }
+
+    fn scan_pair(l: &tempfile::TempDir, r: &tempfile::TempDir) -> ScanOutput {
+        run_scan(&LocalFs::new(l.path()), &LocalFs::new(r.path()), &Ignore::defaults(), &ScanOptions::default()).unwrap()
+    }
+
+    fn file_of(out: &ScanOutput, rel: &str) -> FileRec {
+        out.files.iter().find(|f| f.rel == rel).unwrap_or_else(|| panic!("missing {rel}")).clone()
+    }
+
+    fn status_of(out: &ScanOutput, rel: &str) -> FileStatus {
+        file_of(out, rel).status
     }
 }

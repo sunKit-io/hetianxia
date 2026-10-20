@@ -10,7 +10,7 @@ export type HistoryContinue = {
 
 export type HistoryStatusLabel = "已完成" | "部分失败" | "未完成" | "已回滚" | "部分回滚" | "未知状态";
 
-/** 设计 19。日志里的原始状态只在这里换成界面文案。 */
+/** 设计 19。日志里的原始状态只在这里换成界面文案。部分回滚的展示文案见 historyResultText。 */
 export function historyStatusLabel(status: string): HistoryStatusLabel {
   switch (status) {
     case "COMMITTED":
@@ -38,6 +38,12 @@ export function historyRowButtons(label: HistoryStatusLabel): { rollback: boolea
   return { rollback: false, resume: false };
 }
 
+/** 部分回滚的结果列。k 是后端记下的冲突项数。 */
+export function historyResultText(status: string, conflictCount = 0): string {
+  if (status === "ROLLBACK_PARTIAL") return `部分回滚（跳过 ${conflictCount} 个冲突文件）`;
+  return historyStatusLabel(status);
+}
+
 export function historyContinue(execId: string): HistoryContinue {
   return { command: "resume_run", execId, choice: "continue" };
 }
@@ -52,6 +58,10 @@ export function formatRunTime(startedAt: number): string {
   return `${month}月${day}日 ${hour}:${minute}`;
 }
 
-export function formatFileCounts(run: { fileCount: number; doneCount: number; failedCount: number }): string {
-  return `共 ${run.fileCount} · 已写 ${run.doneCount} · 失败 ${run.failedCount}`;
+/** 冲突数 k 只计回滚留下的 `E_CONFLICT`（冲突，已保留你的文件）。没有这种项时不写这一段。 */
+export function formatFileCounts(run: { fileCount: number; doneCount: number; failedCount: number; conflictCount?: number }): string {
+  const base = `共 ${run.fileCount} · 已写 ${run.doneCount} · 失败 ${run.failedCount}`;
+  const conflicts = run.conflictCount ?? 0;
+  if (conflicts > 0) return `${base} · 冲突 ${conflicts}`;
+  return base;
 }

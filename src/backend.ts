@@ -1,6 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import type { ResumeChoice, RollbackChoice } from "./choices";
 import { parseResume, type ExecReport, type RecoveryOffer, type ResumeView } from "./engine";
+import type { ExecuteConfirm } from "./confirmExecute";
+import type { ExecPlan, SideText, TextDoc } from "./localPlan";
+import type { RemoteBatchFile, RemoteBatchReport } from "./remoteWrite";
 
 export function rollbackRun(execId: string, choice: RollbackChoice) {
   return invoke<ExecReport>("rollback_run", { execId, choice });
@@ -32,6 +36,11 @@ export function appBakDir() {
   return invoke<string>("app_bak_dir");
 }
 
+/** 在 Finder（或其他系统的文件管理器）里显示备份文件。只接受 bak 目录里的路径。 */
+export function revealBackup(path: string) {
+  return invoke<void>("reveal_backup", { path });
+}
+
 export type SavedConnection = {
   id: string;
   name: string;
@@ -41,6 +50,7 @@ export type SavedConnection = {
   auth: "password" | "key" | "agent";
   keyPath: string;
   fingerprint: string;
+  /** 远端绝对目录。旧数据没有这一列时是 null。 */
   remoteRoot: string | null;
 };
 
@@ -97,18 +107,16 @@ export function deleteSshSecret(account: string) {
   return invoke<void>("delete_ssh_secret", { account });
 }
 
-export function remoteWritePrompt(connectionId: string, remotePath: string, content: number[], contentSha256?: string) {
-  return invoke<RemoteWritePrompt>("remote_write_prompt", { connectionId, remotePath, content, contentSha256 });
+export function remoteWritePrompt(connectionId: string, files: RemoteBatchFile[]) {
+  return invoke<RemoteWritePrompt>("remote_write_prompt", { connectionId, files });
 }
 
-export type RemoteWriteOutcome = {
-  execId: string;
-  remotePath: string;
-  backupPath: string | null;
-};
-
 export function commitRemoteOverwrite(execId: string) {
-  return invoke<RemoteWriteOutcome>("commit_remote_overwrite", { execId });
+  return invoke<RemoteBatchReport>("commit_remote_overwrite", { execId });
+}
+
+export function listRemoteDirs(connectionId: string, path: string) {
+  return invoke<{ path: string; dirs: string[] }>("list_remote_dirs", { connectionId, path });
 }
 
 export type JournalRun = {
@@ -119,6 +127,7 @@ export type JournalRun = {
   fileCount: number;
   doneCount: number;
   failedCount: number;
+  conflictCount: number;
   remote: boolean;
 };
 
@@ -133,4 +142,88 @@ export type RollbackPreview = {
 
 export function rollbackPreview(execId: string) {
   return invoke<RollbackPreview>("rollback_preview", { execId });
+}
+
+export type ScanFile = {
+  rel: string;
+  status: string;
+  movedFrom?: string | null;
+  movedTo?: string | null;
+  message?: string | null;
+  readonly?: boolean;
+  leftSize?: number | null;
+  rightSize?: number | null;
+  leftMtimeMs?: number | null;
+  rightMtimeMs?: number | null;
+  contentSha256?: string | null;
+  entryName?: string | null;
+  leftSha256?: string | null;
+};
+
+export function scanPair(left: string, right: string) {
+  return invoke<{ files: ScanFile[]; scanId: string; packageKind: string }>("scan", { left, right });
+}
+
+export type FileDiff = {
+  left: TextDoc;
+  right: TextDoc;
+};
+
+export function diffTexts(left: string, right: string) {
+  return invoke<FileDiff>("diff", { left, right });
+}
+
+export function mergeTexts(left: string, right: string, decision: string) {
+  return invoke<{ text: string }>("merge", { left, right, decision });
+}
+
+export function readSide(root: string, rel: string) {
+  return invoke<SideText>("read_side", { root, rel });
+}
+
+export function preparePackage(path: string) {
+  return invoke<string>("prepare_package", { path });
+}
+
+export function confirmExecute(root: string, plan: ExecPlan, allowReadonly: boolean) {
+  return invoke<ExecuteConfirm>("confirm_execute", { root, plan, allowReadonly });
+}
+
+export function executeLocal(root: string, plan: ExecPlan, allowReadonly: boolean, token: string) {
+  return invoke<ExecReport>("execute", { root, plan, allowReadonly, token });
+}
+
+export async function pickProjectDirectory(): Promise<string | null> {
+  const picked = await open({ directory: true, multiple: false, title: "选择项目目录" });
+  return typeof picked === "string" ? picked : null;
+}
+
+export type UpgradePackage = { source: string; prepared: string };
+
+/** scan 的右边是目录。zip 先解开；文件夹原样返回。两条入口都进这里。source 是用户选中的路径，用来记住勾选。 */
+async function useUpgradePackage(picked: string | string[] | null): Promise<UpgradePackage | null> {
+  if (typeof picked !== "string") return null;
+  return { source: picked, prepared: await preparePackage(picked) };
+}
+
+/** 只选文件夹。和 zip 入口解开后走同一条 scan。 */
+export function pickUpgradeDirectory(): Promise<UpgradePackage | null> {
+  return open({ directory: true, multiple: false, title: "选择升级包文件夹" }).then(useUpgradePackage);
+}
+
+/** 只选 zip。和文件夹入口解开后走同一条 scan。 */
+export function pickUpgradeZip(): Promise<UpgradePackage | null> {
+  return open({
+    multiple: false,
+    title: "选择 zip 升级包",
+    filters: [{ name: "升级包", extensions: ["zip"] }],
+  }).then(useUpgradePackage);
+}
+
+export function loadFilePicks(projectRoot: string, packagePath: string) {
+  return invoke<string[]>("load_file_picks", { projectRoot, packagePath });
+}
+
+export function saveFilePicks(projectRoot: string, packagePath: string, skipped: string[]) {
+  return invoke<void>("save_file_picks", { projectRoot, packagePath, skipped });
 }

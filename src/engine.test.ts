@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { afterResume, engineCode, formatEngineError, formatOffer, formatReport, parseResume, type ExecReport } from "./engine.ts";
+import { readFileSync } from "node:fs";
+import { afterResume, backupNotes, deletedBackupNote, engineCode, formatEngineError, formatFileResult, formatOffer, formatReport, keptFileNote, parseResume, savedPathSentence, type ExecReport } from "./engine.ts";
 
 const stopped: ExecReport = {
   execId: "exec-1",
@@ -52,6 +53,65 @@ test("resume outcomes pick the sheet from the engine", () => {
   const pending = afterResume("keepExternal", parseResume({ changesSinceScan: [{ path: "config/local.env", hashChanged: true, detail: "升级后被修改" }] }));
   assert.equal(pending.sheet, "pending");
   if (pending.sheet === "pending") assert.equal(pending.files[0].path, "config/local.env");
+});
+
+test("file results use Chinese states and keep the error code", () => {
+  assert.equal(formatFileResult({ state: "done", code: null, error: null }), "已写入");
+  assert.equal(formatFileResult({ state: "skipped", code: "E_PERMISSION", error: null }), "已跳过 · E_PERMISSION");
+  assert.equal(formatFileResult({ state: "failed", code: "E_IO", error: "写入失败" }), "失败 · E_IO · 写入失败");
+  assert.equal(formatFileResult({ state: "doing", code: null, error: null }), "进行中");
+  assert.equal(formatFileResult({ state: "kept", code: null, error: null }), "已保留原文件");
+  assert.equal(keptFileNote("/bak/id/conflict-current/new.ts"), "你的文件已存到 /bak/id/conflict-current/new.ts");
+  assert.equal(deletedBackupNote("/bak/id/conflict-current/pkg/c.ts"), "已删除，删除前备份在 /bak/id/conflict-current/pkg/c.ts");
+  assert.equal(savedPathSentence("/bak/id/conflict-current/src/a.ts", "user"), "你的文件已存到 /bak/id/conflict-current/src/a.ts");
+  assert.equal(
+    formatFileResult({ state: "rolled-back", code: null, error: null, savedPath: "/bak/id/conflict-current/new.ts" }),
+    "rolled-back · 你的文件已存到 /bak/id/conflict-current/new.ts",
+  );
+  assert.equal(
+    formatFileResult({ state: "rolled-back", code: null, error: null, savedPath: "/bak/id/conflict-current/pkg/c.ts", savedKind: "deleted_backup" }),
+    "rolled-back · 已删除，删除前备份在 /bak/id/conflict-current/pkg/c.ts",
+  );
+  assert.deepEqual(
+    backupNotes({
+      savedFiles: [
+        { path: "/bak/id/conflict-current/src/a.ts", kind: "user" },
+        { path: "/bak/id/conflict-current/pkg/c.ts", kind: "deleted_backup" },
+      ],
+    }),
+    [
+      { path: "/bak/id/conflict-current/src/a.ts", kind: "user" },
+      { path: "/bak/id/conflict-current/pkg/c.ts", kind: "deleted_backup" },
+    ],
+  );
+  assert.match(
+    formatReport({
+      ...stopped,
+      state: "ROLLED_BACK",
+      historyResult: "已回滚",
+      files: [{ index: 1, path: "new.ts", kind: "move", state: "rolled-back", savedPath: "/bak/id/conflict-current/new.ts" }],
+    }),
+    /new\.ts · 你的文件已存到 \/bak\/id\/conflict-current\/new\.ts/,
+  );
+  assert.match(
+    formatReport({
+      ...stopped,
+      state: "ROLLED_BACK",
+      historyResult: "已回滚",
+      files: [{ index: 1, path: "pkg/c.ts", kind: "move", state: "rolled-back", savedPath: "/bak/id/conflict-current/pkg/c.ts", savedKind: "deleted_backup" }],
+    }),
+    /pkg\/c\.ts · 已删除，删除前备份在 \/bak\/id\/conflict-current\/pkg\/c\.ts/,
+  );
+  const app = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+  const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  assert.match(app, /在 Finder 中显示/);
+  assert.match(app, /revealBackup/);
+  assert.match(app, /savedPathSentence/);
+  assert.match(css, /\.saved-note code \{[^}]*ui-monospace/);
+  const caps = readFileSync(new URL("../src-tauri/capabilities/default.json", import.meta.url), "utf8");
+  assert.match(caps, /allow-reveal-backup/);
+  assert.doesNotMatch(caps, /shell:/);
+  assert.doesNotMatch(caps, /fs:/);
 });
 
 test("startup offer shows the state and code", () => {

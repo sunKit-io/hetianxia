@@ -4,6 +4,9 @@ fn main() {
         "compare",
         "diff",
         "merge",
+        "read_side",
+        "prepare_package",
+        "confirm_execute",
         "execute",
         "rollback_run",
         "resume_run",
@@ -19,7 +22,6 @@ fn main() {
         "delete_ssh_secret",
         "host_key_status",
         "clear_host_fingerprint",
-        "trust_host_fingerprint",
         "remote_backup_path",
         "remote_rename_plan",
         "list_connections",
@@ -29,9 +31,12 @@ fn main() {
         "test_connection",
         "remote_write_prompt",
         "commit_remote_overwrite",
+        "list_remote_dirs",
         "app_bak_dir",
-        "probe_remote",
+        "load_file_picks",
+        "save_file_picks",
         "read_ssh_config",
+        "reveal_backup",
     ]);
     if let Err(error) = tauri_build::try_build(tauri_build::Attributes::new().app_manifest(manifest)) {
         println!("{error:#}");

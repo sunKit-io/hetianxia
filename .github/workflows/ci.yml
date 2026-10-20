@@ -26,6 +26,8 @@ jobs:
         run: cargo test -p hetianxia-core
       - name: cargo test fault-inject
         run: cargo test -p hetianxia-core --features fault-inject
+      - name: release string scan unit tests
+        run: python3 scripts/test_scan_release_strings.py
       - name: release strings
         run: |
           cargo build -p hetianxia-core --release --locked --bin hetianxia-linkcheck
@@ -38,7 +40,7 @@ jobs:
           command: check
           arguments: --all-features --locked
       - name: banner copy
-        run: node --experimental-strip-types --test src/os.test.ts src/resumeCopy.test.ts src/syncScroll.test.ts src/choices.test.ts src/engine.test.ts src/labels.test.ts src/paths.test.ts src/historyRows.test.ts src/remoteWrite.test.ts src/startupSheet.test.ts
+        run: node --experimental-strip-types --test src/os.test.ts src/resumeCopy.test.ts src/syncScroll.test.ts src/choices.test.ts src/engine.test.ts src/labels.test.ts src/paths.test.ts src/historyRows.test.ts src/remoteWrite.test.ts src/remoteBrowse.test.ts src/remotePackage.test.ts src/startupSheet.test.ts src/localPlan.test.ts src/localFlow.test.ts src/filePicks.test.ts src/confirmExecute.test.ts
       - name: javascript licenses
         run: |
           pnpm install --frozen-lockfile
