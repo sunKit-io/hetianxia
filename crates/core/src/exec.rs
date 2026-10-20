@@ -2107,18 +2107,7 @@ pub fn rollback_preview(db: &Connection, exec_id: &str) -> Result<RollbackPrevie
         Err(rusqlite::Error::QueryReturnedNoRows) => return Err(Error::new(ErrorCode::NotFound, "找不到这次升级")),
         Err(err) => return Err(err.into()),
     };
-    let (project_col, _) = journal_flag_columns(db)?;
-    let column_root = if project_col {
-        db.query_row("SELECT project_root FROM exec_journal WHERE exec_id=?1", params![exec_id], |row| {
-            row.get::<_, Option<String>>(0)
-        })?
-    } else {
-        None
-    };
-    let plan_value: serde_json::Value = serde_json::from_str(&plan_json).unwrap_or(serde_json::Value::Null);
-    let Some(root) = nonempty(column_root).or_else(|| plan_project_root(&plan_value)) else {
-        return Err(Error::new(ErrorCode::NotFound, "这次升级没有项目目录"));
-    };
+    let root = stored_project_root(db, exec_id)?;
     let plan: ExecPlan = serde_json::from_str(&plan_json).map_err(|err| Error::new(ErrorCode::Internal, err.to_string()))?;
     let files = rollback_conflicts(&LocalFs::new(root), db, exec_id, &plan)?;
     Ok(RollbackPreview { started_at, files })
@@ -5873,12 +5862,20 @@ mod tests {
             params!["ex-1"],
         )
         .unwrap();
+        let mut with_plan_root = serde_json::to_value(&plan).unwrap();
+        with_plan_root["projectRoot"] = serde_json::Value::String(decoy.display().to_string());
+        db.execute("UPDATE exec_journal SET plan_json=?2 WHERE exec_id=?1", params!["ex-1", with_plan_root.to_string()])
+            .unwrap();
         let no_root = rollback_preview(&db, "ex-1").unwrap_err();
-        assert_eq!(no_root.message, "这次升级没有项目目录");
+        assert_eq!(no_root.code, ErrorCode::InvalidLocation);
+        let needs_verify: i64 = db
+            .query_row("SELECT needs_verify FROM exec_ops WHERE exec_id=?1", params!["ex-1"], |row| row.get(0))
+            .unwrap();
+        assert_eq!(needs_verify, 1);
+        assert_eq!(fs::read(decoy.join("a.txt")).unwrap(), b"changed\n");
+        assert_eq!(fs::read(proj.join("a.txt")).unwrap(), b"original\n");
 
-        let mut with_root = serde_json::to_value(&plan).unwrap();
-        with_root["projectRoot"] = serde_json::Value::String(proj.display().to_string());
-        db.execute("UPDATE exec_journal SET plan_json=?2 WHERE exec_id=?1", params!["ex-1", with_root.to_string()])
+        db.execute("UPDATE exec_journal SET project_root=?2 WHERE exec_id=?1", params!["ex-1", proj.display().to_string()])
             .unwrap();
         let same = rollback_preview(&db, "ex-1").unwrap();
         assert_eq!(same.started_at, 1_700_000_000_000);
