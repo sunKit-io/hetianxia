@@ -44,6 +44,12 @@ test("history rollback opens the sheet for that row and does not call rollback_r
   assert.match(app, /onRollback\(run\.execId\)/);
   assert.match(app, /historyContinue\(run\.execId\)/);
   assert.match(app, /historyStatusLabel\(run\.status\)/);
+  const history = app.slice(app.indexOf("function HistoryPage"), app.indexOf("function VerifyFailedSheet"));
+  assert.match(history, /\[refreshToken\]/);
+  const rollbackStart = app.indexOf("async function applyRollback");
+  const rollback = app.slice(rollbackStart, app.indexOf("return (", rollbackStart));
+  assert.match(rollback, /setHistoryToken\(\(token\) => token \+ 1\)/);
+  assert.ok(rollback.indexOf("rollbackRun") < rollback.indexOf("setHistoryToken"));
   assert.match(app, /title=\{REMOTE_ROLLBACK_TITLE\}/);
   assert.match(app, /applyResume\(offer\.execId/);
   assert.match(app, /applyRollback\(offer\.execId/);

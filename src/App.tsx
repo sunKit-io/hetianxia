@@ -64,6 +64,7 @@ export function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [allowReadonly, setAllowReadonly] = useState(false);
   const [sheet, setSheet] = useState<Sheet>(null);
+  const [historyToken, setHistoryToken] = useState(0);
   const [remoteTx, setRemoteTx] = useState<PendingRemoteWrite | null>(null);
   const [verifyBody, setVerifyBody] = useState<string | null>(null);
   const [bakDir, setBakDir] = useState<string | null>(null);
@@ -229,6 +230,7 @@ export function App() {
     setFlowId(id);
     try {
       const report = await rollbackRun(id, choice);
+      setHistoryToken((token) => token + 1);
       setStatus(formatReport(report));
       setSheet(null);
     } catch (err) {
@@ -331,6 +333,7 @@ export function App() {
         )}
         {page === "history" && (
           <HistoryPage
+            refreshToken={historyToken}
             onRollback={(execId) => void openRollback(execId)}
             onContinue={(action) => void applyResume(action.execId, action.choice)}
           />
@@ -766,7 +769,7 @@ function PreviewPage({
   );
 }
 
-function HistoryPage({ onRollback, onContinue }: { onRollback: (execId: string) => void; onContinue: (action: HistoryContinue) => void }) {
+function HistoryPage({ refreshToken, onRollback, onContinue }: { refreshToken: number; onRollback: (execId: string) => void; onContinue: (action: HistoryContinue) => void }) {
   const [runs, setRuns] = useState<JournalRun[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   useEffect(() => {
@@ -776,7 +779,7 @@ function HistoryPage({ onRollback, onContinue }: { onRollback: (execId: string) 
         setLoadError(null);
       })
       .catch((err) => setLoadError(formatEngineError(err)));
-  }, []);
+  }, [refreshToken]);
   return (
     <div className="history" data-screen="26">
       {loadError ? <p className="err" role="alert"><Text value={loadError} /></p> : runs.length === 0 ? <p>还没有升级记录</p> : null}
