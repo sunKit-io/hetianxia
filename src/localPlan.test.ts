@@ -1,21 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { applyCheck, buildLocalPlan, checkState, execPlanFor, filePathsUnder, planListRows, previewCounts, selectedPlan, selectionSummary, textDocToString, textsFromDiff, type ScanFile, type SideText } from "./localPlan.ts";
-
-function side(text: string, extra: Partial<SideText> = {}): SideText {
-  const bytes = Array.from(new TextEncoder().encode(text));
-  return {
-    present: true,
-    binary: false,
-    text,
-    bytes,
-    size: bytes.length,
-    mtimeMs: 10,
-    sha256: `hash:${text}`,
-    ...extra,
-  };
-}
+import { applyCheck, buildLocalPlan, checkState, execPlanFor, filePathsUnder, planListRows, previewCounts, selectedPlan, selectionSummary, textDocToString, textsFromDiff, type ScanFile } from "./localPlan.ts";
 
 test("text comes from the diff document, not the raw sample", () => {
   const shown = textsFromDiff({
@@ -27,46 +13,54 @@ test("text comes from the diff document, not the raw sample", () => {
   assert.equal(textDocToString({ lines: [], newline: "\n", endsWithNewline: false }), "");
 });
 
-test("scan plus merge builds create, overwrite, and move ops", async () => {
+function scanned(rel: string, status: string, extra: Partial<ScanFile> = {}): ScanFile {
+  return {
+    rel,
+    status,
+    rightSize: 4,
+    contentSha256: `sha:${rel}`,
+    entryName: rel,
+    leftSize: status === "added" ? null : 3,
+    leftSha256: status === "added" ? null : `left:${rel}`,
+    rightMtimeMs: 20,
+    ...extra,
+  };
+}
+
+test("scan metadata builds create, overwrite, and move ops without file bytes", async () => {
   const files: ScanFile[] = [
-    { rel: "new.txt", status: "added" },
-    { rel: "keep.txt", status: "same" },
-    { rel: "app.txt", status: "modified", readonly: true },
-    { rel: "old.txt", status: "moved", message: "move-source", movedTo: "renamed.txt" },
-    { rel: "renamed.txt", status: "moved", movedFrom: "old.txt" },
-    { rel: "link", status: "symlink" },
-    { rel: "only-local.txt", status: "extra" },
+    scanned("new.txt", "added"),
+    scanned("keep.txt", "same"),
+    scanned("app.txt", "modified", { readonly: true }),
+    scanned("old.txt", "moved", { message: "move-source", movedTo: "renamed.txt" }),
+    scanned("renamed.txt", "moved", { movedFrom: "old.txt", leftSha256: "left:old", leftSize: 3 }),
+    scanned("link", "symlink"),
+    scanned("only-local.txt", "extra"),
   ];
-  const reads: string[] = [];
-  const plan = await buildLocalPlan({
+  const plan = buildLocalPlan({
     projectRoot: "/work/demo",
     packagePath: "/tmp/pkg",
+    scanId: "scan-1",
+    packageKind: "dir",
     files,
-    async read(root, rel) {
-      reads.push(`${root}:${rel}`);
-      if (rel === "new.txt") return side("new\n");
-      if (rel === "app.txt" && root === "/work/demo") return side("old\n");
-      if (rel === "app.txt") return side("new-app\n");
-      if (rel === "old.txt") return side("same\n", { sha256: "hash:same" });
-      return side("same\n");
-    },
-    async mergeText(left, right) {
-      return { text: `M:${left}|${right}` };
-    },
   });
   assert.deepEqual(plan.files.map((file) => file.path), ["new.txt", "app.txt", "renamed.txt"]);
   assert.equal(plan.files[0].kind, "create");
   assert.equal(plan.files[0].label, "升级包");
-  assert.equal(plan.files[0].merged, true);
-  assert.equal(new TextDecoder().decode(new Uint8Array(plan.files[0].bytes)), "M:|new\n");
+  assert.equal(plan.files[0].merged, false);
+  assert.equal(plan.files[0].contentHash, "sha:new.txt");
+  assert.equal(plan.files[0].size, 4);
+  assert.deepEqual(plan.files[0].source, { scanId: "scan-1", kind: "dir", entry: "new.txt" });
+  assert.equal(plan.files[0].expect, null);
   assert.equal(plan.files[1].kind, "overwrite");
   assert.equal(plan.files[1].readonly, true);
-  assert.equal(plan.files[1].label, "合并结果");
+  assert.equal(plan.files[1].label, "覆盖");
+  assert.equal(plan.files[1].expect?.hash, "left:app.txt");
   assert.equal(plan.files[2].kind, "move");
   assert.equal(plan.files[2].from, "old.txt");
   assert.equal(plan.files[2].keepSource, true);
   assert.equal(plan.files[2].merged, false);
-  assert.equal(reads.includes("/work/demo:keep.txt"), false);
+  assert.equal(JSON.stringify(plan).includes('"bytes"'), false);
   const counts = previewCounts(plan.files, false);
   assert.equal(counts.create, 1);
   assert.equal(counts.overwrite, 0);
@@ -75,53 +69,45 @@ test("scan plus merge builds create, overwrite, and move ops", async () => {
   assert.equal(counts.delete, 0);
   const allowed = previewCounts(plan.files, true);
   assert.equal(allowed.overwrite, 1);
-  assert.equal(allowed.merged, 2);
+  assert.equal(allowed.merged, 0);
   assert.equal(allowed.skipReadonly, 0);
 });
 
-test("edited right side is what execute writes", async () => {
-  const plan = await buildLocalPlan({
+test("execute plan keeps the package hash and does not carry bytes", async () => {
+  const plan = buildLocalPlan({
     projectRoot: "/proj",
-    packagePath: "/pkg",
-    files: [{ rel: "a.txt", status: "modified" }],
-    async read(root) {
-      return side(root === "/proj" ? "L\n" : "R\n");
-    },
-    async mergeText(_left, right) {
-      return { text: right };
-    },
+    packagePath: "/pkg.zip",
+    scanId: "scan-zip",
+    packageKind: "zip",
+    files: [scanned("a.txt", "modified", { entryName: "a.txt", contentSha256: "abc", rightSize: 8, rightMtimeMs: 11 })],
   });
-  const exec = await execPlanFor(plan, { "a.txt": "edited\n" }, { "a.txt": "takeRight" }, async (left, right, decision) => {
-    assert.equal(left, "L\n");
-    assert.equal(right, "edited\n");
-    assert.equal(decision, "takeRight");
-    return { text: "edited\n" };
+  const exec = await execPlanFor(plan, { "a.txt": "edited\n" }, { "a.txt": "takeRight" }, async () => {
+    throw new Error("plan must not read or merge file bytes");
   }, "exec-test");
   assert.equal(exec.id, "exec-test");
   assert.equal(exec.projectKey, "/proj");
-  assert.equal(exec.ops[0].merged, true);
-  assert.equal(exec.ops[0].sourceMtimeMs, null);
-  assert.equal(new TextDecoder().decode(new Uint8Array(exec.ops[0].bytes ?? [])), "edited\n");
+  assert.equal(exec.ops[0].merged, false);
+  assert.equal(exec.ops[0].sourceMtimeMs, 11);
+  assert.equal(exec.ops[0].contentHash, "abc");
+  assert.equal(exec.ops[0].size, 8);
+  assert.deepEqual(exec.ops[0].source, { scanId: "scan-zip", kind: "zip", entry: "a.txt" });
+  assert.equal(JSON.stringify(exec).includes('"bytes"'), false);
   assert.equal(exec.summary.overwrite, 1);
-  assert.equal(exec.summary.merged, 1);
+  assert.equal(exec.summary.merged, 0);
 });
 
 test("directory checks include nested files and the stored plan keeps one move row", async () => {
-  const plan = await buildLocalPlan({
+  const plan = buildLocalPlan({
     projectRoot: "/work/demo",
     packagePath: "/tmp/pkg",
+    scanId: "scan-2",
+    packageKind: "dir",
     files: [
-      { rel: "readme.txt", status: "added" },
-      { rel: "src/old.ts", status: "moved", message: "move-source", movedTo: "src/new.ts" },
-      { rel: "src/new.ts", status: "moved", movedFrom: "src/old.ts" },
-      { rel: "src/util/c.ts", status: "added" },
+      scanned("readme.txt", "added"),
+      scanned("src/old.ts", "moved", { message: "move-source", movedTo: "src/new.ts" }),
+      scanned("src/new.ts", "moved", { movedFrom: "src/old.ts" }),
+      scanned("src/util/c.ts", "added"),
     ],
-    async read() {
-      return side("same\n");
-    },
-    async mergeText(_left, right) {
-      return { text: right };
-    },
   });
   assert.deepEqual(plan.files.map((file) => file.path), ["readme.txt", "src/new.ts", "src/util/c.ts"]);
   assert.equal(plan.files[1].kind, "move");
@@ -158,21 +144,17 @@ test("directory checks include nested files and the stored plan keeps one move r
 });
 
 test("preview header counts follow the checked plan", async () => {
-  const plan = await buildLocalPlan({
+  const plan = buildLocalPlan({
     projectRoot: "/work/demo",
     packagePath: "/tmp/pkg",
+    scanId: "scan-header",
+    packageKind: "dir",
     files: [
-      { rel: "new.txt", status: "added" },
-      { rel: "app.txt", status: "modified" },
-      { rel: "old.txt", status: "moved", message: "move-source", movedTo: "renamed.txt" },
-      { rel: "renamed.txt", status: "moved", movedFrom: "old.txt" },
+      scanned("new.txt", "added"),
+      scanned("app.txt", "modified"),
+      scanned("old.txt", "moved", { message: "move-source" }),
+      scanned("renamed.txt", "moved", { movedFrom: "old.txt" }),
     ],
-    async read() {
-      return side("same\n");
-    },
-    async mergeText(_left, right) {
-      return { text: right };
-    },
   });
   const all = previewCounts(plan.files, false);
   assert.equal(all.create, 1);

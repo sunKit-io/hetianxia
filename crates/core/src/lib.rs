@@ -12,6 +12,7 @@ pub mod model;
 pub mod osinfo;
 pub mod pathutil;
 pub mod picks;
+pub mod pkg;
 pub mod plans;
 pub mod prefs;
 pub mod remote;

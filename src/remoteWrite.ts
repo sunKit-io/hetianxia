@@ -165,7 +165,10 @@ export function remotePlanFiles(plan: LocalPlan | null, picked: ReadonlySet<stri
     if (!remotePath) return { files: [], error: `远程路径越出了远程目录：${rel}` };
     const content = Object.prototype.hasOwnProperty.call(edited, file.path)
       ? Array.from(new TextEncoder().encode(edited[file.path]))
-      : file.bytes.slice();
+      : file.bytes
+        ? file.bytes.slice()
+        : null;
+    if (!content) return { files: [], error: `远程写入还没有读到 ${rel} 的内容` };
     files.push({ remotePath, content });
   }
   return { files, error: null };

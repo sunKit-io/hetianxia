@@ -308,7 +308,7 @@ mod tests {
         let right = dir.path().join("right");
         std::fs::create_dir(&right).unwrap();
         std::fs::write(right.join("a.txt"), "new\n").unwrap();
-        let scanned = commands::scan(dir.path().display().to_string(), right.display().to_string()).unwrap();
+        let scanned = commands::scan_paths(dir.path().display().to_string(), right.display().to_string()).unwrap();
         assert!(scanned.files.iter().any(|f| f.rel == "a.txt"));
         let compared = commands::compare(dir.path().display().to_string(), right.display().to_string()).unwrap();
         assert_eq!(compared.files.len(), scanned.files.len());
@@ -318,7 +318,7 @@ mod tests {
         std::fs::create_dir(&mv_right).unwrap();
         std::fs::write(mv_left.join("old.ts"), b"body").unwrap();
         std::fs::write(mv_right.join("new.ts"), b"body").unwrap();
-        let moved = commands::scan(mv_left.display().to_string(), mv_right.display().to_string()).unwrap();
+        let moved = commands::scan_paths(mv_left.display().to_string(), mv_right.display().to_string()).unwrap();
         let dest = moved.files.iter().find(|f| f.rel == "new.ts").unwrap();
         assert_eq!(dest.status, hetianxia_core::scan::FileStatus::Moved);
         assert_eq!(dest.moved_from.as_deref(), Some("old.ts"));
@@ -341,6 +341,9 @@ mod tests {
                 path: "a.txt".into(),
                 from: None,
                 bytes: Some(b"new\n".to_vec()),
+                content_hash: None,
+                size: None,
+                source: None,
                 expect: None,
                 mode: None,
                 source_mtime_ms: None,
@@ -429,6 +432,9 @@ mod tests {
                 path: "a.txt".into(),
                 from: None,
                 bytes: Some(bytes.to_vec()),
+                content_hash: None,
+                size: None,
+                source: None,
                 expect: None,
                 mode: None,
                 source_mtime_ms: None,

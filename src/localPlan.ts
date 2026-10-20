@@ -16,6 +16,19 @@ export type ScanFile = {
   movedFrom?: string | null;
   message?: string | null;
   readonly?: boolean;
+  leftSize?: number | null;
+  rightSize?: number | null;
+  leftMtimeMs?: number | null;
+  rightMtimeMs?: number | null;
+  contentSha256?: string | null;
+  entryName?: string | null;
+  leftSha256?: string | null;
+};
+
+export type PackageSource = {
+  scanId: string;
+  kind: "dir" | "zip";
+  entry: string;
 };
 
 export type PlannedFile = {
@@ -27,11 +40,15 @@ export type PlannedFile = {
   binary: boolean;
   leftText: string;
   rightText: string;
-  bytes: number[];
   from: string | null;
   expect: { size: number; mtimeMs: number | null; hash: string } | null;
   sourceMtimeMs: number | null;
   keepSource: boolean;
+  contentHash: string | null;
+  size: number | null;
+  source: PackageSource | null;
+  /** 远程写入临时带上的内容。本地执行计划不使用，也不会写进计划 JSON。 */
+  bytes?: number[];
 };
 
 export type LocalPlan = {
@@ -49,7 +66,9 @@ export type ExecPlan = {
     kind: PlannedFile["kind"];
     path: string;
     from: string | null;
-    bytes: number[] | null;
+    contentHash: string | null;
+    size: number | null;
+    source: PackageSource | null;
     expect: PlannedFile["expect"];
     mode: null;
     sourceMtimeMs: number | null;
@@ -90,6 +109,7 @@ const decisions: Record<string, MergeDecision> = {};
 let statusSink: ((message: string | null) => void) | null = null;
 let shownPlan: LocalPlan | null = null;
 let shownPath: string | null = null;
+const shownText: Record<string, string> = {};
 
 /** 预演当前选中的文件。远程写入在点击时读这份，所以编辑不用再走一轮渲染。 */
 export function noteShownFile(plan: LocalPlan | null, path: string | null) {
@@ -97,7 +117,13 @@ export function noteShownFile(plan: LocalPlan | null, path: string | null) {
   shownPath = path;
 }
 
-/** 选中文件的最终文本：有手工编辑用编辑，否则用计划里已经合并好的字节。 */
+/** 当前打开的那一个文件的文本。计划本身不保存文件字节。 */
+export function rememberShownText(path: string, text: string) {
+  if (!path) return;
+  shownText[path] = text;
+}
+
+/** 选中文件的最终文本：有手工编辑用编辑，否则用已经打开的文本。 */
 export function shownFilePayload(): { path: string; content: string } | null {
   if (!shownPlan || !shownPath) return null;
   const file = shownPlan.files.find((item) => item.path === shownPath);
@@ -105,7 +131,10 @@ export function shownFilePayload(): { path: string; content: string } | null {
   if (Object.prototype.hasOwnProperty.call(edits, file.path)) {
     return { path: file.path, content: edits[file.path] };
   }
-  return { path: file.path, content: new TextDecoder().decode(Uint8Array.from(file.bytes)) };
+  if (Object.prototype.hasOwnProperty.call(shownText, file.path)) {
+    return { path: file.path, content: shownText[file.path] };
+  }
+  return { path: file.path, content: file.rightText };
 }
 
 export function attachFlowStatus(fn: (message: string | null) => void) {
@@ -122,6 +151,7 @@ export function reportFlowStatus(message: string | null) {
 export function clearFileNotes() {
   for (const key of Object.keys(edits)) delete edits[key];
   for (const key of Object.keys(decisions)) delete decisions[key];
+  for (const key of Object.keys(shownText)) delete shownText[key];
 }
 
 export function rememberEdit(path: string, text: string, base: string) {
@@ -283,57 +313,44 @@ export function firstTextFile(plan: LocalPlan): string | null {
   return text?.path ?? plan.files[0]?.path ?? null;
 }
 
-function emptySide(): SideText {
-  return { present: false, binary: false, text: "", bytes: [], size: 0, mtimeMs: null, sha256: "" };
+function expectOf(file: ScanFile, kind: PlannedFile["kind"]): PlannedFile["expect"] {
+  if (kind === "create") return null;
+  if (file.leftSize == null || !file.leftSha256) return null;
+  return { size: file.leftSize, mtimeMs: file.leftMtimeMs ?? null, hash: file.leftSha256 };
 }
 
-function snapshot(side: SideText): PlannedFile["expect"] {
-  if (!side.present) return null;
-  return { size: side.size, mtimeMs: side.mtimeMs, hash: side.sha256 };
-}
-
-export async function buildLocalPlan(args: {
+/** 只用扫描元数据组计划。不读取、不保存文件字节。 */
+export function buildLocalPlan(args: {
   projectRoot: string;
   packagePath: string;
+  scanId: string;
+  packageKind: "dir" | "zip";
   files: ScanFile[];
-  read: (root: string, rel: string) => Promise<SideText>;
-  mergeText: (left: string, right: string, decision: string) => Promise<{ text: string }>;
-}): Promise<LocalPlan> {
+}): LocalPlan {
   const planned: PlannedFile[] = [];
   for (const file of args.files) {
     if (file.message === "move-source") continue;
     if (file.status === "same" || file.status === "symlink" || file.status === "error" || file.status === "extra") continue;
-    const rightRel = file.rel;
-    const leftRel = file.status === "moved" ? file.movedFrom || file.rel : file.rel;
-    const left = file.status === "added" ? emptySide() : await args.read(args.projectRoot, leftRel);
-    const right = file.status === "delete" ? emptySide() : await args.read(args.packagePath, rightRel);
-    const binary = left.binary || right.binary;
-    let bytes = right.bytes;
-    let merged = false;
-    let sourceMtimeMs = right.mtimeMs;
-    const textChange = !binary && (file.status === "modified" || file.status === "added");
-    if (textChange) {
-      const rendered = await args.mergeText(left.text, right.text, "takeRight");
-      bytes = Array.from(new TextEncoder().encode(rendered.text));
-      merged = true;
-      sourceMtimeMs = null;
-    }
-    const kind = file.status === "added" ? "create" : file.status === "moved" ? "move" : "overwrite";
-    const label = kind === "create" ? "升级包" : kind === "move" ? "移动（保留旧文件）" : merged ? "合并结果" : "覆盖";
+    const kind = file.status === "added" ? "create" : file.status === "moved" ? "move" : file.status === "delete" ? "delete" : "overwrite";
+    const entry = file.entryName || file.rel;
+    const source = kind === "delete" || !args.scanId ? null : { scanId: args.scanId, kind: args.packageKind, entry };
+    const label = kind === "create" ? "升级包" : kind === "move" ? "移动（保留旧文件）" : kind === "delete" ? "删除" : "覆盖";
     planned.push({
       path: file.rel,
       kind,
       label,
       readonly: Boolean(file.readonly),
-      merged,
-      binary,
-      leftText: left.text,
-      rightText: right.text,
-      bytes,
+      merged: false,
+      binary: false,
+      leftText: "",
+      rightText: "",
       from: kind === "move" ? file.movedFrom ?? null : null,
-      expect: kind === "create" ? null : snapshot(left),
-      sourceMtimeMs,
+      expect: expectOf(file, kind),
+      sourceMtimeMs: file.rightMtimeMs ?? null,
       keepSource: kind === "move",
+      contentHash: kind === "delete" ? null : file.contentSha256 ?? null,
+      size: kind === "delete" ? null : file.rightSize ?? null,
+      source,
     });
   }
   return {
@@ -346,35 +363,25 @@ export async function buildLocalPlan(args: {
 
 export async function execPlanFor(
   plan: LocalPlan,
-  edits: Record<string, string>,
-  choices: Record<string, MergeDecision>,
-  mergeText: (left: string, right: string, decision: string) => Promise<{ text: string }>,
+  _edits: Record<string, string>,
+  _choices: Record<string, MergeDecision>,
+  _mergeText: (left: string, right: string, decision: string) => Promise<{ text: string }>,
   id: string,
 ): Promise<ExecPlan> {
   const ops: ExecPlan["ops"] = [];
   for (const [index, file] of plan.files.entries()) {
-    let bytes = file.bytes;
-    let merged = file.merged;
-    let sourceMtimeMs = file.sourceMtimeMs;
-    const decision = choices[file.path] ?? "takeRight";
-    const edited = Object.prototype.hasOwnProperty.call(edits, file.path);
-    if (!file.binary && (file.kind === "overwrite" || file.kind === "create") && (edited || decision !== "takeRight")) {
-      const right = edited ? edits[file.path] : file.rightText;
-      const rendered = await mergeText(file.leftText, right, decision);
-      bytes = Array.from(new TextEncoder().encode(rendered.text));
-      merged = true;
-      sourceMtimeMs = null;
-    }
     ops.push({
       index: index + 1,
       kind: file.kind,
       path: file.path,
       from: file.from,
-      bytes: file.kind === "delete" ? null : bytes,
+      contentHash: file.kind === "delete" ? null : file.contentHash,
+      size: file.kind === "delete" ? null : file.size,
+      source: file.kind === "delete" ? null : file.source,
       expect: file.expect,
       mode: null,
-      sourceMtimeMs,
-      merged,
+      sourceMtimeMs: file.sourceMtimeMs,
+      merged: file.merged,
       keepSource: file.keepSource,
       readonly: file.readonly,
       label: file.label,

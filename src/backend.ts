@@ -145,10 +145,17 @@ export type ScanFile = {
   movedTo?: string | null;
   message?: string | null;
   readonly?: boolean;
+  leftSize?: number | null;
+  rightSize?: number | null;
+  leftMtimeMs?: number | null;
+  rightMtimeMs?: number | null;
+  contentSha256?: string | null;
+  entryName?: string | null;
+  leftSha256?: string | null;
 };
 
 export function scanPair(left: string, right: string) {
-  return invoke<{ files: ScanFile[] }>("scan", { left, right });
+  return invoke<{ files: ScanFile[]; scanId: string; packageKind: string }>("scan", { left, right });
 }
 
 export type FileDiff = {

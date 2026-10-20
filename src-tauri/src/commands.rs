@@ -40,16 +40,22 @@ fn ready(session: &crate::Session) -> Result<(), Error> {
     Ok(())
 }
 
-#[tauri::command]
-pub fn scan(left: String, right: String) -> Result<ScanOutput, Error> {
+pub fn scan_paths(left: String, right: String) -> Result<ScanOutput, Error> {
     let left = LocalFs::new(left);
     let right = LocalFs::new(right);
     scan::run_scan(&left, &right, &Ignore::defaults(), &ScanOptions::default())
 }
 
 #[tauri::command]
+pub fn scan(session: tauri::State<crate::Session>, left: String, right: String) -> Result<ScanOutput, Error> {
+    ready(&session)?;
+    let db = exec::open_db(&session.db_path)?;
+    hetianxia_core::pkg::scan_recorded(&db, Path::new(&left), Path::new(&right))
+}
+
+#[tauri::command]
 pub fn compare(left: String, right: String) -> Result<ScanOutput, Error> {
-    scan(left, right)
+    scan_paths(left, right)
 }
 
 #[tauri::command]
@@ -93,35 +99,53 @@ fn text_of(doc: &merge::TextDoc) -> String {
 }
 
 /// 只读。缺文件时 present 为 false，不改磁盘。
+/// 不把文件字节交回界面。超过 1MB 的文件只返回哈希和大小。
 #[tauri::command]
 pub fn read_side(root: String, rel: String) -> Result<SideText, Error> {
     let fs = LocalFs::new(&root);
     let parsed = RelPath::parse(&rel)?;
-    match fs.read(&parsed) {
-        Err(err) if err.code == ErrorCode::NotFound => Ok(SideText {
-            present: false,
-            binary: false,
+    let stat = match fs.stat(&parsed) {
+        Err(err) if err.code == ErrorCode::NotFound => {
+            return Ok(SideText {
+                present: false,
+                binary: false,
+                text: String::new(),
+                bytes: Vec::new(),
+                size: 0,
+                mtime_ms: None,
+                sha256: sha256_hex(b""),
+            });
+        }
+        Err(err) => return Err(err),
+        Ok(stat) => stat,
+    };
+    if stat.kind != hetianxia_core::vfs::EntryKind::File || stat.size > 1024 * 1024 {
+        let sha = if stat.kind == hetianxia_core::vfs::EntryKind::File {
+            fs.hash(&parsed, true)?
+        } else {
+            sha256_hex(b"")
+        };
+        return Ok(SideText {
+            present: true,
+            binary: true,
             text: String::new(),
             bytes: Vec::new(),
-            size: 0,
-            mtime_ms: None,
-            sha256: sha256_hex(b""),
-        }),
-        Err(err) => Err(err),
-        Ok(bytes) => {
-            let doc = merge::decode(&bytes);
-            let stat = fs.stat(&parsed).ok();
-            Ok(SideText {
-                present: true,
-                binary: doc.binary,
-                text: if doc.binary { String::new() } else { text_of(&doc) },
-                size: stat.as_ref().map(|entry| entry.size).unwrap_or(bytes.len() as u64),
-                mtime_ms: stat.and_then(|entry| entry.mtime_ms),
-                sha256: sha256_hex(&bytes),
-                bytes,
-            })
-        }
+            size: stat.size,
+            mtime_ms: stat.mtime_ms,
+            sha256: sha,
+        });
     }
+    let bytes = fs.read(&parsed)?;
+    let doc = merge::decode(&bytes);
+    Ok(SideText {
+        present: true,
+        binary: doc.binary,
+        text: if doc.binary { String::new() } else { text_of(&doc) },
+        size: stat.size,
+        mtime_ms: stat.mtime_ms,
+        sha256: sha256_hex(&bytes),
+        bytes: Vec::new(),
+    })
 }
 
 /// scan 的右边必须是目录。zip 先解到临时目录，目录原样返回。
@@ -196,11 +220,12 @@ pub fn confirm_execute(
 pub fn execute(
     session: tauri::State<crate::Session>,
     root: String,
-    plan: ExecPlan,
+    plan: serde_json::Value,
     allow_readonly: bool,
     token: String,
 ) -> Result<ExecReport, Error> {
     ready(&session)?;
+    let plan = hetianxia_core::model::parse_client_plan(plan)?;
     let project = PathBuf::from(&root);
     {
         let mut saved = session.project_root.lock().map_err(|_| Error::new(ErrorCode::Internal, "项目目录锁被占用"))?;

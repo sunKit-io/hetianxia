@@ -17,6 +17,20 @@ pub struct Snapshot {
     pub hash: String,
 }
 
+/// 升级包里的一个文件。路径不在这里：执行只按 `scan_id` 读扫描时写入数据库的那条路径。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentSource {
+    pub scan_id: String,
+    /// `dir` 或 `zip`。
+    pub kind: String,
+    /// 目录包里的相对路径，或 zip 条目名。
+    pub entry: String,
+    /// 前端如果带了路径，执行会拿它和扫描记录比对，不一致就中止，并且不会打开它。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanOp {
@@ -25,7 +39,8 @@ pub struct PlanOp {
     pub path: String,
     /// 移动的旧路径。
     pub from: Option<String>,
-    /// 要写入的内容。删除没有。
+    /// 引擎内部测试仍可直接带内容。界面计划不能带这个字段，见 `parse_client_plan`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<Vec<u8>>,
     pub expect: Option<Snapshot>,
     pub mode: Option<u32>,
@@ -36,6 +51,32 @@ pub struct PlanOp {
     pub keep_source: bool,
     pub readonly: bool,
     pub label: String,
+    /// 要写入内容的 SHA-256。删除没有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    /// 要写入内容的字节数。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// 升级包来源。只有 scan_id 和条目名；磁盘路径在扫描记录里。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ContentSource>,
+}
+
+pub const LEGACY_BYTES_PLAN: &str = "旧格式计划带有文件内容（bytes），已不再支持。请重新扫描后再执行";
+
+/// 界面送来的计划。带 `bytes` 数组的旧格式直接拒绝。
+pub fn parse_client_plan(value: serde_json::Value) -> crate::error::Result<ExecPlan> {
+    if plan_embeds_bytes(&value) {
+        return Err(crate::error::Error::new(crate::error::ErrorCode::InvalidState, LEGACY_BYTES_PLAN));
+    }
+    serde_json::from_value(value).map_err(|err| crate::error::Error::new(crate::error::ErrorCode::Internal, err.to_string()))
+}
+
+fn plan_embeds_bytes(value: &serde_json::Value) -> bool {
+    let Some(ops) = value.get("ops").and_then(|item| item.as_array()) else {
+        return false;
+    };
+    ops.iter().any(|op| matches!(op.get("bytes"), Some(serde_json::Value::Array(_))))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

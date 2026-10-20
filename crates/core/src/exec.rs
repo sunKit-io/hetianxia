@@ -18,6 +18,8 @@
 //! 继续：对还没 done 的操作重新做变动检测（只认哈希，touch 不算改动）。
 //! 回滚冲突三个选择：继续（先把当前版本另存再覆盖）、跳过冲突文件、取消。
 //! 回滚时只要有文件被跳过或没有恢复，状态就是 `ROLLBACK_PARTIAL`，历史显示「部分回滚」。
+//! 用户选择跳过冲突文件并且这次回滚跑完，是终态：启动不再提示，继续升级也会拒绝。
+//! 停在 `ROLLING_BACK`，或因为恢复失败留下的 `ROLLBACK_PARTIAL`，启动仍要提示。
 //!
 //! 只读文件默认不覆盖，预演里以 E_PERMISSION 列出。勾选「覆盖只读文件」后
 //! 先去掉只读（chmod，macOS 再 chflags nouchg），写完再恢复只读。
@@ -242,6 +244,7 @@ pub fn open_db(path: &Path) -> Result<Connection> {
     // 增量迁移。不改上面 CREATE TABLE 里的原始列。旧库这两列保持 NULL。
     ensure_column(&conn, "exec_journal", "root", "TEXT")?;
     ensure_column(&conn, "exec_journal", "project_root", "TEXT")?;
+    ensure_column(&conn, "exec_journal", "rollback_closed", "INTEGER NOT NULL DEFAULT 0")?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS exec_temps (
             exec_id TEXT NOT NULL,
@@ -872,6 +875,22 @@ fn probe_log_write(db: &Connection, plan: &FaultPlan) -> Result<()> {
     Ok(())
 }
 
+fn payload_hash(op: &PlanOp) -> Option<String> {
+    if let Some(bytes) = &op.bytes {
+        return Some(sha256_hex(bytes));
+    }
+    op.content_hash.clone().filter(|hash| !hash.is_empty())
+}
+
+fn rollback_closed(db: &Connection, exec_id: &str) -> Result<bool> {
+    let closed: i64 = db.query_row(
+        "SELECT COALESCE(rollback_closed, 0) FROM exec_journal WHERE exec_id=?1",
+        params![exec_id],
+        |row| row.get(0),
+    )?;
+    Ok(closed != 0)
+}
+
 enum WriteGuess {
     Written,
     NotWritten,
@@ -880,7 +899,7 @@ enum WriteGuess {
 
 fn guess_written(fsys: &LocalFs, backup: &Path, op: &PlanOp) -> Result<WriteGuess> {
     let target_rel = RelPath::parse(&op.path)?;
-    let target_hash = op.bytes.as_ref().map(|b| sha256_hex(b));
+    let target_hash = payload_hash(op);
     let expect_hash = op.expect.as_ref().map(|s| s.hash.clone());
     let current = fsys.hash(&target_rel, true).ok();
     let source = op.from.as_deref().unwrap_or(op.path.as_str());
@@ -1136,6 +1155,9 @@ pub fn recover_on_startup(db: &Connection, _passed_root: &LocalFs) -> Result<Vec
     drop(stmt);
     let mut offers = Vec::new();
     for (exec_id, state, plan_json, backup_root) in loaded {
+        if state == "ROLLBACK_PARTIAL" && rollback_closed(db, &exec_id)? {
+            continue;
+        }
         if matches!(resume_admission(&state), ResumeAdmission::Reject) {
             continue;
         }
@@ -1308,7 +1330,7 @@ pub fn execute(db: &Connection, fsys: &LocalFs, plan: &ExecPlan, opts: &ExecOpts
         match res {
             Ok(()) => {
                 let done = format!("done:{}", op.index);
-                let wrote = op.bytes.as_ref().map(|b| sha256_hex(b));
+                let wrote = payload_hash(op);
                 log_write(db, &mut fault, &plan.id, &done, || {
                     set_op(db, &plan.id, op.index, "done", None, None)?;
                     if let Some(h) = &wrote {
@@ -1345,7 +1367,7 @@ pub fn execute(db: &Connection, fsys: &LocalFs, plan: &ExecPlan, opts: &ExecOpts
         if !will_apply(op, opts.allow_readonly) {
             continue;
         }
-        if let Some(bytes) = &op.bytes {
+        if let Some(expect) = payload_hash(op) {
             if let Err(e) = fault.hit_file(
                 #[cfg(feature = "fault-inject")]
                 Stage::VerifyPost,
@@ -1355,7 +1377,6 @@ pub fn execute(db: &Connection, fsys: &LocalFs, plan: &ExecPlan, opts: &ExecOpts
             }
             let rel = RelPath::parse(&op.path)?;
             let got = fsys.hash(&rel, true).unwrap_or_default();
-            let expect = sha256_hex(bytes);
             if got != expect {
                 let err = Error::new(ErrorCode::VerifyFailed, format!("{} 写入后的哈希和升级包不一致", op.path));
                 return finish_stopped(db, plan, &backup, files, op, &err);
@@ -1420,19 +1441,26 @@ fn apply_one(
             Ok(())
         }
         OpKind::Create | OpKind::Overwrite | OpKind::Move => {
-            let bytes = op.bytes.clone().unwrap_or_default();
             let dest = RelPath::parse(&op.path)?;
             let restore = op.readonly && opts.allow_readonly && op.kind == OpKind::Overwrite;
             if restore {
                 fsys.set_readonly(&dest, false)?;
             }
-            let wrote = write_one(db, exec_id, fsys, op, opts, fault, temps, &dest, &bytes);
+            let wrote = write_one(db, exec_id, fsys, op, opts, fault, temps, &dest);
             if wrote.is_err() && restore {
                 fsys.set_readonly(&dest, true)?;
             }
             wrote
         }
     }
+}
+
+fn stage_payload(db: &Connection, fsys: &LocalFs, op: &PlanOp, tmp: &RelPath) -> Result<()> {
+    if let Some(bytes) = &op.bytes {
+        return fsys.create_temp_file(tmp, bytes);
+    }
+    let dest = fsys.abs(tmp)?;
+    crate::pkg::stream_plan_file(db, op, &dest)
 }
 
 fn write_one(
@@ -1444,7 +1472,6 @@ fn write_one(
     fault: &mut FaultRuntime,
     temps: &mut Vec<RelPath>,
     dest: &RelPath,
-    bytes: &[u8],
 ) -> Result<()> {
     if matches!(op.kind, OpKind::Create | OpKind::Move) && fsys.path_occupied(dest)? {
         return Err(occupied_after_preview(dest.as_str()));
@@ -1458,7 +1485,7 @@ fn write_one(
     }
     let tmp = fsys.allocate_temp(dest)?;
     remember_temp(db, exec_id, &tmp)?;
-    if let Err(e) = fsys.create_temp_file(&tmp, bytes) {
+    if let Err(e) = stage_payload(db, fsys, op, &tmp) {
         discard_temp(fsys, db, exec_id, &tmp);
         return Err(e);
     }
@@ -1482,7 +1509,7 @@ fn write_one(
         return bail(real_code(e));
     }
     let got = fsys.read_temp_hash(&tmp)?;
-    let expect = sha256_hex(bytes);
+    let expect = payload_hash(op).unwrap_or_default();
     if got != expect {
         return bail(Error::new(ErrorCode::VerifyFailed, format!("{} 临时文件校验失败，原文件未改", op.path)));
     }
@@ -2250,7 +2277,7 @@ fn plan_file_count(plan: &serde_json::Value) -> u32 {
 }
 
 pub fn pending(db: &Connection) -> Result<Vec<PendingTx>> {
-    let mut stmt = db.prepare("SELECT exec_id, state, project_key, backup_root, plan_json FROM exec_journal WHERE state NOT IN ('COMMITTED','ROLLED_BACK')")?;
+    let mut stmt = db.prepare("SELECT exec_id, state, project_key, backup_root, plan_json FROM exec_journal WHERE state NOT IN ('COMMITTED','ROLLED_BACK') AND COALESCE(rollback_closed, 0) = 0")?;
     let rows = stmt.query_map([], |r| {
         Ok(PendingTx {
             exec_id: r.get(0)?,
@@ -2487,7 +2514,11 @@ pub fn rollback(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: 
         .map(|f| f.path.clone())
         .collect();
     let attr_json = attr_failed_payload(&attr_paths);
-    db.execute("UPDATE exec_journal SET state=?2, finished_at=?3 WHERE exec_id=?1", params![exec_id, state, now_ms()])?;
+    let closed = choice == RollbackChoice::SkipConflicts;
+    db.execute(
+        "UPDATE exec_journal SET state=?2, finished_at=?3, rollback_closed=?4 WHERE exec_id=?1",
+        params![exec_id, state, now_ms(), if closed { 1 } else { 0 }],
+    )?;
     db.execute(
         "UPDATE history SET result=?2, paths_json=?3, attr_failed_json=?4 WHERE exec_id=?1",
         params![exec_id, history_result, paths, attr_json],
@@ -2778,11 +2809,11 @@ fn written_file_conflict(fsys: &LocalFs, backup: &Path, op: &PlanOp, row: &OpRow
             }
         };
     }
-    if op.bytes.is_none() && !row.written && row.state != "done" {
+    if payload_hash(op).is_none() && !row.written && row.state != "done" {
         return Ok(None);
     }
     let rel = RelPath::parse(&op.path)?;
-    let wrote = row.after_hash.clone().or_else(|| op.bytes.as_ref().map(|b| sha256_hex(b)));
+    let wrote = row.after_hash.clone().or_else(|| payload_hash(op));
     match fsys.hash(&rel, true) {
         Ok(hash) => {
             if let Some(expect) = wrote {
@@ -2849,7 +2880,7 @@ fn resume_seen_conflict(fsys: &LocalFs, op: &PlanOp, row: &OpRow) -> Result<Opti
             Some(_) => Some(ConflictFile { path: op.path.clone(), detail: DETAIL_MODIFIED.into() }),
         });
     }
-    let expect = row.after_hash.clone().or_else(|| op.bytes.as_ref().map(|b| sha256_hex(b)));
+    let expect = row.after_hash.clone().or_else(|| payload_hash(op));
     Ok(match (current, expect) {
         (None, Some(_)) => Some(ConflictFile { path: op.path.clone(), detail: DETAIL_DELETED.into() }),
         (Some(h), Some(e)) if h != e => Some(ConflictFile { path: op.path.clone(), detail: DETAIL_MODIFIED.into() }),
@@ -2873,6 +2904,9 @@ fn record_kept(db: &Connection, fsys: &LocalFs, exec_id: &str, op: &PlanOp) -> R
 pub fn resume(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: ResumeChoice, opts: &ExecOpts, fault: FaultPlan) -> Result<ResumeOutcome> {
     if choice == ResumeChoice::Cancel {
         return Ok(ResumeOutcome::Unchanged);
+    }
+    if rollback_closed(db, exec_id)? {
+        return Err(Error::new(ErrorCode::InvalidState, "这次回滚已经结束"));
     }
     let observed = observed_state(db, exec_id)?;
     match resume_admission(&observed) {
@@ -3072,7 +3106,7 @@ fn continue_same_transaction(
         match apply_one(db, &plan.id, fsys, op, opts, &mut fault, &mut temps) {
             Ok(()) => {
                 let done = format!("done:{}", op.index);
-                let wrote = op.bytes.as_ref().map(|b| sha256_hex(b));
+                let wrote = payload_hash(op);
                 log_write(db, &mut fault, &plan.id, &done, || {
                     set_op(db, &plan.id, op.index, "done", None, None)?;
                     if let Some(h) = &wrote {
@@ -3109,7 +3143,7 @@ fn continue_same_transaction(
         if code.as_deref() == Some("E_CHANGED_SINCE_SCAN") {
             continue;
         }
-        if let Some(bytes) = &op.bytes {
+        if let Some(expect) = payload_hash(op) {
             if let Err(e) = fault.hit_file(
                 #[cfg(feature = "fault-inject")]
                 Stage::VerifyPost,
@@ -3119,7 +3153,7 @@ fn continue_same_transaction(
             }
             let rel = RelPath::parse(&op.path)?;
             let got = fsys.hash(&rel, true).unwrap_or_default();
-            if got != sha256_hex(bytes) {
+            if got != expect {
                 let err = Error::new(ErrorCode::VerifyFailed, format!("{} 写入后的哈希和升级包不一致", op.path));
                 return finish_stopped(db, plan, backup, files, op, &err);
             }
@@ -3181,6 +3215,9 @@ mod tests {
             path: path.into(),
             from: None,
             bytes: Some(new.to_vec()),
+            content_hash: None,
+            size: None,
+            source: None,
             expect: Some(Snapshot { size: old.len() as u64, mtime_ms: mtime, hash: sha256_hex(old) }),
             mode: Some(0o644),
             source_mtime_ms: Some(1_700_000_000_000),
@@ -3198,6 +3235,9 @@ mod tests {
             path: path.into(),
             from: None,
             bytes: None,
+            content_hash: None,
+            size: None,
+            source: None,
             expect: Some(Snapshot { size: old.len() as u64, mtime_ms: None, hash: sha256_hex(old) }),
             mode: Some(0o644),
             source_mtime_ms: None,
@@ -3302,6 +3342,9 @@ mod tests {
             path: "new.ts".into(),
             from: Some("old.ts".into()),
             bytes: Some(b"body".to_vec()),
+            content_hash: None,
+            size: None,
+            source: None,
             expect: None,
             mode: Some(0o644),
             source_mtime_ms: None,
@@ -3673,6 +3716,9 @@ mod tests {
             path: path.into(),
             from: None,
             bytes: Some(bytes.to_vec()),
+            content_hash: None,
+            size: None,
+            source: None,
             expect: None,
             mode: Some(0o644),
             source_mtime_ms: None,
@@ -3956,6 +4002,9 @@ mod tests {
             path: "new/m.txt".into(),
             from: Some("old/m.txt".into()),
             bytes: Some(b"orig".to_vec()),
+            content_hash: None,
+            size: None,
+            source: None,
             expect: Some(Snapshot { size: 4, mtime_ms: None, hash: sha256_hex(b"orig") }),
             mode: Some(0o644),
             source_mtime_ms: None,
@@ -4558,6 +4607,57 @@ mod tests {
             assert_eq!(offer.pre_recovery_state, state);
             assert_eq!(journal_state(&db, &p.id), state);
         }
+    }
+
+    #[test]
+    fn user_chosen_partial_rollback_is_terminal_and_interrupted_rollback_still_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"old-a").unwrap();
+        fs::write(dir.path().join("b.txt"), b"old-b").unwrap();
+        let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+        let fsys = LocalFs::new(dir.path());
+        let opts = opts_at(dir.path());
+        let chosen = plan(vec![ov(1, "a.txt", b"old-a", b"new-a", None), ov(2, "b.txt", b"old-b", b"new-b", None)]);
+        execute(&db, &fsys, &chosen, &opts, FaultPlan::default()).unwrap();
+        fs::write(dir.path().join("a.txt"), b"edited-after").unwrap();
+        let skipped = rollback(&db, &fsys, &chosen.id, RollbackChoice::SkipConflicts, FaultPlan::default()).unwrap();
+        assert_eq!(skipped.state, "ROLLBACK_PARTIAL");
+        assert!(recover_on_startup(&db, &fsys).unwrap().iter().all(|offer| offer.exec_id != chosen.id));
+        let err = resume(&db, &fsys, &chosen.id, ResumeChoice::Continue, &opts, FaultPlan::default()).unwrap_err();
+        assert_eq!(err.message, "这次回滚已经结束");
+        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"edited-after");
+        assert_eq!(fs::read(dir.path().join("b.txt")).unwrap(), b"old-b");
+
+        let mid = tempfile::tempdir().unwrap();
+        fs::write(mid.path().join("a.txt"), b"old").unwrap();
+        let mid_db = open_db(&mid.path().join("t.sqlite")).unwrap();
+        let mid_fs = LocalFs::new(mid.path());
+        let rolling = plan(vec![ov(1, "a.txt", b"old", b"new", None)]);
+        execute(&mid_db, &mid_fs, &rolling, &opts_at(mid.path()), FaultPlan::default()).unwrap();
+        mid_db
+            .execute(
+                "UPDATE exec_journal SET state='ROLLING_BACK', rollback_closed=0, pre_recovery_state=NULL WHERE exec_id=?1",
+                params![rolling.id],
+            )
+            .unwrap();
+        let offers = recover_on_startup(&mid_db, &mid_fs).unwrap();
+        let offer = offers.iter().find(|item| item.exec_id == rolling.id).unwrap();
+        assert_eq!(offer.state, "ROLLING_BACK");
+        assert_eq!(offer.actions, vec!["继续回滚".to_string(), "稍后处理".to_string()]);
+
+        let broken = tempfile::tempdir().unwrap();
+        fs::write(broken.path().join("a.txt"), b"old").unwrap();
+        let broken_db = open_db(&broken.path().join("t.sqlite")).unwrap();
+        let broken_fs = LocalFs::new(broken.path());
+        let failed = plan(vec![ov(1, "a.txt", b"old", b"new", None)]);
+        execute(&broken_db, &broken_fs, &failed, &opts_at(broken.path()), FaultPlan::default()).unwrap();
+        fs::remove_file(broken.path().join("bak").join(&failed.id).join("files").join("a.txt")).unwrap();
+        let partial = rollback(&broken_db, &broken_fs, &failed.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+        assert_eq!(partial.state, "ROLLBACK_PARTIAL");
+        let offers = recover_on_startup(&broken_db, &broken_fs).unwrap();
+        assert!(offers.iter().any(|item| item.exec_id == failed.id && item.state == "ROLLBACK_PARTIAL"));
+        let err = resume(&broken_db, &broken_fs, &failed.id, ResumeChoice::Continue, &opts_at(broken.path()), FaultPlan::default()).unwrap_err();
+        assert_eq!(err.message, "这次只能继续回滚，不能继续升级");
     }
 
     #[test]
@@ -5222,6 +5322,9 @@ mod tests {
             path: to.into(),
             from: Some(from.into()),
             bytes: Some(bytes.to_vec()),
+            content_hash: None,
+            size: None,
+            source: None,
             expect: Some(Snapshot { size: bytes.len() as u64, mtime_ms: None, hash: sha256_hex(bytes) }),
             mode: Some(0o644),
             source_mtime_ms: None,
@@ -5817,6 +5920,9 @@ mod tests {
             path: "new.ts".into(),
             from: Some("old.ts".into()),
             bytes: Some(b"body".to_vec()),
+            content_hash: None,
+            size: None,
+            source: None,
             expect: Some(Snapshot { size: 4, mtime_ms: None, hash: sha256_hex(b"body") }),
             mode: Some(0o644),
             source_mtime_ms: None,

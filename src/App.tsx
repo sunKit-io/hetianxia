@@ -147,12 +147,12 @@ export function App() {
     clearFileNotes();
     try {
       const scanned = await scanPair(project, prepared);
-      const next = await buildLocalPlan({
+      const next = buildLocalPlan({
         projectRoot: project,
         packagePath: prepared,
+        scanId: scanned.scanId,
+        packageKind: scanned.packageKind === "zip" ? "zip" : "dir",
         files: scanned.files,
-        read: readSide,
-        mergeText: mergeTexts,
       });
       setPlan(next);
       const paths = next.files.map((file) => file.path.replace(/\\/g, "/"));
@@ -410,6 +410,21 @@ export function App() {
             remoteProject={remoteProject}
             onBrowseRemote={openRemoteBrowser}
             onRemoteWrite={() => {
+              const source = plan;
+              void (async () => {
+              const plan = source && packagePath ? {
+                ...source,
+                files: await Promise.all(source.files.map(async (file) => {
+                  if (file.bytes || file.kind === "delete" || !pickedPaths.has(file.path.replace(/\\/g, "/"))) return file;
+                  try {
+                    const side = await readSide(packagePath, file.path);
+                    if (!side.present || side.binary) return file;
+                    return { ...file, rightText: side.text, bytes: Array.from(new TextEncoder().encode(side.text)) };
+                  } catch {
+                    return file;
+                  }
+                })),
+              } : source;
               const pickedFiles = remotePlanFiles(plan, pickedPaths);
               if (!selected) {
                 setStatus("先保存并选择一个连接");
@@ -434,6 +449,7 @@ export function App() {
                   defaultButton: prompt.defaultButton,
                 });
               }).catch((err) => setStatus(formatEngineError(err)));
+              })();
             }}
           />
         )}

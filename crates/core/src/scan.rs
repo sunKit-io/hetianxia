@@ -51,6 +51,15 @@ pub struct FileRec {
     pub message: Option<String>,
     pub readonly: bool,
     pub link_target: Option<String>,
+    /// 升级包一侧的 SHA-256。扫描比较用的哈希可能是 xxh，写计划用这一项。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
+    /// 目录里的相对路径，或 zip 条目名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_name: Option<String>,
+    /// 项目一侧的 SHA-256，给执行前的变动检测用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +67,12 @@ pub struct FileRec {
 pub struct ScanOutput {
     pub files: Vec<FileRec>,
     pub case_sensitive: bool,
+    /// 扫描记录 id。执行只认数据库里这个 id 对应的升级包路径。
+    #[serde(default)]
+    pub scan_id: String,
+    /// `dir` 或 `zip`。
+    #[serde(default)]
+    pub package_kind: String,
 }
 
 pub fn scan_local(left: &LocalFs, right: &LocalFs, ignore: &Ignore, opt: &ScanOptions) -> Result<ScanOutput> {
@@ -121,6 +136,9 @@ fn compare_entries(left: &[Entry], right: &[Entry], lfs: &LocalFs, rfs: &LocalFs
                         message: Some("符号链接只提示，不覆盖、不删除、不新建".into()),
                         readonly: true,
                         link_target: l.link_target.clone().or(r.link_target.clone()),
+                        content_sha256: None,
+                        entry_name: None,
+                        left_sha256: None,
                     });
                     continue;
                 }
@@ -179,6 +197,9 @@ fn compare_entries(left: &[Entry], right: &[Entry], lfs: &LocalFs, rfs: &LocalFs
                     message: None,
                     readonly: l.readonly,
                     link_target: None,
+                    content_sha256: None,
+                    entry_name: None,
+                    left_sha256: None,
                 });
             }
             (None, None) => {}
@@ -189,7 +210,7 @@ fn compare_entries(left: &[Entry], right: &[Entry], lfs: &LocalFs, rfs: &LocalFs
     files.extend(added);
     files.extend(extra);
     files.sort_by(|a, b| a.rel.cmp(&b.rel));
-    ScanOutput { files, case_sensitive }
+    ScanOutput { files, case_sensitive, scan_id: String::new(), package_kind: String::new() }
 }
 
 fn rec_one(e: &Entry, status: FileStatus, left: bool) -> FileRec {
@@ -210,6 +231,9 @@ fn rec_one(e: &Entry, status: FileStatus, left: bool) -> FileRec {
             message: Some("符号链接只提示，不处理".into()),
             readonly: true,
             link_target: e.link_target.clone(),
+            content_sha256: None,
+            entry_name: None,
+            left_sha256: None,
         };
     }
     FileRec {
@@ -228,6 +252,9 @@ fn rec_one(e: &Entry, status: FileStatus, left: bool) -> FileRec {
         message: None,
         readonly: e.readonly,
         link_target: None,
+        content_sha256: None,
+        entry_name: None,
+        left_sha256: None,
     }
 }
 
