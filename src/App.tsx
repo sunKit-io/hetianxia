@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { Server, ShieldAlert, KeyRound, AlertTriangle } from "lucide-react";
-import { journalRuns, rollbackPreview, rollbackRun, resumeRun, startupFailure, startupOffers, type JournalRun } from "./backend";
+import { appBakDir, clearConnectionFingerprint, commitRemoteOverwrite, deleteConnection, deleteSshSecret, journalRuns, listConnections, remoteWritePrompt, rollbackPreview, rollbackRun, resumeRun, saveConnection, saveSshSecret, sshSecretStatus, startupFailure, startupOffers, testConnection, type JournalRun, type ProbeReport, type SavedConnection } from "./backend";
 import { externalChoice, keepSource, pendingChoice, rollbackChoice, type ResumeChoice, type RollbackChoice } from "./choices";
 import { DiffEditor } from "./editor";
 import { afterResume, engineCode, formatEngineError, formatOffer, formatReport, type ConflictFile, type RecoveryOffer } from "./engine";
 import { formatFileCounts, formatRunTime, historyContinue, historyRowButtons, historyStatusLabel, REMOTE_ROLLBACK_TITLE, type HistoryContinue } from "./historyRows";
-import { ALPINE, UNKNOWN, UBUNTU, canContinue, connectionSubtitle, systemTypeLabel, warningBanner, type RemoteOs } from "./os";
 import { Text } from "./plain";
+import { remoteRootFieldError } from "./remoteRoot";
+import { VERIFY_FAILED_BUTTON, VERIFY_FAILED_TITLE, currentRemotePlan, settleRemoteWrite, type PendingRemoteWrite } from "./remoteWrite";
 import {
   DETAIL_DELETED,
   OVERWRITE_PENDING,
@@ -28,71 +29,9 @@ import {
 type Page = "edit" | "ssh" | "preview" | "history";
 type Sheet = null | "rollback" | "log" | "failure" | "startup" | "external" | "pending" | "rollbackResume";
 
-type Host = {
-  id: string;
-  name: string;
-  user: string;
-  host: string;
-  port: number;
-  os: RemoteOs;
-  proxy?: boolean;
-  dot: "ok" | "bad" | "off";
-  key: string;
-  fingerprint: string;
-  seen: string;
-};
-
-const HOSTS: Host[] = [
-  {
-    id: "build-01",
-    name: "build-01",
-    user: "deploy",
-    host: "10.0.8.15",
-    port: 22,
-    os: ALPINE,
-    dot: "ok",
-    key: "~/.ssh/id_ed25519",
-    fingerprint: "SHA256:q7Xk2mR9vT0pL+3nYd8wHcF1sZ4aE6uJbN5oK1M2gQw",
-    seen: "ED25519 · 9月02日首次确认并记住",
-  },
-  {
-    id: "prod-gw-01",
-    name: "prod-gw-01",
-    user: "ops",
-    host: "172.16.2.40",
-    port: 22,
-    os: UBUNTU,
-    dot: "ok",
-    key: "~/.ssh/id_ed25519",
-    fingerprint: "SHA256:aa",
-    seen: "ED25519 · 8月01日首次确认并记住",
-  },
-  {
-    id: "edge-01",
-    name: "edge-01",
-    user: "deploy",
-    host: "10.0.8.15",
-    port: 22,
-    os: UNKNOWN,
-    dot: "ok",
-    key: "~/.ssh/id_ed25519",
-    fingerprint: "SHA256:q7Xk2mR9vT0pL+3nYd8wHcF1sZ4aE6uJbN5oK1M2gQw",
-    seen: "ED25519 · 9月02日首次确认并记住",
-  },
-  {
-    id: "intranet-jump",
-    name: "intranet-jump",
-    user: "ops",
-    host: "10.1.0.4",
-    port: 22,
-    os: UBUNTU,
-    proxy: true,
-    dot: "off",
-    key: "",
-    fingerprint: "",
-    seen: "",
-  },
-];
+function blankConnection(): SavedConnection {
+  return { id: "", name: "", host: "", port: 22, user: "", auth: "password", keyPath: "", fingerprint: "", remoteRoot: null };
+}
 
 const EXTERNAL_FILES: ResumeFile[] = [];
 
@@ -100,10 +39,13 @@ const PENDING_FILES: ConflictFile[] = [];
 
 export function App() {
   const [page, setPage] = useState<Page>("edit");
-  const [hostId, setHostId] = useState("build-01");
+  const [connections, setConnections] = useState<SavedConnection[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [allowReadonly, setAllowReadonly] = useState(false);
   const [sheet, setSheet] = useState<Sheet>(null);
-  const [cleared, setCleared] = useState<Record<string, boolean>>({});
+  const [remoteTx, setRemoteTx] = useState<PendingRemoteWrite | null>(null);
+  const [verifyBody, setVerifyBody] = useState<string | null>(null);
+  const [bakDir, setBakDir] = useState<string | null>(null);
   const [flowId, setFlowId] = useState("");
   const [status, setStatus] = useState<string | null>(null);
   const [offer, setOffer] = useState<RecoveryOffer | null>(null);
@@ -113,9 +55,17 @@ export function App() {
   const [pendingFiles, setPendingFiles] = useState<ConflictFile[]>(PENDING_FILES);
   const [rollbackFiles, setRollbackFiles] = useState<ConflictFile[]>([]);
   const [rollbackAt, setRollbackAt] = useState(0);
-  const host = HOSTS.find((h) => h.id === hostId) ?? HOSTS[0];
+  const selected = connections.find((item) => item.id === selectedId) ?? null;
 
   useEffect(() => {
+    void listConnections().then(setConnections).catch((err) => setStatus(formatEngineError(err)));
+  }, []);
+
+  useEffect(() => {
+    void appBakDir().then(setBakDir).catch((err) => {
+      const message = formatEngineError(err);
+      if (message.startsWith("E_")) setStatus(message);
+    });
     void startupFailure().then((message) => {
       if (message) setBootError(message);
     }).catch((err) => {
@@ -191,7 +141,7 @@ export function App() {
           </span>
           <div className="titleblock">
             <strong>{page === "ssh" ? "SSH 连接" : page === "history" ? "历史记录" : "合天下"}</strong>
-            <span>{page === "ssh" ? `${HOSTS.length} 个连接` : ""}</span>
+            <span>{page === "ssh" ? `${connections.length} 个连接` : ""}</span>
           </div>
           <nav className="pages">
             <button className={page === "edit" ? "on" : ""} onClick={() => setPage("edit")}>编辑</button>
@@ -199,20 +149,53 @@ export function App() {
             <button className={page === "preview" ? "on" : ""} onClick={() => setPage("preview")}>预演</button>
             <button className={page === "history" ? "on" : ""} onClick={() => setPage("history")}>历史</button>
           </nav>
-          {page === "ssh" && <button className="ghost import">从 ~/.ssh/config 导入</button>}
+          {page === "ssh" && (
+            <>
+              <button className="ghost import" type="button" disabled>从 ~/.ssh/config 导入</button>
+              <span className="soon">下一版支持</span>
+            </>
+          )}
         </header>
         {status && !sheet && <p className={status.includes("E_") ? "status err" : "status"} role="status">{status}</p>}
         {page === "edit" && <DiffEditor onWriteFailed={() => setSheet("failure")} />}
         {page === "ssh" && (
           <SshPage
-            host={host}
-            cleared={!!cleared[host.id]}
-            onPick={setHostId}
-            onClear={() => setCleared((s) => ({ ...s, [host.id]: true }))}
+            connections={connections}
+            selectedId={selectedId}
+            onPick={setSelectedId}
+            onRefresh={setConnections}
+            onStatus={setStatus}
           />
         )}
         {page === "preview" && (
-          <PreviewPage allowReadonly={allowReadonly} setAllowReadonly={setAllowReadonly} />
+          <PreviewPage
+            allowReadonly={allowReadonly}
+            setAllowReadonly={setAllowReadonly}
+            bakDir={bakDir}
+            onRemoteWrite={() => {
+              const plan = currentRemotePlan();
+              if (!selected) {
+                setStatus("先保存并选择一个连接");
+                return;
+              }
+              if (!plan || plan.remotePath === "") {
+                setStatus("还没有选中的计划文件");
+                return;
+              }
+              const content = Array.from(new TextEncoder().encode(plan.content));
+              void remoteWritePrompt(selected.id, plan.remotePath, content).then((prompt) => {
+                setRemoteTx({
+                  execId: prompt.execId,
+                  backupDir: prompt.backupDir,
+                  title: prompt.title,
+                  body: prompt.body,
+                  cancelLabel: prompt.cancelLabel,
+                  proceedLabel: prompt.proceedLabel,
+                  defaultButton: prompt.defaultButton,
+                });
+              }).catch((err) => setStatus(formatEngineError(err)));
+            }}
+          />
         )}
         {page === "history" && (
           <HistoryPage
@@ -268,85 +251,233 @@ export function App() {
             </div>
           </div>
         )}
+        {remoteTx && (
+          <RemoteWriteSheet
+            pending={remoteTx}
+            onCancel={() => {
+              settleRemoteWrite("取消", () => {
+                throw new Error("取消不能写入");
+              });
+              setRemoteTx(null);
+            }}
+            onProceed={() => {
+              const pending = remoteTx;
+              settleRemoteWrite("仍然写入", () => {
+                setRemoteTx(null);
+                void commitRemoteOverwrite(pending.execId).then((outcome) => {
+                  setStatus(`已写入 ${outcome.remotePath}`);
+                }).catch((err) => {
+                  const rec = err && typeof err === "object" ? err as Record<string, unknown> : {};
+                  const code = rec.code != null ? engineCode(String(rec.code)) : "";
+                  if (code === "E_VERIFY_FAILED" && rec.message != null) {
+                    setVerifyBody(String(rec.message));
+                    return;
+                  }
+                  setStatus(formatEngineError(err));
+                });
+              });
+            }}
+          />
+        )}
+        {verifyBody && <VerifyFailedSheet body={verifyBody} onClose={() => setVerifyBody(null)} />}
       </div>
     </div>
   );
 }
 
-function SshPage({ host, cleared, onPick, onClear }: { host: Host; cleared: boolean; onPick: (id: string) => void; onClear: () => void }) {
-  const banner = warningBanner(host.os);
-  const usable = canContinue(host.os) && !host.proxy;
-  const subtitle = connectionSubtitle(host.os);
-  const systemRow = systemTypeLabel(host.os);
+function SshPage({
+  connections,
+  selectedId,
+  onPick,
+  onRefresh,
+  onStatus,
+}: {
+  connections: SavedConnection[];
+  selectedId: string | null;
+  onPick: (id: string | null) => void;
+  onRefresh: (rows: SavedConnection[]) => void;
+  onStatus: (message: string) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [draft, setDraft] = useState<SavedConnection>(blankConnection());
+  const [secretDraft, setSecretDraft] = useState("");
+  const [secretSaved, setSecretSaved] = useState(false);
+  const [pendingFingerprint, setPendingFingerprint] = useState<string | null>(null);
+  const [probe, setProbe] = useState<ProbeReport | null>(null);
+  const shown = connections.filter((item) => {
+    const text = `${item.name} ${item.user} ${item.host}`.toLowerCase();
+    return text.includes(query.trim().toLowerCase());
+  });
+
+  function load(id: string | null) {
+    onPick(id);
+    setSecretDraft("");
+    setPendingFingerprint(null);
+    setProbe(null);
+    const found = connections.find((item) => item.id === id);
+    setDraft(found ?? blankConnection());
+    if (!id) {
+      setSecretSaved(false);
+      return;
+    }
+    void sshSecretStatus(id).then((status) => setSecretSaved(status.saved)).catch(() => setSecretSaved(false));
+  }
+
+  async function refresh(id: string | null) {
+    const rows = await listConnections();
+    onRefresh(rows);
+    onPick(id);
+    const found = rows.find((item) => item.id === id);
+    if (found) setDraft(found);
+    if (id) {
+      const status = await sshSecretStatus(id);
+      setSecretSaved(status.saved);
+    }
+  }
+
+  async function save() {
+    try {
+      const saved = await saveConnection(draft);
+      if (saved.auth === "agent") {
+        await deleteSshSecret(saved.id);
+        setSecretDraft("");
+      } else if (secretDraft) {
+        await saveSshSecret(saved.id, secretDraft);
+        setSecretDraft("");
+      }
+      await refresh(saved.id);
+      onStatus("连接已保存");
+    } catch (err) {
+      onStatus(formatEngineError(err));
+    }
+  }
+
+  async function test(acceptNew: boolean) {
+    if (!draft.id) {
+      onStatus("先保存连接");
+      return;
+    }
+    try {
+      const report = await testConnection(draft.id, acceptNew, acceptNew ? pendingFingerprint ?? undefined : undefined);
+      setProbe(report);
+      if (report.hostKey === "new" && !report.authOk) {
+        setPendingFingerprint(report.fingerprint);
+        onStatus("需要确认主机指纹");
+        return;
+      }
+      setPendingFingerprint(null);
+      await refresh(draft.id);
+      onStatus(report.authOk ? "连接测试通过" : "连接测试没有完成");
+    } catch (err) {
+      onStatus(formatEngineError(err));
+    }
+  }
+
+  async function clearFingerprint() {
+    if (!draft.id) return;
+    try {
+      await clearConnectionFingerprint(draft.id);
+      setPendingFingerprint(null);
+      await refresh(draft.id);
+    } catch (err) {
+      onStatus(formatEngineError(err));
+    }
+  }
+
+  async function remove() {
+    if (!draft.id) {
+      load(null);
+      return;
+    }
+    try {
+      await deleteConnection(draft.id);
+      await deleteSshSecret(draft.id);
+      const rows = await listConnections();
+      onRefresh(rows);
+      load(null);
+    } catch (err) {
+      onStatus(formatEngineError(err));
+    }
+  }
+
+  const remoteRootError = remoteRootFieldError(draft.remoteRoot);
+
   return (
     <div className="ssh">
       <aside>
-        <input className="search" placeholder="搜索连接" />
-        {HOSTS.map((h) => (
-          <button key={h.id} className={`host ${h.id === host.id ? "sel" : ""} ${h.proxy ? "disabled" : ""}`} onClick={() => onPick(h.id)} disabled={false}>
+        <input className="search" placeholder="搜索连接" value={query} onChange={(event) => setQuery(event.target.value)} />
+        <button type="button" className="ghost" onClick={() => load(null)}>新建连接</button>
+        {shown.map((item) => (
+          <button key={item.id} type="button" className={`host ${item.id === selectedId ? "sel" : ""}`} onClick={() => load(item.id)}>
             <Server size={16} />
             <span>
-              <b>{h.name}</b>
-              <em>{h.proxy ? "需要跳板机，第二版支持" : `${h.user}@${h.host}:${h.port}`}</em>
+              <b><Text value={item.name} /></b>
+              <em><Text value={`${item.user}@${item.host}:${item.port}`} /></em>
             </span>
-            <i className={`dot ${h.dot}`} />
           </button>
         ))}
+        {shown.length === 0 && <p>还没有连接</p>}
       </aside>
-      <section className={host.proxy ? "dim" : ""}>
+      <section>
         <div className="hosthead">
           <Server size={18} />
           <div>
-            <h1>{host.name}</h1>
-            <p>
-              上次连接今天 11:42 · <span className={host.os.kind === "unidentified" || (host.os.kind === "linux" && !host.os.verified) ? "warn" : ""}>{subtitle}</span>
-            </p>
+            <h1>{draft.name || "新建连接"}</h1>
+            <p>{draft.host ? <Text value={`${draft.user}@${draft.host}:${draft.port}`} /> : "填写主机后再测试"}</p>
           </div>
-          <button className="ghost" disabled={!usable}>测试连接</button>
+          <button className="ghost" type="button" onClick={() => void test(false)} disabled={!draft.id}>测试连接</button>
         </div>
-        <label>名称<input defaultValue={host.name} disabled={host.proxy} /></label>
-        <label>主机<input defaultValue={host.host} disabled={host.proxy} /></label>
+        <label>名称<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></label>
+        <label>主机<input value={draft.host} onChange={(event) => setDraft({ ...draft, host: event.target.value })} /></label>
         <div className="row2">
-          <label>端口<input defaultValue={host.port} disabled={host.proxy} /></label>
-          <label>用户名<input defaultValue={host.user} disabled={host.proxy} /></label>
+          <label>端口<input value={draft.port} onChange={(event) => setDraft({ ...draft, port: Number(event.target.value) || 0 })} /></label>
+          <label>用户名<input value={draft.user} onChange={(event) => setDraft({ ...draft, user: event.target.value })} /></label>
         </div>
-        <div className="auth">认证方式 <span>密码</span><span className="on">私钥文件</span><span>ssh-agent</span></div>
-        <label>私钥文件<input defaultValue={host.key} disabled={host.proxy} /></label>
-        <label>私钥口令<input type="password" placeholder="已存入钥匙串" disabled={host.proxy} /></label>
-        <div className="savekey"><label><input type="checkbox" defaultChecked disabled={host.proxy} /> 保存到钥匙串</label><span className="ok">已存入钥匙串</span></div>
-        <p className="keyhint">钥匙串服务名 com.hetianxia.app.ssh，账号是连接 id「{host.id}」。</p>
-        {banner && usable && (
-          <div className="banner"><AlertTriangle size={16} /> {banner}</div>
-        )}
-        {host.proxy && <div className="banner">需要跳板机，第二版支持。这一版不能用这个连接。</div>}
+        <label>远程目录（绝对路径）<span className="req" aria-hidden="true">*</span><input value={draft.remoteRoot ?? ""} placeholder="/srv/app" aria-required="true" aria-invalid={remoteRootError !== null} onChange={(event) => setDraft({ ...draft, remoteRoot: event.target.value === "" ? null : event.target.value })} /></label>
+        {remoteRootError && <p className="warn fielderr">{remoteRootError}</p>}
+        <div className="auth">认证方式
+          <span className={draft.auth === "password" ? "on" : ""} onClick={() => setDraft({ ...draft, auth: "password" })}>密码</span>
+          <span className={draft.auth === "key" ? "on" : ""} onClick={() => setDraft({ ...draft, auth: "key" })}>私钥文件</span>
+          <span className="off">ssh-agent</span>
+          <span className="soon">下一版支持</span>
+        </div>
+        <label>私钥文件<input value={draft.keyPath} onChange={(event) => setDraft({ ...draft, keyPath: event.target.value })} disabled={draft.auth !== "key"} /></label>
+        <label>私钥口令或密码<input type="password" value={draft.auth === "agent" ? "" : secretDraft} autoComplete="new-password" disabled={draft.auth === "agent"} placeholder={draft.auth === "agent" ? "ssh-agent 不保存口令" : secretSaved ? "已存入钥匙串，留空则不改" : "只写入钥匙串"} onChange={(event) => setSecretDraft(event.target.value)} /></label>
+        <div className="savekey"><span className={draft.auth !== "agent" && secretSaved ? "ok" : ""}>{draft.auth === "agent" ? "ssh-agent 不保存口令" : secretSaved ? "已存入钥匙串" : "还没存入口令"}</span></div>
+        <p className="keyhint">口令只存在本机钥匙串，不会再显示出来</p>
         <h2>连接测试</h2>
         <ul className="checks">
-          <li><span>TCP 连接</span><em>38 ms</em></li>
-          <li><span>身份认证</span><em>私钥 ed25519</em></li>
-          <li><span>SFTP 子系统</span><em>可用</em></li>
-          <li><span>服务器哈希加速</span><em>sha256sum 可用</em></li>
-          <li><span>系统类型</span><em>{systemRow}</em></li>
+          <li><span>身份认证</span><em>{probe ? (probe.authOk ? "通过" : "未完成") : "尚未测试"}</em></li>
+          <li><span>SFTP 子系统</span><em>{probe ? (probe.sftpOk ? "可用" : "不可用") : "尚未测试"}</em></li>
+          <li><span>服务器哈希加速</span><em>{probe ? (probe.sha256sumOk ? "sha256sum 可用" : "不可用") : "尚未测试"}</em></li>
         </ul>
         <h2>主机指纹</h2>
         <div className="fp">
           <div>
-            <b>{cleared ? "尚未记住" : host.fingerprint}</b>
-            <em>{cleared ? "下次连接按首次连接，需要重新确认指纹" : host.seen}</em>
+            <b>{draft.fingerprint ? <Text value={draft.fingerprint} /> : "尚未记住"}</b>
+            <em>{pendingFingerprint ? "服务器出示了新指纹，确认后才会记住" : draft.fingerprint ? "已记住" : "测试连接后确认"}</em>
           </div>
-          <button className="link" onClick={onClear} disabled={host.proxy || cleared}>清除指纹</button>
+          <button className="link" type="button" onClick={() => void clearFingerprint()} disabled={!draft.id || !draft.fingerprint}>清除指纹</button>
         </div>
+        {pendingFingerprint && (
+          <div className="banner">
+            <AlertTriangle size={16} /> 确认指纹 <Text value={pendingFingerprint} />
+            <button type="button" className="primary" onClick={() => void test(true)}>确认这个指纹</button>
+          </div>
+        )}
         <footer>
-          <button className="danger" disabled={host.proxy}>删除连接</button>
+          <button className="danger" type="button" onClick={() => void remove()} disabled={!draft.id}>删除连接</button>
           <span />
-          <button className="ghost">取消</button>
-          <button className="primary" disabled={!usable}>保存</button>
+          <button className="ghost" type="button" onClick={() => load(selectedId)}>取消</button>
+          <button className="primary" type="button" onClick={() => void save()} disabled={remoteRootError !== null}>保存</button>
         </footer>
       </section>
     </div>
   );
 }
 
-function PreviewPage({ allowReadonly, setAllowReadonly }: { allowReadonly: boolean; setAllowReadonly: (v: boolean) => void }) {
+function PreviewPage({ allowReadonly, setAllowReadonly, bakDir, onRemoteWrite }: { allowReadonly: boolean; setAllowReadonly: (v: boolean) => void; bakDir: string | null; onRemoteWrite: () => void }) {
+  const [target, setTarget] = useState<"local" | "remote">("local");
   const counts = useMemo(() => {
     const overwrite = allowReadonly ? 13 : 11;
     const skip = allowReadonly ? 0 : 2;
@@ -356,7 +487,8 @@ function PreviewPage({ allowReadonly, setAllowReadonly }: { allowReadonly: boole
     <div className="sheetwrap">
       <div className="sheet">
         <h1><ShieldAlert size={18} /> 确认执行升级</h1>
-        <p className="sub">OrderCenter · 本机 ~/work/order-center ← release-3.0.0.zip</p>
+        <p className="sub">{target === "remote" ? "远程" : "OrderCenter · 本机 ~/work/order-center ← release-3.0.0.zip"}</p>
+        <div className="auth">写入到 <span className={target === "local" ? "on" : ""} onClick={() => setTarget("local")}>本机</span><span className={target === "remote" ? "on" : ""} onClick={() => setTarget("remote")}>远程</span></div>
         <div className="stats">
           <b>6<small>新增</small></b>
           <b>{counts.overwrite}<small>覆盖{counts.skip ? "" : " · 其中合并 4"}</small></b>
@@ -376,9 +508,9 @@ function PreviewPage({ allowReadonly, setAllowReadonly }: { allowReadonly: boole
           <label><input type="checkbox" checked={allowReadonly} onChange={(e) => setAllowReadonly(e.target.checked)} /> 覆盖只读文件</label>
           <p>临时去掉只读属性，写入后恢复。</p>
         </div>
-        <label className="bak"><input type="checkbox" defaultChecked /> 执行前备份</label>
+        <label className="bak"><input type="checkbox" defaultChecked /> 执行前备份到 {bakDir ? <Text value={bakDir} /> : "…"}</label>
         <footer>
-          <button className="primary">备份并执行</button>
+          <button className="primary" onClick={() => { if (target === "remote") onRemoteWrite(); }}>{target === "remote" ? "写入远程" : "备份并执行"}</button>
         </footer>
       </div>
     </div>
@@ -426,6 +558,37 @@ function HistoryPage({ onRollback, onContinue }: { onRollback: (execId: string) 
           })}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function VerifyFailedSheet({ body, onClose }: { body: string; onClose: () => void }) {
+  return (
+    <div className="mask" onClick={onClose} onKeyDown={(event) => { if (event.key === "Escape") onClose(); }}>
+      <div className="sheet small" role="dialog" aria-modal="true" aria-labelledby="verify-failed-title" onClick={(event) => event.stopPropagation()}>
+        <h1 id="verify-failed-title"><AlertTriangle size={18} /> <Text value={VERIFY_FAILED_TITLE} /></h1>
+        <p><Text value={body} /></p>
+        <footer>
+          <span />
+          <button type="button" className="primary" autoFocus onClick={onClose}>{VERIFY_FAILED_BUTTON}</button>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function RemoteWriteSheet({ pending, onCancel, onProceed }: { pending: PendingRemoteWrite; onCancel: () => void; onProceed: () => void }) {
+  return (
+    <div className="mask" onClick={onCancel} onKeyDown={(event) => { if (event.key === "Escape") onCancel(); }}>
+      <div className="sheet small" role="dialog" aria-modal="true" aria-labelledby="remote-write-title" onClick={(event) => event.stopPropagation()}>
+        <h1 id="remote-write-title"><AlertTriangle size={18} /> <Text value={pending.title} /></h1>
+        <p><Text value={pending.body} /></p>
+        <footer>
+          <span />
+          <button type="button" className="ghost" onClick={onProceed}>{pending.proceedLabel}</button>
+          <button type="button" className="primary" autoFocus data-default="true" onClick={onCancel}>{pending.cancelLabel}</button>
+        </footer>
+      </div>
     </div>
   );
 }

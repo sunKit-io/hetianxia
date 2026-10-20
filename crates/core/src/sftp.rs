@@ -41,7 +41,7 @@ pub struct ProbeRequest {
     pub user: String,
     #[serde(default)]
     pub proxy_jump: Option<String>,
-    /// `password` 或 `key`。
+    /// `password`、`key` 或 `agent`。
     pub auth: String,
     #[serde(default)]
     pub secret: String,
@@ -56,6 +56,9 @@ pub struct ProbeRequest {
     /// 用户在探测之后确认的指纹。`accept_new` 重连时必须带上，并且要和服务器出示的一致。
     #[serde(default)]
     pub confirmed_fingerprint: Option<String>,
+    /// 提交写入时带上许可证里的指纹。有值就只做严格比较，不再询问信任。
+    #[serde(default)]
+    pub strict_fingerprint: Option<String>,
 }
 
 pub fn remote_backup_dir(home: &str, exec_id: &str) -> Result<String> {
@@ -90,6 +93,8 @@ pub trait RemoteNames {
 }
 
 /// 和线上 SFTP 退回同一套顺序。测试不需要 sshd。
+/// 非 posix 成功时如果留下了 `.htx-bak`，返回 true。目标核对通过之后才能删它。
+/// 第二步失败时先把 `.htx-bak` 改回原名，这一步成功之后才删临时文件。
 pub fn apply_rename(
     ops: &mut dyn RemoteNames,
     log: &mut RuntimeLog,
@@ -97,15 +102,28 @@ pub fn apply_rename(
     temp: &str,
     dest: &str,
     backup: &str,
-) -> Result<()> {
+) -> Result<bool> {
     log_rename_steps(log, posix_rename);
     if posix_rename {
-        return ops.rename(temp, dest);
+        ops.rename(temp, dest)?;
+        return Ok(false);
     }
-    if ops.exists(dest)? {
+    let had_dest = ops.exists(dest)?;
+    if had_dest {
         ops.rename(dest, backup)?;
     }
-    ops.rename(temp, dest)?;
+    if let Err(err) = ops.rename(temp, dest) {
+        if had_dest {
+            ops.rename(backup, dest)?;
+        }
+        ops.remove(temp)?;
+        return Err(err);
+    }
+    Ok(had_dest)
+}
+
+/// 只在目标内容已经核对通过之后调用。
+pub fn discard_verified_backup(ops: &mut dyn RemoteNames, backup: &str) -> Result<()> {
     if ops.exists(backup)? {
         ops.remove(backup)?;
     }
@@ -140,6 +158,7 @@ enum SessFail {
     Ssh(russh::Error),
     Changed(String),
     Confirm(String),
+    PermitMismatch,
 }
 
 impl From<russh::Error> for SessFail {
@@ -159,6 +178,7 @@ struct KeyHandler {
     file_fps: Vec<String>,
     accept_new: bool,
     confirmed: Option<String>,
+    strict_fingerprint: Option<String>,
     seen: Arc<Mutex<Option<Observed>>>,
 }
 
@@ -167,6 +187,18 @@ impl Handler for KeyHandler {
 
     async fn check_server_key(&mut self, server_public_key: &russh::keys::PublicKey) -> std::result::Result<bool, Self::Error> {
         let fingerprint = format!("{}", server_public_key.fingerprint(russh::keys::HashAlg::Sha256));
+        if let Some(permit) = &self.strict_fingerprint {
+            if crate::remote::strict_permit_fingerprint(permit, &fingerprint).is_err() {
+                return Err(SessFail::PermitMismatch);
+            }
+            if let Ok(mut slot) = self.seen.lock() {
+                *slot = Some(Observed {
+                    fingerprint,
+                    status: HostKeyStatus::Match,
+                });
+            }
+            return Ok(true);
+        }
         let decision = classify_presented_key(
             self.saved.as_deref(),
             self.cleared,
@@ -251,6 +283,7 @@ impl RemoteSession {
             file_fps,
             accept_new: req.accept_new,
             confirmed: req.confirmed_fingerprint.clone(),
+            strict_fingerprint: req.strict_fingerprint.clone(),
             seen: seen.clone(),
         };
         let config = Arc::new(russh::client::Config {
@@ -268,6 +301,9 @@ impl RemoteSession {
                 ErrorCode::HostkeyChanged,
                 format!("主机指纹变了，需要清除指纹后重新确认：{fp}"),
             ),
+            SessFail::PermitMismatch => {
+                Error::new(ErrorCode::HostkeyChanged, crate::remote::COMMIT_FINGERPRINT_MISMATCH)
+            }
             SessFail::Confirm(fp) => Error::new(ErrorCode::HostkeyChanged, format!("需要确认主机指纹：{fp}")),
             SessFail::Ssh(err) => {
                 let _ = err;
@@ -421,9 +457,156 @@ impl RemoteSession {
             .await
             .map_err(map_net)
     }
+
+    /// 确认之后才写。先把远端原文件落到本机 `bak/<id>/`，再写临时文件并改名。
+    /// 成功返回时，远端不应再留下 `.htx-` 临时文件。
+    pub async fn commit_overwrite(
+        &mut self,
+        req: crate::remote_write::RemoteWriteRequest,
+    ) -> Result<crate::remote_write::CommitResult> {
+        let dest = req.remote_path.clone();
+        let original = if self.exists(&dest).await? { Some(self.read_file(&dest).await?) } else { None };
+        let staged = crate::remote_write::stage_before_write(&req, original.as_deref())?;
+        let temp = crate::remote_write::remote_temp_path(&dest)?;
+        let backup = crate::remote_write::remote_backup_name(&dest)?;
+        if let Err(err) = self.write_new(&temp, &req.bytes).await {
+            let _ = self.remove_quiet(&temp).await;
+            return Err(err);
+        }
+        let held = self.replace_temp(&temp, &dest, &backup, req.posix_rename).await?;
+        let got = self.read_file(&dest).await?;
+        let anchor = staged.backup_file.clone().unwrap_or_else(|| staged.backup_dir.clone());
+        crate::remote_write::verify_after_rename(&got, &req.bytes, &dest, &anchor)?;
+        if held {
+            self.remove_quiet(&backup).await?;
+        }
+        if self.exists(&temp).await? || self.exists(&backup).await? {
+            return Err(Error::new(ErrorCode::Io, "远程临时文件还在"));
+        }
+        Ok(crate::remote_write::CommitResult::Written(staged))
+    }
+
+    /// 给壳层用的同步入口。口令在返回前清掉。
+    pub fn commit_overwrite_blocking(
+        req: &mut ProbeRequest,
+        exec_id: &str,
+        app_data_dir: PathBuf,
+    ) -> Result<crate::remote_write::CommitResult> {
+        let granted = match crate::remote_write::take_granted_write(exec_id, crate::remote_write::now_ms()) {
+            Ok(granted) => granted,
+            Err(err) => {
+                req.secret.zeroize();
+                return Err(err);
+            }
+        };
+        if !crate::remote_write::grant_binds(&granted.connection, &req.host, req.port, &req.user, &granted.connection.remote_path) {
+            req.secret.zeroize();
+            return Err(Error::new(ErrorCode::InvalidState, "写入确认和主机或路径不一致"));
+        }
+        lock_commit_fingerprint(req, &granted.connection.fingerprint);
+        let write = crate::remote_write::request_from_grant(exec_id, &app_data_dir, true, 0, granted)?;
+        let result = block_on(async {
+            let connected = RemoteSession::connect(req).await;
+            let mut session = match connected {
+                Ok(session) => session,
+                Err(err) => {
+                    return Err(err);
+                }
+            };
+            let committed = session.commit_overwrite(write).await?;
+            let _ = session.close().await;
+            Ok(committed)
+        });
+        if result.as_ref().is_err() {
+            let _ = crate::remote_write::void_granted_write(exec_id);
+        }
+        req.secret.zeroize();
+        result.and_then(|inner| inner)
+    }
+
+    async fn write_new(&self, path: &str, bytes: &[u8]) -> Result<()> {
+        let flags = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE;
+        let opened = self.sftp.open(path, flags, FileAttributes::empty()).await.map_err(map_sftp)?;
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let end = (offset + 32 * 1024).min(bytes.len());
+            if let Err(err) = self.sftp.write(&opened.handle, offset as u64, bytes[offset..end].to_vec()).await {
+                let _ = self.sftp.close(&opened.handle).await;
+                let _ = self.sftp.remove(path).await;
+                return Err(map_sftp(err));
+            }
+            offset = end;
+        }
+        self.sftp.close(&opened.handle).await.map_err(map_sftp)?;
+        Ok(())
+    }
+
+    async fn replace_temp(&mut self, temp: &str, dest: &str, backup: &str, posix_rename: bool) -> Result<bool> {
+        let use_posix = posix_rename && self.posix_rename;
+        log_rename_steps(&mut self.log, use_posix);
+        if use_posix {
+            self.posix_rename_over(temp, dest).await?;
+            return Ok(false);
+        }
+        let had_dest = self.exists(dest).await?;
+        if had_dest {
+            self.rename_path(dest, backup).await?;
+        }
+        if let Err(err) = self.rename_path(temp, dest).await {
+            if had_dest {
+                self.rename_path(backup, dest).await?;
+            }
+            self.remove_quiet(temp).await?;
+            return Err(err);
+        }
+        Ok(had_dest)
+    }
+
+    async fn posix_rename_over(&self, from: &str, to: &str) -> Result<()> {
+        let mut data = ssh_string(from);
+        data.extend(ssh_string(to));
+        let packet = self.sftp.extended(POSIX_RENAME, data).await.map_err(map_sftp)?;
+        match packet {
+            russh_sftp::protocol::Packet::Status(status) if status.status_code == StatusCode::Ok => Ok(()),
+            russh_sftp::protocol::Packet::Status(status) => {
+                Err(map_sftp(russh_sftp::client::error::Error::Status(status)))
+            }
+            _ => Err(Error::new(ErrorCode::Io, "SFTP 操作失败")),
+        }
+    }
+
+    async fn rename_path(&self, from: &str, to: &str) -> Result<()> {
+        self.sftp.rename(from, to).await.map_err(map_sftp)?;
+        Ok(())
+    }
+
+    async fn remove_quiet(&self, path: &str) -> Result<()> {
+        match self.sftp.remove(path).await {
+            Ok(_) => Ok(()),
+            Err(russh_sftp::client::error::Error::Status(status)) if status.status_code == StatusCode::NoSuchFile => Ok(()),
+            Err(err) => Err(map_sftp(err)),
+        }
+    }
+}
+
+fn ssh_string(value: &str) -> Vec<u8> {
+    let bytes = value.as_bytes();
+    let mut out = (bytes.len() as u32).to_be_bytes().to_vec();
+    out.extend_from_slice(bytes);
+    out
+}
+
+/// 提交只比对许可证里的指纹，并关掉探测用的信任确认。
+fn lock_commit_fingerprint(req: &mut ProbeRequest, permit_fp: &str) {
+    req.strict_fingerprint = Some(permit_fp.to_string());
+    req.accept_new = false;
+    req.confirmed_fingerprint = None;
 }
 
 async fn authenticate(handle: &mut russh::client::Handle<KeyHandler>, req: &ProbeRequest) -> Result<()> {
+    if req.auth == "agent" {
+        return Err(Error::new(ErrorCode::Unsupported, "ssh-agent 这一版还不能用来连接"));
+    }
     let result = if req.auth == "key" {
         let path = req.key_path.as_deref().filter(|p| !p.is_empty()).ok_or_else(|| {
             Error::new(ErrorCode::Auth, "没有私钥路径")
@@ -527,16 +710,18 @@ mod tests {
             ops: Vec::new(),
         };
         let mut log = RuntimeLog::default();
-        apply_rename(&mut mem, &mut log, false, "dir/.a.txt.htx-1", "dir/a.txt", "dir/a.txt.htx-bak").unwrap();
+        let held = apply_rename(&mut mem, &mut log, false, "dir/.a.txt.htx-1", "dir/a.txt", "dir/a.txt.htx-bak").unwrap();
+        assert!(held);
         assert_eq!(
             mem.ops,
             vec![
                 "rename dir/a.txt dir/a.txt.htx-bak".to_string(),
                 "rename dir/.a.txt.htx-1 dir/a.txt".into(),
-                "remove dir/a.txt.htx-bak".into(),
             ]
         );
         assert_eq!(mem.files.get("dir/a.txt").map(Vec::as_slice), Some(b"new".as_slice()));
+        assert_eq!(mem.files.get("dir/a.txt.htx-bak").map(Vec::as_slice), Some(b"old".as_slice()));
+        discard_verified_backup(&mut mem, "dir/a.txt.htx-bak").unwrap();
         assert!(!mem.files.contains_key("dir/a.txt.htx-bak"));
         assert_eq!(log.lines[0].category, "sftp-rename");
         assert_eq!(log.lines[0].message, "rename-backup → rename-replace → delete-backup");
@@ -547,7 +732,7 @@ mod tests {
             files: BTreeMap::from([("t".into(), b"n".to_vec())]),
             ops: Vec::new(),
         };
-        apply_rename(&mut mem, &mut log, true, "t", "a", "b").unwrap();
+        assert!(!apply_rename(&mut mem, &mut log, true, "t", "a", "b").unwrap());
         assert_eq!(log.lines[0].message, "posix-rename");
         assert_eq!(mem.ops, vec!["rename t a".to_string()]);
     }
@@ -579,6 +764,7 @@ mod tests {
             db_path: std::env::temp_dir().join("hetianxia-probe-unused.sqlite").display().to_string(),
             accept_new: false,
             confirmed_fingerprint: None,
+            strict_fingerprint: None,
         };
         let err = probe_connection(&mut req).unwrap_err();
         assert_eq!(err.code_str(), "E_UNSUPPORTED");
@@ -595,5 +781,31 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("pw-do-not-leak-9f3a"));
         assert_eq!(remote::remote_write_unsupported().code_str(), "E_INVALID_STATE");
+    }
+
+    #[test]
+    fn commit_locks_the_permit_fingerprint_and_drops_the_trust_prompt() {
+        let mut req = ProbeRequest {
+            host: "web.example".into(),
+            port: 22,
+            user: "deploy".into(),
+            proxy_jump: None,
+            auth: "key".into(),
+            secret: String::new(),
+            account: None,
+            key_path: None,
+            known_hosts_path: String::new(),
+            db_path: String::new(),
+            accept_new: true,
+            confirmed_fingerprint: Some("SHA256:clicked-later".into()),
+            strict_fingerprint: None,
+        };
+        lock_commit_fingerprint(&mut req, "SHA256:permit");
+        assert_eq!(req.strict_fingerprint.as_deref(), Some("SHA256:permit"));
+        assert!(!req.accept_new);
+        assert!(req.confirmed_fingerprint.is_none());
+        let err = crate::remote::strict_permit_fingerprint("SHA256:permit", "SHA256:server").unwrap_err();
+        assert_eq!(err.message, "服务器指纹已变化");
+        assert!(!err.message.contains("需要确认"));
     }
 }

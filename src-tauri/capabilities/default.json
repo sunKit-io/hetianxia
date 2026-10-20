@@ -27,6 +27,15 @@
     "allow-trust-host-fingerprint",
     "allow-remote-backup-path",
     "allow-remote-rename-plan",
-    "allow-probe-remote"
+    "allow-list-connections",
+    "allow-save-connection",
+    "allow-delete-connection",
+    "allow-clear-connection-fingerprint",
+    "allow-test-connection",
+    "allow-remote-write-prompt",
+    "allow-commit-remote-overwrite",
+    "allow-app-bak-dir",
+    "allow-probe-remote",
+    "allow-read-ssh-config"
   ]
 }

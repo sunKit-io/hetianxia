@@ -25,6 +25,12 @@ ignore = [
     { id = "RUSTSEC-2025-0081", reason = "unic-char-property 经 urlpattern 0.3 进入 tauri 2.1.1，没有可升级版本。" },
     { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version 经 urlpattern 0.3 进入 tauri 2.1.1，没有可升级版本。" },
     { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident 经 urlpattern 0.3 进入 tauri 2.1.1，没有可升级版本。" },
+    # 临时忽略：zvariant 4.1.2，经 zbus 由 tauri-plugin-single-instance 带入；停维护告警非漏洞；2026-10-20 随 813d61d 评审一起处理
+    { id = "RUSTSEC-2026-0370", reason = "临时忽略：zvariant 4.1.2，经 zbus 由 tauri-plugin-single-instance 带入；停维护告警非漏洞；2026-10-20 随 813d61d 评审一起处理" },
+    # 临时忽略：zbus_names 3.0.0，经 zbus 由 tauri-plugin-single-instance 带入；停维护告警非漏洞；2026-10-20 随 813d61d 评审一起处理
+    { id = "RUSTSEC-2026-0371", reason = "临时忽略：zbus_names 3.0.0，经 zbus 由 tauri-plugin-single-instance 带入；停维护告警非漏洞；2026-10-20 随 813d61d 评审一起处理" },
+    # 临时忽略：zvariant_derive 4.1.2，经 zvariant/zbus 由 tauri-plugin-single-instance 带入；停维护告警非漏洞；2026-10-20 随 813d61d 评审一起处理
+    { id = "RUSTSEC-2026-0372", reason = "临时忽略：zvariant_derive 4.1.2，经 zvariant/zbus 由 tauri-plugin-single-instance 带入；停维护告警非漏洞；2026-10-20 随 813d61d 评审一起处理" },
 ]
 
 [licenses]

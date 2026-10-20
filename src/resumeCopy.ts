@@ -47,11 +47,3 @@ export const RESUME_NOTE = "继续会先核对已写完的文件，沿用原来�
 
 /** 画面 26。计划自己删掉、并且已经从备份恢复的文件不出现在这份名单里。 */
 export const PARTIAL_ROLLBACK_RESULT = "部分回滚";
-export const PARTIAL_ROLLBACK_CHANGE = "已恢复 7 / 9 · 跳过 2";
-
-export type UnrestoredFile = { path: string; reason: string };
-
-export const PARTIAL_ROLLBACK_UNRESTORED: UnrestoredFile[] = [
-  { path: "src/routes.js", reason: "升级后被修改，已跳过" },
-  { path: "public/index.html", reason: "升级后被修改，已跳过" },
-];

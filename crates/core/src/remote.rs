@@ -17,6 +17,9 @@ pub struct ImportedHost {
     pub user: Option<String>,
     pub port: u16,
     pub proxy_jump: Option<String>,
+    /// 展开过 `~` 的私钥路径。没有则是空字符串。
+    #[serde(default)]
+    pub identity_file: String,
 }
 
 impl ImportedHost {
@@ -33,6 +36,41 @@ impl ImportedHost {
 
 /// 解析 OpenSSH config 里的 Host 块。含 ProxyJump 的主机照常导入，但标成不可用。
 pub fn parse_ssh_config(text: &str) -> Vec<ImportedHost> {
+    parse_ssh_config_with_home(text, None)
+}
+
+fn is_wildcard_host(pattern: &str) -> bool {
+    pattern.is_empty() || pattern.contains('*') || pattern.contains('?')
+}
+
+fn unquote(value: &str) -> &str {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if value.len() >= 2
+        && ((bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\''))
+    {
+        return &value[1..value.len() - 1];
+    }
+    value
+}
+
+fn expand_tilde(value: &str, home: Option<&std::path::Path>) -> String {
+    let value = unquote(value);
+    let Some(home) = home else {
+        return value.to_string();
+    };
+    if value == "~" {
+        return home.display().to_string();
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        return home.join(rest).display().to_string();
+    }
+    value.to_string()
+}
+
+/// 只读解析。`home` 用来展开 IdentityFile 里的 `~`。通配 Host（`*`、`?`）整段忽略。
+pub fn parse_ssh_config_with_home(text: &str, home: Option<&std::path::Path>) -> Vec<ImportedHost> {
     let mut out = Vec::new();
     let mut cur: Option<ImportedHost> = None;
     for raw in text.lines() {
@@ -45,16 +83,26 @@ pub fn parse_ssh_config(text: &str) -> Vec<ImportedHost> {
         let value = parts.collect::<Vec<_>>().join(" ");
         if key.eq_ignore_ascii_case("Host") {
             if let Some(done) = cur.take() {
-                if done.alias != "*" {
+                if !is_wildcard_host(&done.alias) {
                     out.push(done);
                 }
             }
+            let alias = value
+                .split_whitespace()
+                .find(|pattern| !is_wildcard_host(pattern))
+                .unwrap_or("")
+                .to_string();
+            if alias.is_empty() {
+                cur = None;
+                continue;
+            }
             cur = Some(ImportedHost {
-                alias: value.clone(),
-                host_name: value,
+                alias: alias.clone(),
+                host_name: alias,
                 user: None,
                 port: 22,
                 proxy_jump: None,
+                identity_file: String::new(),
             });
             continue;
         }
@@ -69,14 +117,40 @@ pub fn parse_ssh_config(text: &str) -> Vec<ImportedHost> {
             }
         } else if key.eq_ignore_ascii_case("ProxyJump") {
             host.proxy_jump = Some(value);
+        } else if key.eq_ignore_ascii_case("IdentityFile") && host.identity_file.is_empty() {
+            host.identity_file = expand_tilde(&value, home);
         }
     }
     if let Some(done) = cur {
-        if done.alias != "*" {
+        if !is_wildcard_host(&done.alias) {
             out.push(done);
         }
     }
     out
+}
+
+/// 只读取 `~/.ssh/config`，不创建、不改写。
+pub fn read_user_ssh_config(home: &std::path::Path) -> Result<Vec<ImportedHost>> {
+    let path = home.join(".ssh").join("config");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Error::new(ErrorCode::NotFound, "没有找到 ~/.ssh/config"));
+        }
+        Err(err) => return Err(Error::new(ErrorCode::Io, format!("读取 ~/.ssh/config 失败：{err}"))),
+    };
+    Ok(parse_ssh_config_with_home(&text, Some(home)))
+}
+
+pub const COMMIT_FINGERPRINT_MISMATCH: &str = "服务器指纹已变化";
+
+/// 提交写入时只认许可证里的指纹。空指纹或任何不一致都拒绝，不进入信任确认。
+pub fn strict_permit_fingerprint(permit: &str, presented: &str) -> Result<()> {
+    if !permit.is_empty() && permit == presented {
+        Ok(())
+    } else {
+        Err(Error::new(ErrorCode::HostkeyChanged, COMMIT_FINGERPRINT_MISMATCH))
+    }
 }
 
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
@@ -649,5 +723,46 @@ Host intranet-jump\n  HostName 10.1.0.4\n  User ops\n  ProxyJump jump.example\n"
 
         let unbound = classify_presented_key(None, false, &[], probed, true, None);
         assert!(!unbound.sends_credentials());
+    }
+
+    #[test]
+    fn ssh_config_skips_wildcards_expands_identity_and_never_writes() {
+        let text = "\
+Host *\n  User nobody\n  IdentityFile ~/.ssh/id_ed25519\n\n\
+Host *.internal\n  HostName inside.example\n\n\
+Host web\n  HostName web.example\n  User deploy\n  Port 2222\n  IdentityFile \"~/keys/id\"\n";
+        let home = std::path::Path::new("/home/me");
+        let hosts = parse_ssh_config_with_home(text, Some(home));
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].alias, "web");
+        assert_eq!(hosts[0].host_name, "web.example");
+        assert_eq!(hosts[0].user.as_deref(), Some("deploy"));
+        assert_eq!(hosts[0].port, 2222);
+        assert_eq!(hosts[0].identity_file, "/home/me/keys/id");
+
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        let cfg = ssh.join("config");
+        let body = "Host web\n  HostName web.example\n  IdentityFile ~/id\n";
+        std::fs::write(&cfg, body).unwrap();
+        let before = std::fs::read(&cfg).unwrap();
+        let read = read_user_ssh_config(dir.path()).unwrap();
+        assert_eq!(std::fs::read(&cfg).unwrap(), before);
+        let names: Vec<_> = std::fs::read_dir(&ssh).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("config")]);
+        assert_eq!(read[0].identity_file, dir.path().join("id").display().to_string());
+        assert_eq!(read[0].host_name, "web.example");
+    }
+
+    #[test]
+    fn commit_fingerprint_must_match_the_permit_exactly() {
+        assert!(strict_permit_fingerprint("SHA256:permit", "SHA256:permit").is_ok());
+        let mismatch = strict_permit_fingerprint("SHA256:permit", "SHA256:other").unwrap_err();
+        assert_eq!(mismatch.message, "服务器指纹已变化");
+        assert!(!mismatch.message.contains("需要确认"));
+        let empty = strict_permit_fingerprint("", "SHA256:other").unwrap_err();
+        assert_eq!(empty.message, COMMIT_FINGERPRINT_MISMATCH);
+        assert_eq!(empty.code_str(), "E_HOSTKEY_CHANGED");
     }
 }

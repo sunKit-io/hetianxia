@@ -125,10 +125,17 @@ pub fn run() {
             commands::delete_ssh_secret,
             commands::host_key_status,
             commands::clear_host_fingerprint,
-            commands::trust_host_fingerprint,
             commands::remote_backup_path,
             commands::remote_rename_plan,
-            commands::probe_remote,
+            commands::list_connections,
+            commands::save_connection,
+            commands::delete_connection,
+            commands::clear_connection_fingerprint,
+            commands::test_connection,
+            commands::remote_write_prompt,
+            commands::commit_remote_overwrite,
+            commands::app_bak_dir,
+            commands::read_ssh_config,
         ])
         .build(tauri::generate_context!())
         .expect("合天下启动失败")
@@ -194,7 +201,19 @@ mod tests {
         assert!(!commands.contains("join(\"backups\")"));
         assert!(!commands.contains("load_ssh_secret"));
         assert!(commands.contains("ssh_secret_status"));
-        assert!(commands.contains("req.secret.clear()"));
+        assert!(!commands.contains("pub fn probe_remote"));
+        assert!(commands.contains("probe.secret.clear()"));
+        assert!(commands.contains("path_inside_remote_root"));
+        let commit = command_header(commands, "commit_remote_overwrite");
+        assert!(commit.contains("exec_id"));
+        assert!(!commit.contains("host"));
+        assert!(!commit.contains("remote_path"));
+        assert!(!commit.contains("bytes"));
+        for name in ["list_connections", "save_connection", "delete_connection", "test_connection", "remote_write_prompt", "read_ssh_config"] {
+            let header = command_header(commands, name);
+            assert!(!header.contains("db_path"), "{name}: {header}");
+            assert!(!header.contains("backup_root"), "{name}: {header}");
+        }
     }
 
     #[test]

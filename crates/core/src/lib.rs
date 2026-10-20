@@ -1,6 +1,7 @@
 //! 合天下核心。界面和 Tauri 命令都调用这里，不在别的地方再写一套合并或写入。
 
 pub mod brand;
+pub mod connections;
 pub mod error;
 pub mod exec;
 pub mod fault;
@@ -13,6 +14,7 @@ pub mod pathutil;
 pub mod plans;
 pub mod prefs;
 pub mod remote;
+pub mod remote_write;
 pub mod runlock;
 pub mod scan;
 pub mod secrets;
