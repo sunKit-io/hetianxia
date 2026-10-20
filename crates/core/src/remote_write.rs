@@ -606,6 +606,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn permit_stores_the_normalized_path_inside_the_remote_root() {
+        let path = crate::connections::path_inside_remote_root(Some("/srv/app"), "/srv/app//conf/./app.conf").unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let input = WritePromptInput {
+            host: "build-01",
+            port: 22,
+            user: "deploy",
+            auth: "key",
+            fingerprint: "SHA256:stored",
+            remote_path: &path,
+            content: b"new-bytes",
+            content_sha256: None,
+            account: None,
+            key_path: None,
+        };
+        issue_prompt_for(home.path(), "tx-inside", &input, now_ms()).unwrap();
+        let stored = borrow_granted_connection("tx-inside", now_ms()).unwrap();
+        assert_eq!(stored.remote_path, "/srv/app/conf/app.conf");
+        assert!(crate::connections::path_inside_remote_root(Some("/srv/app"), "../etc/passwd").is_err());
+    }
+
     fn grant(app_data: &Path, exec_id: &str) {
         issue_prompt_for(app_data, exec_id, &sample("build-01", "deploy", "/opt/gateway/app.conf", b"new-bytes"), now_ms()).unwrap();
     }

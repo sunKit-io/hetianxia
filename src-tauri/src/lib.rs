@@ -203,6 +203,7 @@ mod tests {
         assert!(commands.contains("ssh_secret_status"));
         assert!(!commands.contains("pub fn probe_remote"));
         assert!(commands.contains("probe.secret.clear()"));
+        assert!(commands.contains("path_inside_remote_root"));
         let commit = command_header(commands, "commit_remote_overwrite");
         assert!(commit.contains("exec_id"));
         assert!(!commit.contains("host"));

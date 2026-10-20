@@ -41,6 +41,7 @@ export type SavedConnection = {
   auth: "password" | "key" | "agent";
   keyPath: string;
   fingerprint: string;
+  remoteRoot: string | null;
 };
 
 export type ImportedHost = {

@@ -29,7 +29,7 @@ type Page = "edit" | "ssh" | "preview" | "history";
 type Sheet = null | "rollback" | "log" | "failure" | "startup" | "external" | "pending" | "rollbackResume";
 
 function blankConnection(): SavedConnection {
-  return { id: "", name: "", host: "", port: 22, user: "", auth: "password", keyPath: "", fingerprint: "" };
+  return { id: "", name: "", host: "", port: 22, user: "", auth: "password", keyPath: "", fingerprint: "", remoteRoot: null };
 }
 
 const EXTERNAL_FILES: ResumeFile[] = [];
@@ -430,6 +430,7 @@ function SshPage({
           <label>端口<input value={draft.port} onChange={(event) => setDraft({ ...draft, port: Number(event.target.value) || 0 })} /></label>
           <label>用户名<input value={draft.user} onChange={(event) => setDraft({ ...draft, user: event.target.value })} /></label>
         </div>
+        <label>远程目录<input value={draft.remoteRoot ?? ""} placeholder="/srv/app" onChange={(event) => setDraft({ ...draft, remoteRoot: event.target.value === "" ? null : event.target.value })} /></label>
         <div className="auth">认证方式
           <span className={draft.auth === "password" ? "on" : ""} onClick={() => setDraft({ ...draft, auth: "password" })}>密码</span>
           <span className={draft.auth === "key" ? "on" : ""} onClick={() => setDraft({ ...draft, auth: "key" })}>私钥文件</span>

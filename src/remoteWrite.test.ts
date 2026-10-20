@@ -54,6 +54,8 @@ test("the frontend has no baked home or product backup path", () => {
   assert.match(app, /下一版支持/);
   assert.equal(app.includes("readSshConfig("), false);
   assert.match(app, /口令只存在本机钥匙串，不会再显示出来/);
+  assert.match(app, /远程目录/);
+  assert.match(readFileSync(new URL("./backend.ts", import.meta.url), "utf8"), /remoteRoot: string \| null/);
   assert.equal(app.includes("账号是连接 id"), false);
   assert.equal(app.includes("probe_remote"), false);
   assert.equal(app.includes("trust_host_fingerprint"), false);

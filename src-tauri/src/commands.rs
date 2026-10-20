@@ -430,6 +430,7 @@ pub fn remote_write_prompt(
         return Err(Error::new(ErrorCode::Unsupported, "ssh-agent 这一版还不能用来连接"));
     }
     let key_path = if saved.key_path.is_empty() { None } else { Some(saved.key_path.clone()) };
+    let remote_path = connections::path_inside_remote_root(saved.remote_root.as_deref(), &remote_path)?;
     let input = WritePromptInput {
         host: &saved.host,
         port: saved.port,
