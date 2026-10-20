@@ -2304,7 +2304,21 @@ pub fn rollback(db: &Connection, _passed_root: &LocalFs, exec_id: &str, choice: 
             continue;
         }
         // 新增和移动没落地时，目标上的文件是用户的，回滚不能删。
+        // 目标本来就不在（写入前崩溃，父目录也可能没建出来）：没有我们写过的文件，
+        // 记成已回滚。漏记的话，这条 doing 会被当成「未恢复」，回滚永远停在部分回滚。
         if !row.written && matches!(op.kind, OpKind::Create | OpKind::Move) {
+            let target_missing = match RelPath::parse(&op.path) {
+                Ok(rel) => match fsys.stat(&rel) {
+                    Err(err) if err.code == ErrorCode::NotFound => true,
+                    Err(err) => return Err(err),
+                    Ok(_) => false,
+                },
+                Err(err) => return Err(err),
+            };
+            if target_missing {
+                mark_rollback_done(db, exec_id, op.index)?;
+                files.push(fr(op, "rolled-back", None, None));
+            }
             continue;
         }
         if row.rollback_state.as_deref() == Some("done") && !move_other_side_present(fsys, op)? {
