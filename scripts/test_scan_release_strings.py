@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """名单扫描：只跳过 russh_sftp 的整句，其他 Rename 照报。"""
 
+import contextlib
 import importlib.util
+import io
 import pathlib
 import unittest
 
@@ -36,6 +38,25 @@ class ExactThirdPartySentenceTest(unittest.TestCase):
         self.assertGreater(scan.forbid_blobs([("sample", blob)]), 0)
         beside = EXACT + b" Backup Rollback"
         self.assertEqual(name_hits(beside), [b"Backup", b"Rollback"])
+
+    def test_hit_output_includes_context(self):
+        prefix = bytes([0x11]) + b"Z" * 69 + bytes([0x01])
+        blob = prefix + b"Rename" + b"\x02" + b"Y" * 69 + bytes([0x22])
+        offset = len(prefix)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            failed = scan.forbid_blobs([("bundle/Demo.app/Contents/MacOS/hetianxia", blob)])
+        text = buf.getvalue()
+        self.assertGreater(failed, 0)
+        self.assertIn("scan bundle/Demo.app/Contents/MacOS/hetianxia (", text)
+        self.assertIn(f"{len(blob)} bytes", text)
+        self.assertIn(f"contains Rename at {offset}", text)
+        self.assertIn(f"offset {offset}", text)
+        self.assertIn("52 65 6e 61 6d 65", text)
+        self.assertIn("Rename", text)
+        self.assertIn("01", text)
+        self.assertIn(f"{offset - 64:08x}  ", text)
+        self.assertNotIn("00000000  ", text)
 
 
 if __name__ == "__main__":
