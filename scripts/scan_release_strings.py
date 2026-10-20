@@ -28,11 +28,15 @@ NEEDLES = (b"UPG_FAULT", b"sftp-disconnect", b"HTX_FAULT_INJECT_ENABLED", b"fsyn
 STAGE = re.compile(
     rb"(?:backup|write|verify-pre|verify-post|rename|rollback|log|log-probe|fsync-dir|sftp-disconnect):[0-9a-z]"
 )
-# 只留不容易撞上正式二进制的名字。Backup / Rename / Rollback / Log 会命中 brotli 词典和 log::Log。
-# Write 会命中 std::io::Write。阶段语法仍由 STAGE 抓住，例如 backup:1、log:1。LogProbe 要留下。
+# Stage 变体名，外加 Item::LogProbe。按标识符边界匹配，避免撞上 core::fmt::Write 这类符号。
+# `Write` 不放进裸名字：正式二进制里有 `std::io::Write`。
+# `Log` 也不放：Tauri 带进来的 log::Log 会命中。阶段语法 `write:N` / `log:N` 仍在 STAGE 里。
 STAGE_NAMES = (
+    b"Backup",
     b"VerifyPre",
     b"VerifyPost",
+    b"Rename",
+    b"Rollback",
     b"LogProbe",
     b"SftpDisconnect",
     b"FsyncDir",
@@ -49,7 +53,7 @@ def is_rlib(path: pathlib.Path) -> bool:
 def app_executables(root: pathlib.Path):
     found = []
     for macos in root.rglob("Contents/MacOS"):
-        # .../Name.app/Contents/MacOS，.app 是 MacOS 的祖父目录，不是 Contents。
+        # .../Name.app/Contents/MacOS — the .app is the grandparent, not Contents.
         if macos.parent.parent.suffix != ".app":
             continue
         for child in macos.iterdir():
