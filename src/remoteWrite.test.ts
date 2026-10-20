@@ -143,15 +143,57 @@ test("remotePlanFiles sends every checked file and the failure list stops at the
     failedPath: "/srv/site/b.txt",
     code: "E_IO",
     files: [
-      { remotePath: "/srv/site/a.txt", state: "written", code: null },
-      { remotePath: "/srv/site/b.txt", state: "failed", code: "E_IO" },
-      { remotePath: "/srv/site/c.txt", state: "pending", code: null },
+      { remotePath: "/srv/site/a.txt", state: "written", code: null, backedUp: true },
+      { remotePath: "/srv/site/b.txt", state: "failed", code: "E_IO", backedUp: false },
+      { remotePath: "/srv/site/c.txt", state: "pending", code: null, backedUp: false },
     ],
   };
   assert.equal(
     remoteBatchFailure(report),
     "写到第 2/共 6 个文件时失败：/srv/site/b.txt。已写入的 1 个文件的原文件已备份到本机（/data/bak/tx-1），可以从这里手工恢复。",
   );
+  const mixed: RemoteBatchReport = {
+    ...report,
+    total: 4,
+    failedIndex: 4,
+    failedPath: "/srv/site/d.txt",
+    files: [
+      { remotePath: "/srv/site/a.txt", state: "written", code: null, backedUp: true },
+      { remotePath: "/srv/site/new.txt", state: "written", code: null, backedUp: false },
+      { remotePath: "/srv/site/b.txt", state: "written", code: null, backedUp: true },
+      { remotePath: "/srv/site/d.txt", state: "failed", code: "E_IO", backedUp: false },
+    ],
+  };
+  assert.equal(
+    remoteBatchFailure(mixed),
+    "写到第 4/共 4 个文件时失败：/srv/site/d.txt。已写入的 2 个文件的原文件已备份到本机（/data/bak/tx-1），可以从这里手工恢复。新增的 1 个文件原本不存在，如需撤销请删除。",
+  );
+  const onlyNew: RemoteBatchReport = {
+    ...report,
+    total: 3,
+    failedIndex: 3,
+    failedPath: "/srv/site/c.txt",
+    files: [
+      { remotePath: "/srv/site/a.txt", state: "written", code: null, backedUp: false },
+      { remotePath: "/srv/site/b.txt", state: "written", code: null, backedUp: false },
+      { remotePath: "/srv/site/c.txt", state: "failed", code: "E_IO", backedUp: false },
+    ],
+  };
+  const onlyNewText = remoteBatchFailure(onlyNew) ?? "";
+  assert.equal(onlyNewText.includes("原文件已备份"), false);
+  assert.equal(onlyNewText, "写到第 3/共 3 个文件时失败：/srv/site/c.txt。新增的 2 个文件原本不存在，如需撤销请删除。");
+  const noneWritten: RemoteBatchReport = {
+    ...report,
+    failedIndex: 1,
+    failedPath: "/srv/site/a.txt",
+    files: [
+      { remotePath: "/srv/site/a.txt", state: "failed", code: "E_IO", backedUp: true },
+      { remotePath: "/srv/site/b.txt", state: "pending", code: null, backedUp: true },
+    ],
+  };
+  assert.equal(remoteBatchFailure(noneWritten), "写到第 1/共 6 个文件时失败：/srv/site/a.txt。");
+  assert.equal((remoteBatchFailure(noneWritten) ?? "").includes("原文件已备份"), false);
+  assert.equal((remoteBatchFailure(noneWritten) ?? "").includes("原本不存在"), false);
   assert.equal(remoteFileMark(report.files[0]), "已写入");
   assert.equal(remoteFileMark(report.files[1]), "失败 · E_IO");
   assert.equal(remoteFileMark(report.files[2]), "未开始");

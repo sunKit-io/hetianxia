@@ -589,10 +589,11 @@ impl RemoteSession {
                 Ok(session) => session,
                 Err(err) => {
                     let failed = if paths.is_empty() { None } else { Some((0, err.code_str().to_string())) };
-                    return Ok(crate::remote_write::assemble_report(&backup_dir, &paths, failed));
+                    return Ok(crate::remote_write::assemble_report(&backup_dir, &paths, failed, &[]));
                 }
             };
             let mut failed = None;
+            let mut backed_up = vec![false; paths.len()];
             for (index, file) in granted.files.into_iter().enumerate() {
                 let write = match crate::remote_write::request_from_stored(
                     exec_id,
@@ -610,13 +611,18 @@ impl RemoteSession {
                         break;
                     }
                 };
-                if let Err(err) = session.commit_overwrite(write).await {
-                    failed = Some((index, err.code_str().to_string()));
-                    break;
+                match session.commit_overwrite(write).await {
+                    Ok(crate::remote_write::CommitResult::Written(staged)) => {
+                        backed_up[index] = staged.backup_file.is_some();
+                    }
+                    Err(err) => {
+                        failed = Some((index, err.code_str().to_string()));
+                        break;
+                    }
                 }
             }
             let _ = session.close().await;
-            Ok(crate::remote_write::assemble_report(&backup_dir, &paths, failed))
+            Ok(crate::remote_write::assemble_report(&backup_dir, &paths, failed, &backed_up))
         });
         req.secret.zeroize();
         result.and_then(|inner| inner)

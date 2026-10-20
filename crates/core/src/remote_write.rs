@@ -286,6 +286,8 @@ pub struct RemoteFileOutcome {
     pub remote_path: String,
     pub state: String,
     pub code: Option<String>,
+    /// 这一项写成功，并且远端原来就有文件、原件已落到本机。新增文件是 false。
+    pub backed_up: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -474,7 +476,7 @@ pub fn request_from_stored(
     })
 }
 
-pub fn assemble_report(backup_dir: &str, paths: &[String], failed_at: Option<(usize, String)>) -> RemoteBatchReport {
+pub fn assemble_report(backup_dir: &str, paths: &[String], failed_at: Option<(usize, String)>, backed_up: &[bool]) -> RemoteBatchReport {
     let files = paths
         .iter()
         .enumerate()
@@ -484,7 +486,8 @@ pub fn assemble_report(backup_dir: &str, paths: &[String], failed_at: Option<(us
                 Some((failed, _)) if index > *failed => ("pending", None),
                 _ => ("written", None),
             };
-            RemoteFileOutcome { remote_path: remote_path.clone(), state: state.to_string(), code }
+            let kept = state == "written" && backed_up.get(index).copied().unwrap_or(false);
+            RemoteFileOutcome { remote_path: remote_path.clone(), state: state.to_string(), code, backed_up: kept }
         })
         .collect();
     let (failed_index, failed_path, code) = match failed_at {
@@ -502,15 +505,19 @@ pub fn assemble_report(backup_dir: &str, paths: &[String], failed_at: Option<(us
 }
 
 /// 按顺序写。某一项失败后不再碰后面的文件。
-pub fn run_batch(backup_dir: &str, paths: &[String], mut write_at: impl FnMut(usize) -> Result<()>) -> RemoteBatchReport {
+pub fn run_batch(backup_dir: &str, paths: &[String], mut write_at: impl FnMut(usize) -> Result<bool>) -> RemoteBatchReport {
     let mut failed_at = None;
+    let mut backed_up = vec![false; paths.len()];
     for index in 0..paths.len() {
-        if let Err(err) = write_at(index) {
-            failed_at = Some((index, err.code_str().to_string()));
-            break;
+        match write_at(index) {
+            Ok(kept) => backed_up[index] = kept,
+            Err(err) => {
+                failed_at = Some((index, err.code_str().to_string()));
+                break;
+            }
         }
     }
-    assemble_report(backup_dir, paths, failed_at)
+    assemble_report(backup_dir, paths, failed_at, &backed_up)
 }
 
 pub fn commit_stored_batch(
@@ -530,8 +537,8 @@ pub fn commit_stored_batch(
     let report = run_batch(&backup_dir, &paths, |index| {
         let file = files.next().ok_or_else(|| Error::new(ErrorCode::Internal, "写入项丢失"))?;
         let req = request_from_stored(exec_id, app_data_dir, posix_rename, index as u32, &host, port, &user, file)?;
-        write_one(store, log, &req)?;
-        Ok(())
+        let staged = write_one(store, log, &req)?;
+        Ok(staged.backup_file.is_some())
     });
     Ok(report)
 }
@@ -1175,6 +1182,7 @@ mod tests {
         let done = commit_stored_batch(&mut mem, &mut log, "tx-all", &app_data, true).unwrap();
         assert_eq!(done.failed_index, None);
         assert_eq!(done.files.iter().map(|file| file.state.as_str()).collect::<Vec<_>>(), ["written", "written", "written"]);
+        assert!(done.files.iter().all(|file| file.backed_up));
         assert_eq!(mem.files.get("/opt/site/a.txt").map(Vec::as_slice), Some(b"A".as_slice()));
         assert_eq!(mem.files.get("/opt/site/b.txt").map(Vec::as_slice), Some(b"B".as_slice()));
         assert_eq!(mem.files.get("/opt/site/c.txt").map(Vec::as_slice), Some(b"C".as_slice()));
@@ -1200,12 +1208,54 @@ mod tests {
             stopped.files.iter().map(|file| (file.state.as_str(), file.code.as_deref())).collect::<Vec<_>>(),
             [("written", None), ("failed", Some("E_IO")), ("pending", None)]
         );
+        assert_eq!(stopped.files.iter().map(|file| file.backed_up).collect::<Vec<_>>(), [true, false, false]);
         assert_eq!(again.files.get("/opt/site/a.txt").map(Vec::as_slice), Some(b"A".as_slice()));
         assert_eq!(again.files.get("/opt/site/b.txt").map(Vec::as_slice), Some(b"old-b".as_slice()));
         assert_eq!(again.files.get("/opt/site/c.txt").map(Vec::as_slice), Some(b"old-c".as_slice()));
         let mid = tx_backup_dir(&app_data, "tx-mid").unwrap();
         assert_eq!(fs::read(mid.join("files/opt/site/a.txt")).unwrap(), b"old-a");
+        // 失败项在改远端之前已经把原件落下，但不算「已写入并备份」。
+        assert_eq!(fs::read(mid.join("files/opt/site/b.txt")).unwrap(), b"old-b");
+        assert!(!stopped.files[1].backed_up);
         assert_eq!(stopped.backup_dir, mid.display().to_string());
+
+        let mixed_files = [
+            BatchFileInput { remote_path: "/opt/site/a.txt", content: b"A", content_sha256: None },
+            BatchFileInput { remote_path: "/opt/site/new.txt", content: b"N", content_sha256: None },
+            BatchFileInput { remote_path: "/opt/site/c.txt", content: b"C", content_sha256: None },
+        ];
+        issue_batch_for(&app_data, "tx-mix", &batch_input(&mixed_files), now_ms()).unwrap();
+        let mut mix = Mem::new(BTreeMap::from([
+            ("/opt/site/a.txt".into(), b"old-a".to_vec()),
+            ("/opt/site/c.txt".into(), b"old-c".to_vec()),
+        ]));
+        mix.fail_after_writes = Some(2);
+        let mixed = commit_stored_batch(&mut mix, &mut log, "tx-mix", &app_data, true).unwrap();
+        assert_eq!(
+            mixed.files.iter().map(|file| (file.state.as_str(), file.backed_up)).collect::<Vec<_>>(),
+            [("written", true), ("written", false), ("failed", false)]
+        );
+        assert_eq!(mix.files.get("/opt/site/new.txt").map(Vec::as_slice), Some(b"N".as_slice()));
+        assert_eq!(mix.files.get("/opt/site/c.txt").map(Vec::as_slice), Some(b"old-c".as_slice()));
+        let mix_dir = tx_backup_dir(&app_data, "tx-mix").unwrap();
+        assert_eq!(fs::read(mix_dir.join("files/opt/site/a.txt")).unwrap(), b"old-a");
+        assert!(!mix_dir.join("files/opt/site/new.txt").exists());
+
+        let created = [
+            BatchFileInput { remote_path: "/opt/site/n1.txt", content: b"1", content_sha256: None },
+            BatchFileInput { remote_path: "/opt/site/n2.txt", content: b"2", content_sha256: None },
+            BatchFileInput { remote_path: "/opt/site/n3.txt", content: b"3", content_sha256: None },
+        ];
+        issue_batch_for(&app_data, "tx-new", &batch_input(&created), now_ms()).unwrap();
+        let mut fresh = Mem::new(BTreeMap::new());
+        fresh.fail_after_writes = Some(2);
+        let only_new = commit_stored_batch(&mut fresh, &mut log, "tx-new", &app_data, true).unwrap();
+        assert!(only_new.files.iter().all(|file| !file.backed_up));
+        assert_eq!(
+            only_new.files.iter().map(|file| file.state.as_str()).collect::<Vec<_>>(),
+            ["written", "written", "failed"]
+        );
+
         let calls = std::cell::Cell::new(0u32);
         let partial = run_batch("/bak/tx", &["/a".into(), "/b".into(), "/c".into()], |_| {
             let seen = calls.get();
@@ -1213,10 +1263,14 @@ mod tests {
             if seen == 1 {
                 return Err(Error::new(ErrorCode::Permission, "不能写"));
             }
-            Ok(())
+            Ok(true)
         });
         assert_eq!(calls.get(), 2);
         assert_eq!(partial.failed_index, Some(2));
         assert_eq!(partial.files[2].state, "pending");
+        assert_eq!(partial.files.iter().map(|file| file.backed_up).collect::<Vec<_>>(), [true, false, false]);
+        let dropped = assemble_report("/bak/tx", &["/a".into(), "/b".into()], Some((1, "E_IO".into())), &[true, true]);
+        assert!(dropped.files[0].backed_up);
+        assert!(!dropped.files[1].backed_up);
     }
 }

@@ -139,6 +139,8 @@ export type RemoteFileOutcome = {
   remotePath: string;
   state: string;
   code: string | null;
+  /** 写成功且远端原来就有文件。新增文件为 false。 */
+  backedUp: boolean;
 };
 
 export type RemoteBatchReport = {
@@ -178,7 +180,17 @@ export function remoteFileMark(file: { state: string; code?: string | null }): s
 export function remoteBatchFailure(report: RemoteBatchReport): string | null {
   if (report.failedIndex == null || !report.failedPath) return null;
   const n = report.failedIndex;
-  return `写到第 ${n}/共 ${report.total} 个文件时失败：${report.failedPath}。已写入的 ${n - 1} 个文件的原文件已备份到本机（${report.backupDir}），可以从这里手工恢复。`;
+  const written = report.files.filter((file) => file.state === "written");
+  const backed = written.filter((file) => file.backedUp).length;
+  const created = written.length - backed;
+  let text = `写到第 ${n}/共 ${report.total} 个文件时失败：${report.failedPath}。`;
+  if (backed > 0) {
+    text += `已写入的 ${backed} 个文件的原文件已备份到本机（${report.backupDir}），可以从这里手工恢复。`;
+  }
+  if (created > 0) {
+    text += `新增的 ${created} 个文件原本不存在，如需撤销请删除。`;
+  }
+  return text;
 }
 
 /** 只有「仍然写入」会调用 write。取消什么都不写。 */
