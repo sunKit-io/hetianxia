@@ -181,13 +181,22 @@ export async function pickProjectDirectory(): Promise<string | null> {
   return typeof picked === "string" ? picked : null;
 }
 
-/** scan 的右边是目录。选中的 zip 先解开；本身是目录则原样交给 scan。 */
-export async function pickUpgradePackage(): Promise<string | null> {
-  const picked = await open({
-    multiple: false,
-    title: "选择升级包",
-    filters: [{ name: "升级包", extensions: ["zip"] }],
-  });
+/** scan 的右边是目录。zip 先解开；文件夹原样返回。两条入口都进这里。 */
+async function useUpgradePackage(picked: string | string[] | null): Promise<string | null> {
   if (typeof picked !== "string") return null;
   return preparePackage(picked);
+}
+
+/** 只选文件夹。和 zip 入口解开后走同一条 scan。 */
+export function pickUpgradeDirectory(): Promise<string | null> {
+  return open({ directory: true, multiple: false, title: "选择升级包文件夹" }).then(useUpgradePackage);
+}
+
+/** 只选 zip。和文件夹入口解开后走同一条 scan。 */
+export function pickUpgradeZip(): Promise<string | null> {
+  return open({
+    multiple: false,
+    title: "选择 zip 升级包",
+    filters: [{ name: "升级包", extensions: ["zip"] }],
+  }).then(useUpgradePackage);
 }

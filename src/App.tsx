@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Server, ShieldAlert, KeyRound, AlertTriangle } from "lucide-react";
-import { appBakDir, clearConnectionFingerprint, commitRemoteOverwrite, deleteConnection, deleteSshSecret, executeLocal, journalRuns, listConnections, mergeTexts, pickProjectDirectory, pickUpgradePackage, readSide, remoteWritePrompt, rollbackPreview, rollbackRun, resumeRun, saveConnection, saveSshSecret, scanPair, sshSecretStatus, startupFailure, startupOffers, testConnection, type JournalRun, type ProbeReport, type SavedConnection } from "./backend";
+import { appBakDir, clearConnectionFingerprint, commitRemoteOverwrite, deleteConnection, deleteSshSecret, executeLocal, journalRuns, listConnections, mergeTexts, pickProjectDirectory, pickUpgradeDirectory, pickUpgradeZip, readSide, remoteWritePrompt, rollbackPreview, rollbackRun, resumeRun, saveConnection, saveSshSecret, scanPair, sshSecretStatus, startupFailure, startupOffers, testConnection, type JournalRun, type ProbeReport, type SavedConnection } from "./backend";
 import { externalChoice, keepSource, pendingChoice, rollbackChoice, type ResumeChoice, type RollbackChoice } from "./choices";
 import { DiffEditor } from "./editor";
 import { afterResume, engineCode, formatEngineError, formatFileResult, formatOffer, formatReport, type ConflictFile, type ExecReport, type RecoveryOffer } from "./engine";
@@ -153,9 +153,9 @@ export function App() {
     }
   }
 
-  async function onPickPackage() {
+  async function onPickPackage(pick: () => Promise<string | null>) {
     try {
-      const picked = await pickUpgradePackage();
+      const picked = await pick();
       if (!picked) return;
       setPackagePath(picked);
       if (projectRoot) await refreshPlan(projectRoot, picked);
@@ -283,7 +283,8 @@ export function App() {
             running={running}
             report={report}
             onPickProject={() => { void onPickProject(); }}
-            onPickPackage={() => { void onPickPackage(); }}
+            onPickDirectory={() => { void onPickPackage(pickUpgradeDirectory); }}
+            onPickZip={() => { void onPickPackage(pickUpgradeZip); }}
             onExecute={() => { void backupAndExecute(editedContents()); }}
             onOpenFile={(path) => { setCurrentFile(path); setPage("edit"); }}
             connectionSelected={selected != null}
@@ -604,7 +605,8 @@ function PreviewPage({
   running,
   report,
   onPickProject,
-  onPickPackage,
+  onPickDirectory,
+  onPickZip,
   onExecute,
   onOpenFile,
   connectionSelected,
@@ -622,7 +624,8 @@ function PreviewPage({
   running: boolean;
   report: ExecReport | null;
   onPickProject: () => void;
-  onPickPackage: () => void;
+  onPickDirectory: () => void;
+  onPickZip: () => void;
   onExecute: () => void;
   onOpenFile: (path: string) => void;
   connectionSelected: boolean;
@@ -644,7 +647,8 @@ function PreviewPage({
         <p className="sub">{target === "remote" ? "远程" : localSub}</p>
         <div className="pickrow">
           <button type="button" onClick={onPickProject}>选择项目目录…</button>
-          <button type="button" onClick={onPickPackage}>选择升级包…</button>
+          <button type="button" onClick={onPickDirectory}>选择升级包文件夹…</button>
+          <button type="button" onClick={onPickZip}>选择 zip 升级包…</button>
         </div>
         {scanning && <p role="status">正在扫描…</p>}
         <div className="auth">写入到 <span className={target === "local" ? "on" : ""} onClick={() => setTarget("local")}>本机</span><span className={target === "remote" ? "on" : ""} onClick={() => setTarget("remote")}>远程</span></div>
