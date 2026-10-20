@@ -5,7 +5,6 @@ fn main() {
         "diff",
         "merge",
         "execute",
-        "rollback",
         "rollback_run",
         "resume_run",
         "history",

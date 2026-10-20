@@ -9,7 +9,6 @@
     "allow-diff",
     "allow-merge",
     "allow-execute",
-    "allow-rollback",
     "allow-rollback-run",
     "allow-resume-run",
     "allow-history",

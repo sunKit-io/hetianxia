@@ -3,7 +3,9 @@
 //!
 //! 第二个进程由单实例插件把已有窗口拉到前面，然后自己退出，不改 `run.lock`。
 //! `begin_run` 在任何恢复提示之前完成：先核对崩溃那次的 `needs_verify`，再写新的 `run_id`。
-//! 窗口关闭、退出请求和进程退出都会 `release_clean`。
+//! 数据库、`bak/` 和 `run.lock` 都在 Tauri 的 `app_data_dir`
+//! （macOS：`~/Library/Application Support/com.hetianxia.app/`）。
+//! 执行或回滚还在进行时，窗口关闭和退出都不写成 `clean`。没有进行中的工作时，退出才 `release_clean`。
 
 pub mod commands;
 
@@ -69,11 +71,13 @@ fn open_session(data: PathBuf) -> Result<Session, String> {
 }
 
 fn end_session(session: &Session) {
+    let Ok(db) = hetianxia_core::exec::open_db(&session.db_path) else { return };
+    if hetianxia_core::exec::run_in_flight(&db).unwrap_or(true) {
+        return;
+    }
     let Ok(mut guard) = session.lock.lock() else { return };
     let Some(lock) = guard.take() else { return };
-    if let Ok(db) = hetianxia_core::exec::open_db(&session.db_path) {
-        let _ = lock.release_clean(&db);
-    }
+    let _ = lock.release_clean(&db);
 }
 
 pub fn run() {
@@ -110,7 +114,6 @@ pub fn run() {
             commands::diff,
             commands::merge,
             commands::execute,
-            commands::rollback,
             commands::rollback_run,
             commands::resume_run,
             commands::history,
@@ -189,14 +192,25 @@ mod tests {
         assert!(source.contains("startup_offers"));
         assert!(source.contains("startup_failure"));
         assert!(source.contains("failed_session"));
+        assert!(source.contains("app_data_dir"));
+        assert!(source.contains("run_in_flight"));
         assert_eq!(app_db_path(std::path::Path::new("/data")), std::path::PathBuf::from("/data/hetianxia.sqlite"));
         assert_eq!(app_backup_root(std::path::Path::new("/data")), std::path::PathBuf::from("/data/bak"));
         let commands = include_str!("commands.rs");
-        for name in ["execute", "rollback", "rollback_run", "resume_run", "history", "journal_runs", "rollback_preview"] {
+        for name in ["execute", "rollback_run", "resume_run", "history", "journal_runs", "clear_host_fingerprint", "host_key_status", "trust_host_fingerprint", "rollback_preview"] {
             let header = command_header(commands, name);
             assert!(!header.contains("db_path"), "{name}: {header}");
             assert!(!header.contains("backup_root"), "{name}: {header}");
         }
+        for name in ["rollback_run", "resume_run"] {
+            let marker = format!("pub fn {name}(");
+            let start = commands.find(&marker).unwrap_or_else(|| panic!("missing {name}"));
+            let rest = &commands[start..];
+            let end = rest[marker.len()..].find("\npub fn ").map(|index| index + marker.len()).unwrap_or(rest.len());
+            assert!(!rest[..end].contains("project_root"), "{name}");
+        }
+        assert!(commands.contains("stored_project_root"));
+        assert!(!commands.contains("pub fn rollback("));
         assert!(commands.contains("session.backup_root"));
         assert!(!commands.contains("join(\"backups\")"));
         assert!(!commands.contains("load_ssh_secret"));
@@ -214,6 +228,8 @@ mod tests {
             assert!(!header.contains("db_path"), "{name}: {header}");
             assert!(!header.contains("backup_root"), "{name}: {header}");
         }
+        let hardcoded = format!("local_{}dir", "data_");
+        assert!(!source.contains(&hardcoded));
     }
 
     #[test]
@@ -253,6 +269,7 @@ mod tests {
         let plan = ExecPlan {
             id: "exec-1".into(),
             project_key: "demo".into(),
+            project_root: String::new(),
             ops: vec![PlanOp {
                 index: 1,
                 kind: OpKind::Overwrite,
@@ -290,7 +307,10 @@ mod tests {
         let runs = commands::journal_runs_in(&db).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].exec_id, "exec-1");
-        assert!(runs[0].project_root.is_none());
+        assert_eq!(
+            runs[0].project_root.as_deref(),
+            Some(std::fs::canonicalize(dir.path()).unwrap().to_str().unwrap())
+        );
         assert!(!runs[0].remote);
         assert_eq!(runs[0].file_count, 1);
         assert_eq!(runs[0].status, "ROLLED_BACK");
@@ -318,25 +338,135 @@ mod tests {
         )
         .unwrap();
         let before = std::fs::read(&known).unwrap();
-        let status = commands::host_key_status(
-            db.display().to_string(),
-            known.display().to_string(),
-            "build-01".into(),
+        let status = commands::host_key_status_at(
+            &db,
+            &known,
+            "build-01",
             22,
-            "SHA256:ldyiXa1JQakitNU5tErauu8DvWQ1dZ7aXu+rm7KQuog".into(),
+            "SHA256:ldyiXa1JQakitNU5tErauu8DvWQ1dZ7aXu+rm7KQuog",
         )
         .unwrap();
         assert_eq!(status, "match");
-        commands::clear_host_fingerprint(db.display().to_string(), "build-01".into(), 22).unwrap();
-        let again = commands::host_key_status(
-            db.display().to_string(),
-            known.display().to_string(),
-            "build-01".into(),
-            22,
-            "SHA256:other".into(),
-        )
-        .unwrap();
+        commands::clear_host_fingerprint_at(&db, "build-01", 22).unwrap();
+        let again = commands::host_key_status_at(&db, &known, "build-01", 22, "SHA256:other").unwrap();
         assert_eq!(again, "new");
         assert_eq!(std::fs::read(&known).unwrap(), before);
+    }
+
+    fn overwrite_plan(id: &str, bytes: &[u8]) -> ExecPlan {
+        ExecPlan {
+            id: id.into(),
+            project_key: "demo".into(),
+            project_root: String::new(),
+            ops: vec![PlanOp {
+                index: 1,
+                kind: OpKind::Overwrite,
+                path: "a.txt".into(),
+                from: None,
+                bytes: Some(bytes.to_vec()),
+                expect: None,
+                mode: None,
+                source_mtime_ms: None,
+                merged: false,
+                keep_source: false,
+                readonly: false,
+                label: "覆盖".into(),
+            }],
+            summary: Summary { overwrite: 1, ..Summary::default() },
+        }
+    }
+
+    /// A 执行后再在 B 执行。回滚 A 必须改 A，不能改 B。
+    /// 已回滚再调 rollback_run、已结束再调 resume_run，都只观察是否再写文件。
+    #[test]
+    fn rollback_run_and_resume_run_follow_the_journal_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("a.txt"), b"old").unwrap();
+        std::fs::write(b.join("a.txt"), b"from-b").unwrap();
+        let db = dir.path().join("t.sqlite");
+        let backup = dir.path().join("bak");
+        commands::execute_in(&db, &a, &backup, overwrite_plan("exec-a", b"NEW"), false).unwrap();
+        commands::execute_in(&db, &b, &backup, overwrite_plan("exec-b", b"from-b-new"), false).unwrap();
+
+        let rolled = commands::rollback_recorded(&db, "exec-a", hetianxia_core::exec::RollbackChoice::ProceedBackupCurrent).unwrap();
+        assert_eq!(rolled.state, "ROLLED_BACK");
+        assert_eq!(std::fs::read(a.join("a.txt")).unwrap(), b"old");
+        assert_eq!(std::fs::read(b.join("a.txt")).unwrap(), b"from-b-new");
+
+        let again = commands::rollback_recorded(&db, "exec-a", hetianxia_core::exec::RollbackChoice::ProceedBackupCurrent);
+        assert!(again.is_err(), "已回滚后再 rollback_run 不应再执行: {again:?}");
+        assert_eq!(std::fs::read(a.join("a.txt")).unwrap(), b"old");
+        assert_eq!(std::fs::read(b.join("a.txt")).unwrap(), b"from-b-new");
+
+        let resume_rolled = commands::resume_recorded(&db, &backup, "exec-a", hetianxia_core::exec::ResumeChoice::Continue);
+        assert!(resume_rolled.is_err(), "已回滚后再 resume_run 不应再执行: {resume_rolled:?}");
+        assert_eq!(std::fs::read(a.join("a.txt")).unwrap(), b"old");
+        assert_eq!(std::fs::read(b.join("a.txt")).unwrap(), b"from-b-new");
+
+        let resume_done = commands::resume_recorded(&db, &backup, "exec-b", hetianxia_core::exec::ResumeChoice::Continue);
+        assert!(resume_done.is_err(), "已完成后再 resume_run 不应再执行: {resume_done:?}");
+        assert_eq!(std::fs::read(b.join("a.txt")).unwrap(), b"from-b-new");
+
+        // 已完成的升级，第一次 rollback_run 是回滚本身，不是再跑一遍。
+        let rolled_done = commands::rollback_recorded(&db, "exec-b", hetianxia_core::exec::RollbackChoice::ProceedBackupCurrent);
+        assert!(rolled_done.is_ok(), "已完成的升级第一次回滚返回了错误: {rolled_done:?}");
+        assert_eq!(std::fs::read(b.join("a.txt")).unwrap(), b"from-b");
+        let rolled_done_again = commands::rollback_recorded(&db, "exec-b", hetianxia_core::exec::RollbackChoice::ProceedBackupCurrent);
+        assert!(rolled_done_again.is_err(), "已回滚后再 rollback_run 不应再执行: {rolled_done_again:?}");
+        assert_eq!(std::fs::read(b.join("a.txt")).unwrap(), b"from-b");
+        assert_eq!(std::fs::read(a.join("a.txt")).unwrap(), b"old");
+    }
+
+    /// 历史页：execute 之后先 rollback_preview，确认后再走 rollback_run
+    /// （reject_finished + rollback_recorded）。两个目录里只回滚被点中的那一笔。
+    #[test]
+    fn history_page_previews_then_rolls_back_the_clicked_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("a.txt"), b"old-a").unwrap();
+        std::fs::write(b.join("a.txt"), b"old-b").unwrap();
+        let db = dir.path().join("t.sqlite");
+        let backup = dir.path().join("bak");
+        commands::execute_in(&db, &a, &backup, overwrite_plan("exec-a", b"NEW-A"), false).unwrap();
+        commands::execute_in(&db, &b, &backup, overwrite_plan("exec-b", b"NEW-B"), false).unwrap();
+
+        let canon_a = std::fs::canonicalize(&a).unwrap();
+        let canon_b = std::fs::canonicalize(&b).unwrap();
+        let runs = commands::journal_runs_in(&db).unwrap();
+        let run_a = runs.iter().find(|run| run.exec_id == "exec-a").unwrap();
+        let run_b = runs.iter().find(|run| run.exec_id == "exec-b").unwrap();
+        assert_eq!(run_a.project_root.as_deref(), canon_a.to_str());
+        assert_eq!(run_b.project_root.as_deref(), canon_b.to_str());
+
+        let preview_a = commands::rollback_preview_in(&db, "exec-a").unwrap();
+        assert!(preview_a.files.is_empty());
+        std::fs::write(b.join("a.txt"), b"user-edit").unwrap();
+        let preview_b = commands::rollback_preview_in(&db, "exec-b").unwrap();
+        assert!(preview_b.files.iter().any(|file| file.path == "a.txt"));
+        assert_eq!(std::fs::read(a.join("a.txt")).unwrap(), b"NEW-A");
+        assert_eq!(std::fs::read(b.join("a.txt")).unwrap(), b"user-edit");
+
+        commands::reject_finished(&db, "exec-b", true).unwrap();
+        let rolled = commands::rollback_recorded(
+            &db,
+            "exec-b",
+            hetianxia_core::exec::RollbackChoice::ProceedBackupCurrent,
+        )
+        .unwrap();
+        assert_eq!(rolled.state, "ROLLED_BACK");
+        assert_eq!(std::fs::read(b.join("a.txt")).unwrap(), b"old-b");
+        assert_eq!(std::fs::read(a.join("a.txt")).unwrap(), b"NEW-A");
+
+        let again = commands::reject_finished(&db, "exec-b", true).unwrap_err();
+        assert_eq!(again.message, "这次回滚已经结束");
+        assert_eq!(std::fs::read(a.join("a.txt")).unwrap(), b"NEW-A");
+        assert_eq!(std::fs::read(b.join("a.txt")).unwrap(), b"old-b");
     }
 }

@@ -37,15 +37,6 @@ fn ready(session: &crate::Session) -> Result<(), Error> {
     Ok(())
 }
 
-fn project_root(session: &crate::Session) -> Result<PathBuf, Error> {
-    ready(session)?;
-    session
-        .project_root
-        .lock()
-        .map(|guard| guard.clone())
-        .map_err(|_| Error::new(ErrorCode::Internal, "项目目录锁被占用"))
-}
-
 #[tauri::command]
 pub fn scan(left: String, right: String) -> Result<ScanOutput, Error> {
     let left = LocalFs::new(left);
@@ -78,8 +69,9 @@ pub fn merge(left: String, right: String, decision: String) -> Result<Rendered, 
     Ok(merge::render(&file, &state))
 }
 
-pub fn execute_in(db_path: &Path, root: &Path, backup_root: &Path, plan: ExecPlan, allow_readonly: bool) -> Result<ExecReport, Error> {
+pub fn execute_in(db_path: &Path, root: &Path, backup_root: &Path, mut plan: ExecPlan, allow_readonly: bool) -> Result<ExecReport, Error> {
     remember_project_root(db_path, root);
+    plan.project_root = root.display().to_string();
     let db = exec::open_db(db_path)?;
     let fsys = LocalFs::new(root);
     let kinds: Vec<_> = plan.ops.iter().map(|op| op.kind).collect();
@@ -109,10 +101,29 @@ pub fn rollback_in(db_path: &Path, root: &Path, exec_id: &str, choice: RollbackC
     exec::rollback(&db, &fsys, exec_id, choice, hetianxia_core::fault::FaultPlan::default())
 }
 
-#[tauri::command]
-pub fn rollback(session: tauri::State<crate::Session>, root: String, exec_id: String, choice: RollbackChoice) -> Result<ExecReport, Error> {
-    ready(&session)?;
-    rollback_in(&session.db_path, Path::new(&root), &exec_id, choice)
+/// 按 exec_id 取 journal.root，不读壳层当前项目。
+pub fn rollback_recorded(db_path: &Path, exec_id: &str, choice: RollbackChoice) -> Result<ExecReport, Error> {
+    let root = exec::stored_project_root(&exec::open_db(db_path)?, exec_id)?;
+    rollback_in(db_path, &root, exec_id, choice)
+}
+
+pub fn resume_recorded(
+    db_path: &Path,
+    backup_root: &Path,
+    exec_id: &str,
+    choice: ResumeChoice,
+) -> Result<ResumeOutcome, Error> {
+    let root = exec::stored_project_root(&exec::open_db(db_path)?, exec_id)?;
+    let db = exec::open_db(db_path)?;
+    let fsys = LocalFs::new(root);
+    exec::resume(
+        &db,
+        &fsys,
+        exec_id,
+        choice,
+        &local_opts(backup_root.display().to_string(), false),
+        hetianxia_core::fault::FaultPlan::default(),
+    )
 }
 
 /// 已回滚的不能再回滚。已完成的升级可以回滚，所以已提交不在这里拒绝。
@@ -133,9 +144,9 @@ pub fn reject_finished(db_path: &Path, exec_id: &str, rollback: bool) -> Result<
 
 #[tauri::command]
 pub fn rollback_run(session: tauri::State<crate::Session>, exec_id: String, choice: RollbackChoice) -> Result<ExecReport, Error> {
+    ready(&session)?;
     reject_finished(&session.db_path, &exec_id, true)?;
-    let root = project_root(&session)?;
-    rollback_in(&session.db_path, &root, &exec_id, choice)
+    rollback_recorded(&session.db_path, &exec_id, choice)
 }
 
 #[tauri::command]
@@ -144,18 +155,9 @@ pub fn resume_run(
     exec_id: String,
     choice: ResumeChoice,
 ) -> Result<ResumeOutcome, Error> {
+    ready(&session)?;
     reject_finished(&session.db_path, &exec_id, false)?;
-    let root = project_root(&session)?;
-    let db = exec::open_db(&session.db_path)?;
-    let fsys = LocalFs::new(root);
-    exec::resume(
-        &db,
-        &fsys,
-        &exec_id,
-        choice,
-        &local_opts(session.backup_root.display().to_string(), false),
-        hetianxia_core::fault::FaultPlan::default(),
-    )
+    resume_recorded(&session.db_path, &session.backup_root, &exec_id, choice)
 }
 
 pub fn history_in(db_path: &Path) -> Result<Vec<HistoryRow>, Error> {
@@ -228,17 +230,16 @@ pub fn delete_ssh_secret(account: String) -> Result<(), Error> {
     KeyringStore.delete(&account)
 }
 
-#[tauri::command]
-pub fn host_key_status(
-    db_path: String,
-    known_hosts_path: String,
-    host: String,
+pub fn host_key_status_at(
+    db_path: &Path,
+    known_hosts_path: &Path,
+    host: &str,
     port: u16,
-    fingerprint: String,
+    fingerprint: &str,
 ) -> Result<String, Error> {
-    let db = exec::open_db(Path::new(&db_path))?;
-    let status = remote::host_key_with_file(&db, Path::new(&known_hosts_path), &host, port, &fingerprint)?;
-    remote::reject_if_host_key_changed(status, &fingerprint)?;
+    let db = exec::open_db(db_path)?;
+    let status = remote::host_key_with_file(&db, known_hosts_path, host, port, fingerprint)?;
+    remote::reject_if_host_key_changed(status, fingerprint)?;
     Ok(match status {
         remote::HostKeyStatus::New => "new",
         remote::HostKeyStatus::Match => "match",
@@ -248,20 +249,47 @@ pub fn host_key_status(
 }
 
 #[tauri::command]
-pub fn clear_host_fingerprint(db_path: String, host: String, port: u16) -> Result<(), Error> {
-    let db = exec::open_db(Path::new(&db_path))?;
-    remote::clear_fingerprint(&db, &host, port)
+pub fn host_key_status(
+    session: tauri::State<crate::Session>,
+    known_hosts_path: String,
+    host: String,
+    port: u16,
+    fingerprint: String,
+) -> Result<String, Error> {
+    ready(&session)?;
+    host_key_status_at(&session.db_path, Path::new(&known_hosts_path), &host, port, &fingerprint)
+}
+
+pub fn clear_host_fingerprint_at(db_path: &Path, host: &str, port: u16) -> Result<(), Error> {
+    let db = exec::open_db(db_path)?;
+    remote::clear_fingerprint(&db, host, port)
 }
 
 #[tauri::command]
-#[allow(dead_code)]
-pub fn trust_host_fingerprint(db_path: String, host: String, port: u16, fingerprint: String) -> Result<(), Error> {
-    let db = exec::open_db(Path::new(&db_path))?;
+pub fn clear_host_fingerprint(session: tauri::State<crate::Session>, host: String, port: u16) -> Result<(), Error> {
+    ready(&session)?;
+    clear_host_fingerprint_at(&session.db_path, &host, port)
+}
+
+pub fn trust_host_fingerprint_at(db_path: &Path, host: &str, port: u16, fingerprint: &str) -> Result<(), Error> {
+    let db = exec::open_db(db_path)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    remote::trust_host_key(&db, &host, port, &fingerprint, now)
+    remote::trust_host_key(&db, host, port, fingerprint, now)
+}
+
+#[tauri::command]
+#[allow(dead_code)]
+pub fn trust_host_fingerprint(
+    session: tauri::State<crate::Session>,
+    host: String,
+    port: u16,
+    fingerprint: String,
+) -> Result<(), Error> {
+    ready(&session)?;
+    trust_host_fingerprint_at(&session.db_path, &host, port, &fingerprint)
 }
 
 #[tauri::command]
