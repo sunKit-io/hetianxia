@@ -141,6 +141,8 @@ pub fn run() {
             commands::remote_write_prompt,
             commands::commit_remote_overwrite,
             commands::app_bak_dir,
+            commands::load_file_picks,
+            commands::save_file_picks,
             commands::read_ssh_config,
         ])
         .build(tauri::generate_context!())
@@ -486,6 +488,19 @@ mod tests {
         assert_eq!(again.message, "这次回滚已经结束");
         assert_eq!(std::fs::read(a.join("a.txt")).unwrap(), b"NEW-A");
         assert_eq!(std::fs::read(b.join("a.txt")).unwrap(), b"old-b");
+    }
+
+    #[test]
+    fn file_picks_roundtrip_keeps_skipped_rels() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.sqlite");
+        commands::save_file_picks_in(&db, "/work/app", "/pkg/a.zip", &["src/old.ts".into()]).unwrap();
+        assert_eq!(
+            commands::load_file_picks_in(&db, "/work/app", "/pkg/a.zip").unwrap(),
+            vec!["src/old.ts".to_string()]
+        );
+        commands::save_file_picks_in(&db, "/work/app", "/pkg/a.zip", &[]).unwrap();
+        assert!(commands::load_file_picks_in(&db, "/work/app", "/pkg/a.zip").unwrap().is_empty());
     }
 
     #[test]

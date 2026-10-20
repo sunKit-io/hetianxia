@@ -36,6 +36,8 @@
     "allow-remote-write-prompt",
     "allow-commit-remote-overwrite",
     "allow-app-bak-dir",
+    "allow-load-file-picks",
+    "allow-save-file-picks",
     "allow-read-ssh-config"
   ]
 }

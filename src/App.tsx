@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Server, ShieldAlert, KeyRound, AlertTriangle } from "lucide-react";
-import { appBakDir, clearConnectionFingerprint, commitRemoteOverwrite, deleteConnection, deleteSshSecret, executeLocal, journalRuns, listConnections, mergeTexts, pickProjectDirectory, pickUpgradeDirectory, pickUpgradeZip, readSide, remoteWritePrompt, rollbackPreview, rollbackRun, resumeRun, saveConnection, saveSshSecret, scanPair, sshSecretStatus, startupFailure, startupOffers, testConnection, type JournalRun, type ProbeReport, type SavedConnection } from "./backend";
+import { appBakDir, clearConnectionFingerprint, commitRemoteOverwrite, deleteConnection, deleteSshSecret, executeLocal, journalRuns, listConnections, loadFilePicks, mergeTexts, pickProjectDirectory, pickUpgradeDirectory, pickUpgradeZip, readSide, remoteWritePrompt, rollbackPreview, rollbackRun, resumeRun, saveConnection, saveFilePicks, saveSshSecret, scanPair, sshSecretStatus, startupFailure, startupOffers, testConnection, type JournalRun, type ProbeReport, type SavedConnection } from "./backend";
+import { invertPicked, pickedFromSkipped, skippedOf } from "./filePicks";
 import { externalChoice, keepSource, pendingChoice, rollbackChoice, type ResumeChoice, type RollbackChoice } from "./choices";
 import { DiffEditor } from "./editor";
 import { afterResume, engineCode, formatEngineError, formatFileResult, formatOffer, formatReport, type ConflictFile, type ExecReport, type RecoveryOffer } from "./engine";
@@ -79,6 +80,7 @@ export function App() {
   const [rollbackAt, setRollbackAt] = useState(0);
   const [projectRoot, setProjectRoot] = useState<string | null>(null);
   const [packagePath, setPackagePath] = useState<string | null>(null);
+  const [packageSource, setPackageSource] = useState<string | null>(null);
   const [plan, setPlan] = useState<LocalPlan | null>(null);
   const [pickedPaths, setPickedPaths] = useState<ReadonlySet<string>>(new Set());
   const [currentFile, setCurrentFile] = useState<string | null>(null);
@@ -126,23 +128,30 @@ export function App() {
     });
   }, []);
 
-  async function refreshPlan(project: string, pkg: string) {
+  async function refreshPlan(project: string, prepared: string, source: string) {
     setScanning(true);
     setReport(null);
     clearFileNotes();
     try {
-      const scanned = await scanPair(project, pkg);
+      const scanned = await scanPair(project, prepared);
       const next = await buildLocalPlan({
         projectRoot: project,
-        packagePath: pkg,
+        packagePath: prepared,
         files: scanned.files,
         read: readSide,
         mergeText: mergeTexts,
       });
       setPlan(next);
-      setPickedPaths(new Set(next.files.map((file) => file.path.replace(/\\/g, "/"))));
+      const paths = next.files.map((file) => file.path.replace(/\\/g, "/"));
+      let skipped: string[] = [];
+      try {
+        skipped = await loadFilePicks(project, source);
+        setStatus(null);
+      } catch (err) {
+        setStatus(formatEngineError(err));
+      }
+      setPickedPaths(pickedFromSkipped(paths, skipped));
       setCurrentFile(firstTextFile(next));
-      setStatus(null);
     } catch (err) {
       setPlan(null);
       setPickedPaths(new Set());
@@ -153,23 +162,31 @@ export function App() {
     }
   }
 
+  function applyPicked(next: ReadonlySet<string>) {
+    setPickedPaths(next);
+    if (!projectRoot || !packageSource || !plan) return;
+    const paths = plan.files.map((file) => file.path.replace(/\\/g, "/"));
+    void saveFilePicks(projectRoot, packageSource, skippedOf(paths, next)).catch((err) => setStatus(formatEngineError(err)));
+  }
+
   async function onPickProject() {
     try {
       const picked = await pickProjectDirectory();
       if (!picked) return;
       setProjectRoot(picked);
-      if (packagePath) await refreshPlan(picked, packagePath);
+      if (packagePath && packageSource) await refreshPlan(picked, packagePath, packageSource);
     } catch (err) {
       setStatus(formatEngineError(err));
     }
   }
 
-  async function onPickPackage(pick: () => Promise<string | null>) {
+  async function onPickPackage(pick: () => Promise<{ source: string; prepared: string } | null>) {
     try {
       const picked = await pick();
       if (!picked) return;
-      setPackagePath(picked);
-      if (projectRoot) await refreshPlan(projectRoot, picked);
+      setPackageSource(picked.source);
+      setPackagePath(picked.prepared);
+      if (projectRoot) await refreshPlan(projectRoot, picked.prepared, picked.source);
     } catch (err) {
       setStatus(formatEngineError(err));
     }
@@ -294,7 +311,7 @@ export function App() {
             packagePath={packagePath}
             plan={plan}
             picked={pickedPaths}
-            onPicked={setPickedPaths}
+            onPicked={applyPicked}
             scanning={scanning}
             running={running}
             report={report}
@@ -695,6 +712,7 @@ function PreviewPage({
               onChange={() => onPicked(applyCheck(picked, allPaths, allState))}
             />
             <span>已选 {summary.selected} / 共 {summary.total} 个文件</span>
+            <button type="button" onClick={() => onPicked(invertPicked(allPaths, picked))}>反选</button>
           </div>
         )}
         {plan && (

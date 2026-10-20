@@ -376,6 +376,28 @@ pub fn remote_rename_plan(posix_rename: bool) -> Vec<String> {
     sftp::rename_steps(posix_rename).iter().map(|s| (*s).to_string()).collect()
 }
 
+pub fn load_file_picks_in(db_path: &Path, project_root: &str, package_path: &str) -> Result<Vec<String>, Error> {
+    let db = exec::open_db(db_path)?;
+    hetianxia_core::picks::load_skipped(&db, project_root, package_path)
+}
+
+pub fn save_file_picks_in(db_path: &Path, project_root: &str, package_path: &str, skipped: &[String]) -> Result<(), Error> {
+    let db = exec::open_db(db_path)?;
+    hetianxia_core::picks::save_skipped(&db, project_root, package_path, skipped)
+}
+
+#[tauri::command]
+pub fn load_file_picks(session: tauri::State<crate::Session>, project_root: String, package_path: String) -> Result<Vec<String>, Error> {
+    ready(&session)?;
+    load_file_picks_in(&session.db_path, &project_root, &package_path)
+}
+
+#[tauri::command]
+pub fn save_file_picks(session: tauri::State<crate::Session>, project_root: String, package_path: String, skipped: Vec<String>) -> Result<(), Error> {
+    ready(&session)?;
+    save_file_picks_in(&session.db_path, &project_root, &package_path, &skipped)
+}
+
 #[tauri::command]
 pub fn app_bak_dir(session: tauri::State<crate::Session>) -> Result<String, Error> {
     ready(&session)?;

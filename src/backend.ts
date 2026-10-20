@@ -181,22 +181,32 @@ export async function pickProjectDirectory(): Promise<string | null> {
   return typeof picked === "string" ? picked : null;
 }
 
-/** scan 的右边是目录。zip 先解开；文件夹原样返回。两条入口都进这里。 */
-async function useUpgradePackage(picked: string | string[] | null): Promise<string | null> {
+export type UpgradePackage = { source: string; prepared: string };
+
+/** scan 的右边是目录。zip 先解开；文件夹原样返回。两条入口都进这里。source 是用户选中的路径，用来记住勾选。 */
+async function useUpgradePackage(picked: string | string[] | null): Promise<UpgradePackage | null> {
   if (typeof picked !== "string") return null;
-  return preparePackage(picked);
+  return { source: picked, prepared: await preparePackage(picked) };
 }
 
 /** 只选文件夹。和 zip 入口解开后走同一条 scan。 */
-export function pickUpgradeDirectory(): Promise<string | null> {
+export function pickUpgradeDirectory(): Promise<UpgradePackage | null> {
   return open({ directory: true, multiple: false, title: "选择升级包文件夹" }).then(useUpgradePackage);
 }
 
 /** 只选 zip。和文件夹入口解开后走同一条 scan。 */
-export function pickUpgradeZip(): Promise<string | null> {
+export function pickUpgradeZip(): Promise<UpgradePackage | null> {
   return open({
     multiple: false,
     title: "选择 zip 升级包",
     filters: [{ name: "升级包", extensions: ["zip"] }],
   }).then(useUpgradePackage);
+}
+
+export function loadFilePicks(projectRoot: string, packagePath: string) {
+  return invoke<string[]>("load_file_picks", { projectRoot, packagePath });
+}
+
+export function saveFilePicks(projectRoot: string, packagePath: string, skipped: string[]) {
+  return invoke<void>("save_file_picks", { projectRoot, packagePath, skipped });
 }

@@ -29,7 +29,7 @@ test("preview empty state and execute stay on the real plan", () => {
   assert.match(app, /aria-label="全选"/);
   assert.match(app, /indeterminate = allState === "some"/);
   assert.match(app, /indeterminate = state === "some"/);
-  assert.match(app, /setPickedPaths\(new Set\(next\.files\.map\(\(file\) => file\.path\.replace/);
+  assert.match(app, /pickedFromSkipped\(/);
   assert.match(app, /selectedPlan\(plan, pickedPaths\)/);
   assert.match(app, /execPlanFor\(chosen/);
   assert.match(app, /connectionSelected && remoteRootReady && currentRemotePlan\(\) != null/);

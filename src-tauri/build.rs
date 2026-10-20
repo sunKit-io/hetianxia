@@ -31,6 +31,8 @@ fn main() {
         "remote_write_prompt",
         "commit_remote_overwrite",
         "app_bak_dir",
+        "load_file_picks",
+        "save_file_picks",
         "read_ssh_config",
     ]);
     if let Err(error) = tauri_build::try_build(tauri_build::Attributes::new().app_manifest(manifest)) {
