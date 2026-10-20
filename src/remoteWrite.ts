@@ -43,18 +43,37 @@ export type RemoteConnection = {
   auth: string;
   keyPath: string;
   fingerprint: string;
-  remoteRoot?: string | null;
+  remoteRoot: string | null;
 };
 
-export function connectionRemoteRoot(connection: { remoteRoot?: string | null } | null): string {
-  const value = connection?.remoteRoot;
-  return typeof value === "string" ? value : "";
+/** 先按 POSIX 折叠 `//`、`.` 和 `..`。不是绝对路径，或 `..` 逃出根时返回 null。折叠后没有目录名就是 `/`。 */
+function normalizePosixAbsolute(raw: string): string | null {
+  const value = raw.trim();
+  if (!value.startsWith("/") || value.includes("\\") || value.includes("\0")) return null;
+  const segments = posixSegments(value);
+  if (!segments) return null;
+  if (segments.length === 0) return "/";
+  return `/${segments.join("/")}`;
 }
 
-/** 绝对 POSIX 目录。含 `..` 且逃出根、或不是以 / 开头，都不算。 */
+/** 规范化之后只剩文件系统根，例如 `/`、`/.`、`//`、`/srv/..`。 */
+export function isFilesystemRemoteRoot(root: string): boolean {
+  return normalizePosixAbsolute(root) === "/";
+}
+
+export function connectionRemoteRoot(connection: { remoteRoot: string | null } | null): string {
+  const value = connection?.remoteRoot;
+  if (value == null) return "";
+  const normalized = normalizePosixAbsolute(value);
+  if (normalized == null) return value.trim();
+  if (normalized === "/") return "";
+  return normalized;
+}
+
+/** 绝对 POSIX 目录。规范化成 `/` 的不算。 */
 export function isAbsoluteRemoteRoot(root: string): boolean {
-  if (!root.startsWith("/") || root.includes("\\") || root.includes("\0") || root.split("/").includes("..")) return false;
-  return posixSegments(root) != null;
+  const normalized = normalizePosixAbsolute(root);
+  return normalized != null && normalized !== "/";
 }
 
 export function noteRemoteRoot(root: string) {

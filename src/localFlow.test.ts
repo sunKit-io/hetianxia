@@ -14,6 +14,7 @@ test("preview empty state and execute stay on the real plan", () => {
   assert.match(app, /disabled=\{target === "local" \? !localReady : !remoteReady\}/);
   assert.match(app, /connectionSelected && remoteRootReady && currentRemotePlan\(\) != null/);
   assert.match(app, /先在连接里填远程目录/);
+  assert.match(app, /远程目录不能是根目录 \//);
   assert.match(app, /执行前备份到/);
   assert.equal(app.includes("defaultChecked"), false);
   assert.match(app, /executeLocal\(/);

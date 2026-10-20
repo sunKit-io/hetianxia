@@ -21,7 +21,7 @@ import {
 import { formatFileCounts, formatRunTime, historyContinue, historyRowButtons, historyStatusLabel, REMOTE_ROLLBACK_TITLE, type HistoryContinue } from "./historyRows";
 import { Text } from "./plain";
 import { remoteRootFieldError } from "./remoteRoot";
-import { VERIFY_FAILED_BUTTON, VERIFY_FAILED_TITLE, connectionRemoteRoot, currentRemotePlan, isAbsoluteRemoteRoot, noteRemoteRoot, settleRemoteWrite, type PendingRemoteWrite } from "./remoteWrite";
+import { VERIFY_FAILED_BUTTON, VERIFY_FAILED_TITLE, connectionRemoteRoot, currentRemotePlan, isAbsoluteRemoteRoot, isFilesystemRemoteRoot, noteRemoteRoot, settleRemoteWrite, type PendingRemoteWrite } from "./remoteWrite";
 import {
   DETAIL_DELETED,
   OVERWRITE_PENDING,
@@ -288,6 +288,7 @@ export function App() {
             onOpenFile={(path) => { setCurrentFile(path); setPage("edit"); }}
             connectionSelected={selected != null}
             remoteRootReady={isAbsoluteRemoteRoot(connectionRemoteRoot(selected))}
+            remoteRootIsSlash={isFilesystemRemoteRoot(selected?.remoteRoot ?? "")}
             onRemoteWrite={() => {
               const plan = currentRemotePlan();
               if (!selected) {
@@ -608,6 +609,7 @@ function PreviewPage({
   onOpenFile,
   connectionSelected,
   remoteRootReady,
+  remoteRootIsSlash,
   onRemoteWrite,
 }: {
   allowReadonly: boolean;
@@ -625,6 +627,7 @@ function PreviewPage({
   onOpenFile: (path: string) => void;
   connectionSelected: boolean;
   remoteRootReady: boolean;
+  remoteRootIsSlash: boolean;
   onRemoteWrite: () => void;
 }) {
   const [target, setTarget] = useState<"local" | "remote">("local");
@@ -689,7 +692,8 @@ function PreviewPage({
         )}
         {running && <p role="status">正在备份并执行…</p>}
         <p className="bak">执行前备份到 {bakDir ? <Text value={bakDir} /> : "…"}</p>
-        {target === "remote" && !remoteRootReady && <p>先在连接里填远程目录</p>}
+        {target === "remote" && remoteRootIsSlash && <p>远程目录不能是根目录 /</p>}
+        {target === "remote" && !remoteRootReady && !remoteRootIsSlash && <p>先在连接里填远程目录</p>}
         <footer>
           <button className="primary" disabled={target === "local" ? !localReady : !remoteReady} onClick={() => { if (target === "remote") onRemoteWrite(); else onExecute(); }}>{target === "remote" ? "写入远程" : "备份并执行"}</button>
         </footer>

@@ -43,6 +43,7 @@ export type SavedConnection = {
   auth: "password" | "key" | "agent";
   keyPath: string;
   fingerprint: string;
+  /** 远端绝对目录。旧数据没有这一列时是 null。 */
   remoteRoot: string | null;
 };
 
