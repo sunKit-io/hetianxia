@@ -1258,6 +1258,13 @@ function RollbackResumeSheet({ alert, offer, onLater, onContinue }: { alert: str
         <h1><AlertTriangle size={18} /> 有一次回滚没有完成</h1>
         <p>上次回滚停在中途。可以接着回滚，或先放着。</p>
         {offer?.state ? <p><Text value={offer.state} /></p> : null}
+        {offer && offer.conflicts.length > 0 && (
+          <ul className="changes">
+            {offer.conflicts.map((file) => (
+              <li key={file.path}><span><Text value={file.path} /></span><em><Text value={file.detail} /></em></li>
+            ))}
+          </ul>
+        )}
         {alert && <p className="err" role="alert"><Text value={alert} /></p>}
         <footer>
           <button className="ghost" onClick={onLater}>稍后处理</button>

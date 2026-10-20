@@ -30,6 +30,7 @@ test("history status labels and buttons follow the journal state", () => {
   assert.notEqual(first.execId, second.execId);
   assert.equal(REMOTE_ROLLBACK_TITLE, "远程写入暂不支持回滚");
   assert.equal(formatFileCounts({ fileCount: 4, doneCount: 2, failedCount: 1 }), "共 4 · 已写 2 · 失败 1");
+  assert.equal(formatFileCounts({ fileCount: 4, doneCount: 2, failedCount: 0, conflictCount: 2 }), "共 4 · 已写 2 · 失败 0 · 冲突 2");
 });
 
 test("history rollback opens the sheet for that row and does not call rollback_run", () => {

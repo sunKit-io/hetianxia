@@ -19,6 +19,7 @@
 //! 回滚冲突三个选择：继续（先把当前版本另存再覆盖）、跳过冲突文件、取消。
 //! 回滚时只要有文件被跳过或没有恢复，状态就是 `ROLLBACK_PARTIAL`，历史显示「部分回滚」。
 //! 用户选择跳过冲突文件并且这次回滚跑完，是终态：启动不再提示，继续升级也会拒绝。
+//! 部分回滚如果只剩下 `E_CONFLICT`（冲突，已保留你的文件），同样是终态，启动不再提示。
 //! 停在 `ROLLING_BACK`，或因为恢复失败留下的 `ROLLBACK_PARTIAL`，启动仍要提示。
 //!
 //! 只读文件默认不覆盖，预演里以 E_PERMISSION 列出。勾选「覆盖只读文件」后
@@ -893,6 +894,41 @@ fn rollback_closed(db: &Connection, exec_id: &str) -> Result<bool> {
     Ok(closed != 0)
 }
 
+/// 已结束的部分回滚只剩下「冲突，已保留你的文件」。没有还要继续还原的项。
+fn conflict_only_partial(db: &Connection, exec_id: &str) -> Result<bool> {
+    let (conflicts, open): (i64, i64) = db.query_row(
+        "SELECT
+            COALESCE(SUM(CASE WHEN rollback_state = 'conflict' AND code = 'E_CONFLICT' THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE
+                WHEN COALESCE(rollback_state, '') = 'done' THEN 0
+                WHEN rollback_state = 'conflict' AND code = 'E_CONFLICT' THEN 0
+                WHEN state IN ('doing', 'failed') OR COALESCE(written, 0) != 0 OR COALESCE(rollback_state, '') != '' THEN 1
+                ELSE 0
+            END), 0)
+         FROM exec_ops WHERE exec_id = ?1",
+        params![exec_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(conflicts > 0 && open == 0)
+}
+
+fn kept_user_conflict_files(db: &Connection, exec_id: &str) -> Result<Vec<ConflictFile>> {
+    let mut stmt = db.prepare(
+        "SELECT op_json FROM exec_ops WHERE exec_id=?1 AND rollback_state='conflict' AND code='E_CONFLICT' ORDER BY op_index",
+    )?;
+    let rows = stmt.query_map(params![exec_id], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let json = row?;
+        let Some(op) = serde_json::from_str::<PlanOp>(&json).ok() else { continue };
+        if op.path.is_empty() {
+            continue;
+        }
+        out.push(ConflictFile { path: op.path, detail: DETAIL_KEPT_USER_FILE.to_string() });
+    }
+    Ok(out)
+}
+
 enum WriteGuess {
     Written,
     NotWritten,
@@ -1157,7 +1193,7 @@ pub fn recover_on_startup(db: &Connection, _passed_root: &LocalFs) -> Result<Vec
     drop(stmt);
     let mut offers = Vec::new();
     for (exec_id, state, plan_json, backup_root) in loaded {
-        if state == "ROLLBACK_PARTIAL" && rollback_closed(db, &exec_id)? {
+        if state == "ROLLBACK_PARTIAL" && (rollback_closed(db, &exec_id)? || conflict_only_partial(db, &exec_id)?) {
             continue;
         }
         if matches!(resume_admission(&state), ResumeAdmission::Reject) {
@@ -1205,6 +1241,14 @@ pub fn recover_on_startup(db: &Connection, _passed_root: &LocalFs) -> Result<Vec
                         WriteGuess::Conflict(c) => conflicts.push(c),
                     }
                 }
+            }
+        }
+        if matches!(resume_admission(&kept), ResumeAdmission::RollbackOnly) {
+            for file in kept_user_conflict_files(db, &exec_id)? {
+                if conflicts.iter().any(|item| item.path == file.path) {
+                    continue;
+                }
+                conflicts.push(file);
             }
         }
         offers.push(RecoveryOffer {
@@ -2141,6 +2185,8 @@ pub struct JournalRun {
     pub file_count: u32,
     pub done_count: u32,
     pub failed_count: u32,
+    /// `E_CONFLICT`：回滚时内容对不上、已保留的文件数。历史页的冲突数就是这个数。
+    pub conflict_count: u32,
     pub remote: bool,
 }
 
@@ -2178,7 +2224,7 @@ pub fn list_journal_runs(db: &Connection) -> Result<Vec<JournalRun>> {
             .as_deref()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
             .unwrap_or(serde_json::Value::Null);
-        let (file_count, done_count, failed_count) = journal_file_counts(db, &exec_id, &plan)?;
+        let (file_count, done_count, failed_count, conflict_count) = journal_file_counts(db, &exec_id, &plan)?;
         out.push(JournalRun {
             exec_id,
             project_root: nonempty(column_root).or_else(|| plan_project_root(&plan)),
@@ -2187,6 +2233,7 @@ pub fn list_journal_runs(db: &Connection) -> Result<Vec<JournalRun>> {
             file_count,
             done_count,
             failed_count,
+            conflict_count,
             remote: match column_remote {
                 Some(value) => value != 0,
                 None => plan.get("remote").and_then(|value| value.as_bool()).unwrap_or(false),
@@ -2235,19 +2282,20 @@ fn plan_project_root(plan: &serde_json::Value) -> Option<String> {
     None
 }
 
-fn journal_file_counts(db: &Connection, exec_id: &str, plan: &serde_json::Value) -> Result<(u32, u32, u32)> {
-    let (total, done, failed): (i64, i64, i64) = db.query_row(
+fn journal_file_counts(db: &Connection, exec_id: &str, plan: &serde_json::Value) -> Result<(u32, u32, u32, u32)> {
+    let (total, done, failed, conflicts): (i64, i64, i64, i64) = db.query_row(
         "SELECT COUNT(*),
                 COALESCE(SUM(CASE WHEN state = 'done' OR COALESCE(written, 0) != 0 THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END), 0)
+                COALESCE(SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN code = 'E_CONFLICT' THEN 1 ELSE 0 END), 0)
          FROM exec_ops WHERE exec_id = ?1",
         params![exec_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
     if total == 0 {
-        return Ok((plan_file_count(plan), 0, 0));
+        return Ok((plan_file_count(plan), 0, 0, 0));
     }
-    Ok((as_u32(total), as_u32(done), as_u32(failed)))
+    Ok((as_u32(total), as_u32(done), as_u32(failed), as_u32(conflicts)))
 }
 
 fn as_u32(value: i64) -> u32 {
@@ -2307,7 +2355,11 @@ pub fn pending(db: &Connection) -> Result<Vec<PendingTx>> {
     })?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(row?);
+        let row = row?;
+        if row.state == "ROLLBACK_PARTIAL" && conflict_only_partial(db, &row.exec_id)? {
+            continue;
+        }
+        out.push(row);
     }
     Ok(out)
 }
@@ -4742,6 +4794,49 @@ mod tests {
         assert!(offers.iter().any(|item| item.exec_id == failed.id && item.state == "ROLLBACK_PARTIAL"));
         let err = resume(&broken_db, &broken_fs, &failed.id, ResumeChoice::Continue, &opts_at(broken.path()), FaultPlan::default()).unwrap_err();
         assert_eq!(err.message, "这次只能继续回滚，不能继续升级");
+    }
+
+    /// 内容对不上留下的 E_CONFLICT 是终态。内联字节和计划里的 hash+size 都一样。
+    /// 旁边还有未恢复项时，启动提示要带上「冲突，已保留你的文件」。
+    #[test]
+    fn conflict_only_partial_does_not_prompt_and_history_counts_it() {
+        for streamed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let proj = dir.path().join("proj");
+            fs::create_dir(&proj).unwrap();
+            let db = open_db(&dir.path().join("t.sqlite")).unwrap();
+            let fsys = LocalFs::new(&proj);
+            let mut op = create_op(1, "pkg/new.ts", b"body");
+            if streamed {
+                op = as_streamed(op);
+            }
+            let created = plan(vec![op]);
+            execute(&db, &fsys, &created, &crash_before_write(dir.path()), FaultPlan::default()).unwrap();
+            place_after_crash(&proj, "pkg/new.ts", b"xxxx");
+            let back = rollback(&db, &fsys, &created.id, RollbackChoice::ProceedBackupCurrent, FaultPlan::default()).unwrap();
+            assert_eq!(back.state, "ROLLBACK_PARTIAL", "streamed={streamed} {:?}", back.files);
+            assert_eq!(back.files[0].state, "conflict");
+            assert_eq!(back.files[0].code.as_deref(), Some("E_CONFLICT"));
+            assert_eq!(back.files[0].error.as_deref(), Some(DETAIL_KEPT_USER_FILE));
+            assert!(recover_on_startup(&db, &fsys).unwrap().iter().all(|offer| offer.exec_id != created.id));
+            assert!(pending(&db).unwrap().iter().all(|item| item.exec_id != created.id));
+            let run = list_journal_runs(&db).unwrap().into_iter().find(|run| run.exec_id == created.id).unwrap();
+            assert_eq!(run.conflict_count, 1, "streamed={streamed}");
+            assert_eq!(fs::read(proj.join("pkg/new.ts")).unwrap(), b"xxxx");
+
+            if streamed {
+                continue;
+            }
+            db.execute(
+                "INSERT INTO exec_ops (exec_id, op_index, op_json, state, written, rollback_state, code) VALUES (?1, 2, '{}', 'failed', 1, 'failed', 'E_IO')",
+                params![created.id],
+            )
+            .unwrap();
+            let offers = recover_on_startup(&db, &fsys).unwrap();
+            let offer = offers.iter().find(|item| item.exec_id == created.id).unwrap();
+            assert_eq!(offer.state, "ROLLBACK_PARTIAL");
+            assert!(offer.conflicts.iter().any(|file| file.path == "pkg/new.ts" && file.detail == DETAIL_KEPT_USER_FILE));
+        }
     }
 
     #[test]

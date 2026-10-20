@@ -122,6 +122,7 @@ export type JournalRun = {
   fileCount: number;
   doneCount: number;
   failedCount: number;
+  conflictCount: number;
   remote: boolean;
 };
 

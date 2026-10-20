@@ -52,6 +52,10 @@ export function formatRunTime(startedAt: number): string {
   return `${month}月${day}日 ${hour}:${minute}`;
 }
 
-export function formatFileCounts(run: { fileCount: number; doneCount: number; failedCount: number }): string {
-  return `共 ${run.fileCount} · 已写 ${run.doneCount} · 失败 ${run.failedCount}`;
+/** 冲突数 k 只计回滚留下的 `E_CONFLICT`（冲突，已保留你的文件）。没有这种项时不写这一段。 */
+export function formatFileCounts(run: { fileCount: number; doneCount: number; failedCount: number; conflictCount?: number }): string {
+  const base = `共 ${run.fileCount} · 已写 ${run.doneCount} · 失败 ${run.failedCount}`;
+  const conflicts = run.conflictCount ?? 0;
+  if (conflicts > 0) return `${base} · 冲突 ${conflicts}`;
+  return base;
 }

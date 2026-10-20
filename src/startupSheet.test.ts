@@ -17,6 +17,9 @@ test("startup sheet stays closed until a real offer exists", () => {
   const title = app.slice(app.indexOf("titleblock"), app.indexOf("pages"));
   assert.equal(title.includes("OrderCenter"), false);
   assert.equal(title.includes("src/config/app.config.js"), false);
+  const resume = app.slice(app.indexOf("function RollbackResumeSheet"), app.indexOf("function LogSheet"));
+  assert.match(resume, /offer\.conflicts/);
+  assert.match(resume, /file\.detail/);
 });
 
 test("rollback preview loads that exec before the sheet opens", () => {
