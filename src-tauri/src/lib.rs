@@ -110,6 +110,20 @@ mod tests {
     }
 
     #[test]
+    fn csp_is_set_and_capabilities_do_not_grant_fs_or_shell() {
+        let conf = include_str!("../tauri.conf.json");
+        assert!(!conf.contains("\"csp\": null"));
+        assert!(conf.contains("default-src 'self'"));
+        assert!(conf.contains("object-src 'none'"));
+        assert!(!conf.contains("unsafe-eval"));
+        let caps = include_str!("../capabilities/default.json");
+        assert!(!caps.contains("fs:"));
+        assert!(!caps.contains("shell:"));
+        assert!(caps.contains("allow-execute"));
+        assert!(caps.contains("core:default"));
+    }
+
+    #[test]
     fn commands_scan_diff_merge_history_and_connections() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "old\n").unwrap();
